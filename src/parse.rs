@@ -1,3 +1,5 @@
+use encoding_rs::{EUC_KR, UTF_16BE, UTF_16LE, UTF_8};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     Utf8,
@@ -29,6 +31,19 @@ pub fn detect_encoding(head: &[u8]) -> Encoding {
         }
     }
     Encoding::Cp949
+}
+
+/// 한 줄(개행 제외 권장)의 바이트를 인코딩에 맞춰 문자열로 디코딩한다.
+/// 잘못된 바이트는 대체문자(U+FFFD)로 손실 없이 처리한다(패닉 없음).
+pub fn decode_line(bytes: &[u8], enc: Encoding) -> String {
+    let encoding = match enc {
+        Encoding::Utf8 => UTF_8,
+        Encoding::Cp949 => EUC_KR,
+        Encoding::Utf16Le => UTF_16LE,
+        Encoding::Utf16Be => UTF_16BE,
+    };
+    let (cow, _used, _had_errors) = encoding.decode(bytes);
+    cow.into_owned()
 }
 
 #[cfg(test)]
@@ -69,5 +84,25 @@ mod tests {
         // "가" in CP949 = 0xB0 0xA1, which is NOT valid UTF-8
         let bytes = [0xB0, 0xA1];
         assert_eq!(detect_encoding(&bytes), Encoding::Cp949);
+    }
+
+    #[test]
+    fn decode_utf8_line() {
+        assert_eq!(decode_line("이름,나이".as_bytes(), Encoding::Utf8), "이름,나이");
+    }
+
+    #[test]
+    fn decode_cp949_line() {
+        // "가나" in CP949
+        let bytes = [0xB0, 0xA1, 0xB3, 0xAA];
+        assert_eq!(decode_line(&bytes, Encoding::Cp949), "가나");
+    }
+
+    #[test]
+    fn decode_invalid_bytes_no_panic() {
+        // 잘못된 바이트도 패닉 없이 대체문자로 표시
+        let bytes = [0xFF, 0xFE, 0x00];
+        let s = decode_line(&bytes, Encoding::Utf8);
+        assert!(!s.is_empty());
     }
 }
