@@ -1,4 +1,5 @@
 mod index;
+mod indexer;
 mod parse;
 mod source;
 
