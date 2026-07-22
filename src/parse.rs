@@ -46,9 +46,114 @@ pub fn decode_line(bytes: &[u8], enc: Encoding) -> String {
     cow.into_owned()
 }
 
+const DELIMITER_CANDIDATES: [u8; 4] = [b',', b'\t', b'|', b';'];
+
+/// 확장자 우선, 애매하면 앞부분 여러 줄에서 가장 일관된 구분자 선택.
+pub fn detect_delimiter(path: &std::path::Path, head_lines: &[&str]) -> u8 {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        match ext.to_ascii_lowercase().as_str() {
+            "tsv" | "tab" => return b'\t',
+            "csv" => return b',',
+            "psv" => return b'|',
+            _ => {}
+        }
+    }
+    // 내용 분석: 각 후보의 줄당 등장 횟수 분산이 가장 낮고 평균이 1 이상인 것.
+    let mut best = b',';
+    let mut best_score = f64::MAX;
+    for &cand in &DELIMITER_CANDIDATES {
+        let counts: Vec<usize> = head_lines
+            .iter()
+            .map(|l| l.bytes().filter(|&b| b == cand).count())
+            .collect();
+        if counts.is_empty() {
+            continue;
+        }
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        if mean < 1.0 {
+            continue; // 이 구분자는 거의 안 나옴
+        }
+        let variance = counts
+            .iter()
+            .map(|&c| (c as f64 - mean).powi(2))
+            .sum::<f64>()
+            / counts.len() as f64;
+        if variance < best_score {
+            best_score = variance;
+            best = cand;
+        }
+    }
+    best
+}
+
+/// 한 줄을 구분자로 분리. 따옴표(")로 감싼 필드 안의 구분자는 무시.
+///
+/// 구현 노트(csv-core 0.1.13 API 확인 결과, 브리프의 의사코드에서 편차):
+/// `read_record` 는 입력을 다 소비해도 개행이 없으면 마지막 필드의 끝 위치를
+/// `ends` 에 즉시 쓰지 않는다(csv-core 소스 주석: "they'll be missing the
+/// final end position of the final field in `ends`"). 이를 채우려면 빈
+/// 입력 슬라이스로 한 번 더 호출해 EOF 를 알려야 하는데, 그 호출은
+/// `output` 버퍼에는 아무것도 새로 쓰지 않고(nout=0) `ends` 에만 이전
+/// 호출까지 누적된 위치(`output_pos`)를 추가한다. 즉 `out`/`ends` 를
+/// 여러 번의 `read_record` 호출에 걸쳐 "이어붙여" 읽으면 좌표가 어긋난다.
+/// 따라서 출력 버퍼 크기를 입력보다 항상 크게 잡아 실질적으로 데이터 쓰기는
+/// 단 한 번의 호출로 끝나도록 하고, 그 뒤에는 EOF 플러시 호출(nend 증가만)
+/// 만 반복해서 받도록 한다. 필드 벡터는 매 호출 후가 아니라 루프 종료 후
+/// 최종 `ends` 스냅샷을 기준으로 한 번에 구성한다.
+pub fn split_fields(line: &str, delim: u8) -> Vec<String> {
+    let mut reader = csv_core::ReaderBuilder::new()
+        .delimiter(delim)
+        .build();
+    let bytes = line.as_bytes();
+    // 넉넉한 출력 버퍼: 필드 구분자/따옴표가 제거되므로 출력은 입력보다 클 수 없다.
+    let mut out = vec![0u8; bytes.len() + 1];
+    let mut ends = vec![0usize; bytes.len() + 1];
+    let mut input = bytes;
+    let mut total_nend = 0usize;
+    loop {
+        let (result, nin, _nout, nend) =
+            reader.read_record(input, &mut out, &mut ends[total_nend..]);
+        total_nend += nend;
+        input = &input[nin..];
+        match result {
+            csv_core::ReadRecordResult::End => break,
+            csv_core::ReadRecordResult::InputEmpty => {
+                if input.is_empty() {
+                    // 다음 호출에서 빈 슬라이스로 EOF 를 알려 마지막 필드를 flush.
+                    continue;
+                }
+            }
+            csv_core::ReadRecordResult::OutputFull => {
+                out.resize(out.len() * 2, 0);
+            }
+            csv_core::ReadRecordResult::OutputEndsFull => {
+                ends.resize(ends.len() * 2, 0);
+            }
+            csv_core::ReadRecordResult::Record => {
+                break; // 한 줄짜리 입력이므로 레코드 하나면 끝.
+            }
+        }
+        if input.is_empty() && total_nend > 0 {
+            // EOF flush 까지 받아 total_nend 가 이미 채워졌다면 종료.
+            break;
+        }
+    }
+    let mut fields = Vec::new();
+    for i in 0..total_nend {
+        let start = if i == 0 { 0 } else { ends[i - 1] };
+        let end = ends[i];
+        fields.push(String::from_utf8_lossy(&out[start..end]).into_owned());
+    }
+    if fields.is_empty() {
+        fields.push(String::new());
+    }
+    fields
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn detects_utf8_bom() {
@@ -104,5 +209,38 @@ mod tests {
         let bytes = [0xFF, 0xFE, 0x00];
         let s = decode_line(&bytes, Encoding::Utf8);
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn tsv_extension_picks_tab() {
+        assert_eq!(detect_delimiter(Path::new("a.tsv"), &["x\ty"]), b'\t');
+    }
+
+    #[test]
+    fn csv_extension_picks_comma() {
+        assert_eq!(detect_delimiter(Path::new("a.csv"), &["x,y"]), b',');
+    }
+
+    #[test]
+    fn txt_content_picks_consistent_delimiter() {
+        // 매 줄 파이프가 정확히 2개로 일관 → 파이프
+        let lines = ["a|b|c", "d|e|f", "g|h|i"];
+        assert_eq!(detect_delimiter(Path::new("a.txt"), &lines), b'|');
+    }
+
+    #[test]
+    fn split_basic_fields() {
+        assert_eq!(split_fields("a,b,c", b','), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn split_quoted_field_with_delimiter() {
+        // "a,b" 는 한 필드
+        assert_eq!(split_fields("\"a,b\",c", b','), vec!["a,b", "c"]);
+    }
+
+    #[test]
+    fn split_empty_fields() {
+        assert_eq!(split_fields("a,,c", b','), vec!["a", "", "c"]);
     }
 }
