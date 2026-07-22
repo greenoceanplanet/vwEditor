@@ -215,15 +215,16 @@ impl eframe::App for App {
             table
                 .header(ROW_HEIGHT, |mut header| {
                     header.col(|ui| {
-                        ui.strong("#");
+                        ui.add(egui::Label::new(egui::RichText::new("#").strong()).truncate());
                     });
                     for c in 0..col_count {
                         header.col(|ui| {
-                            if let Some(h) = &header_fields {
-                                ui.strong(format!("{} {}", c + 1, h.get(c).cloned().unwrap_or_default()));
+                            let text = if let Some(h) = &header_fields {
+                                format!("{} {}", c + 1, h.get(c).cloned().unwrap_or_default())
                             } else {
-                                ui.strong(format!("{}", c + 1));
-                            }
+                                format!("{}", c + 1)
+                            };
+                            ui.add(egui::Label::new(egui::RichText::new(text).strong()).truncate());
                         });
                     }
                 })
@@ -231,15 +232,18 @@ impl eframe::App for App {
                     body.rows(ROW_HEIGHT, data_rows, |mut row| {
                         let logical = row.index() + data_start;
                         let line_no = row.index() + 1;
-                        // 라인번호 컬럼
+                        // 라인번호 컬럼 — 한 줄 고정(긴 값으로 인한 wrap 방지)
                         row.col(|ui| {
-                            ui.label(format!("{line_no}"));
+                            ui.add(egui::Label::new(format!("{line_no}")).truncate());
                         });
                         // 데이터 컬럼들 — 이 행만 offset으로 조회·디코딩·파싱
                         let fields = parse_logical_line(doc, logical).unwrap_or_default();
                         for c in 0..col_count {
                             row.col(|ui| {
-                                ui.label(fields.get(c).cloned().unwrap_or_default());
+                                ui.add(
+                                    egui::Label::new(fields.get(c).cloned().unwrap_or_default())
+                                        .truncate(),
+                                );
                             });
                         }
                     });
