@@ -51,6 +51,8 @@ impl LineIndex {
         self.inner.offsets.read().unwrap().len()
     }
 
+    /// 현재 UI는 line_range만 사용하지만, offset 조회 API를 대칭적으로 남겨둔다.
+    #[allow(dead_code)]
     pub fn offset(&self, row: usize) -> Option<u64> {
         self.inner.offsets.read().unwrap().get(row).copied()
     }

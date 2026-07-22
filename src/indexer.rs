@@ -14,6 +14,11 @@ pub fn newline_pattern(enc: Encoding) -> &'static [u8] {
 
 /// bytes 구간에서 각 줄의 시작 offset(절대값 = start + 로컬)을 반환.
 /// 첫 줄 시작(start)을 항상 포함. 개행 바로 다음 위치가 새 줄 시작.
+///
+/// 실제 인덱싱은 청크 경계를 처리하는 index_range가 담당한다. 이 함수는
+/// 청크 없이 버퍼 전체를 한 번에 스캔하는 "정답지"로, 회귀 테스트가
+/// index_range의 청크 경계 처리 결과를 이 함수와 대조하는 데 쓰인다.
+#[allow(dead_code)]
 pub fn scan_offsets(bytes: &[u8], start: u64, enc: Encoding) -> Vec<u64> {
     let pat = newline_pattern(enc);
     let mut result = Vec::new();
@@ -149,8 +154,11 @@ mod tests {
     use std::sync::Arc;
 
     fn temp_file(content: &[u8]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("tv_idx_{}.txt", content.len()));
+        p.push(format!("tv_idx_{}_{}.txt", std::process::id(), id));
         std::fs::File::create(&p).unwrap().write_all(content).unwrap();
         p
     }

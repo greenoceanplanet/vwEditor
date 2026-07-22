@@ -50,4 +50,22 @@ fn install_korean_font(ctx: &egui::Context) {
     }
 
     ctx.set_fonts(fonts);
+
+    // 본문/버튼 텍스트 크기를 살짝 키워 한글(맑은 고딕)이 작은 크기에서
+    // 뭉개져 보이는 것을 완화한다.
+    ctx.style_mut(|style| {
+        use egui::{FontFamily, FontId, TextStyle};
+        style.text_styles.insert(
+            TextStyle::Body,
+            FontId::new(15.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Button,
+            FontId::new(15.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Monospace,
+            FontId::new(15.0, FontFamily::Monospace),
+        );
+    });
 }

@@ -73,7 +73,7 @@ impl App {
 use crate::index::Phase;
 use egui_extras::{Column, TableBuilder};
 
-const ROW_HEIGHT: f32 = 20.0;
+const ROW_HEIGHT: f32 = 22.0;
 
 /// 논리 행 번호(logical)에 해당하는 줄을 offset으로 조회해 디코딩·개행 제거·구분자
 /// 분리까지 수행한다. 헤더 행, col_count 샘플링, 데이터 행 렌더링이 모두 이 함수를
@@ -88,6 +88,22 @@ fn parse_logical_line(doc: &Document, logical: usize) -> Option<Vec<String>> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Ctrl + 휠로 전역 확대/축소. zoom_factor를 조절하면 폰트뿐 아니라
+        // UI 전체가 배율에 맞춰 커지고 작아진다. (0.5배 ~ 4.0배로 제한)
+        let scroll_y = ctx.input(|i| {
+            if i.modifiers.ctrl || i.modifiers.command {
+                i.raw_scroll_delta.y
+            } else {
+                0.0
+            }
+        });
+        if scroll_y != 0.0 {
+            let factor = ctx.zoom_factor();
+            // 휠 한 칸(대략 ±? px)마다 배율을 곱셈으로 조절해 부드럽게.
+            let new_factor = (factor * (1.0 + scroll_y * 0.001)).clamp(0.5, 4.0);
+            ctx.set_zoom_factor(new_factor);
+        }
+
         // 상단 툴바
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -207,10 +223,21 @@ impl eframe::App for App {
             }
             let col_count = col_count.max(1);
 
+            // 테이블이 남은 세로 공간을 모두 채우도록 한다.
+            // - max_scroll_height 기본값(800px)이 스크롤 영역을 제한해 창을 키워도
+            //   ~35행에서 멈추므로, 사용 가능한 높이로 올린다.
+            // - auto_shrink의 y축을 false로 두어 내용이 적어도 테이블이 창을 채운다.
+            let avail_height = ui.available_height();
+
+            // 컬럼은 auto()(전 행 measure로 대용량에서 느림) 대신 고정 초기폭 +
+            // 드래그 조절(resizable)로 둔다. 긴 값은 셀에서 truncate 되고 폭을
+            // 넓히면 전체가 보인다.
             let table = TableBuilder::new(ui)
                 .striped(true)
-                .column(Column::auto().at_least(48.0)) // 라인번호 #
-                .columns(Column::auto().at_least(60.0).resizable(true), col_count);
+                .auto_shrink([false, false])
+                .max_scroll_height(avail_height)
+                .column(Column::initial(64.0).at_least(48.0).resizable(true)) // 라인번호 #
+                .columns(Column::initial(120.0).at_least(60.0).resizable(true), col_count);
 
             table
                 .header(ROW_HEIGHT, |mut header| {
@@ -258,8 +285,11 @@ mod tests {
     use std::io::Write;
 
     fn temp(content: &[u8]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("tv_app_{}.csv", content.len()));
+        p.push(format!("tv_app_{}_{}.csv", std::process::id(), id));
         std::fs::File::create(&p).unwrap().write_all(content).unwrap();
         p
     }
