@@ -1,3 +1,4 @@
+mod index;
 mod parse;
 mod source;
 
