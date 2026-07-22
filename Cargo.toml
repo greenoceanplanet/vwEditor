@@ -1,0 +1,17 @@
+[package]
+name = "textviewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.28"
+egui = "0.28"
+egui_extras = "0.28"
+memmap2 = "0.9"
+csv-core = "0.1"
+encoding_rs = "0.8"
+rfd = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = true
