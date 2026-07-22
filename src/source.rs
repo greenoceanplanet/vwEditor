@@ -30,10 +30,6 @@ impl Source {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// [start, end) 범위의 바이트 슬라이스. 범위는 파일 크기로 클램프된다.
     pub fn slice(&self, start: u64, end: u64) -> &[u8] {
         let Some(m) = &self.mmap else {

@@ -75,6 +75,17 @@ use egui_extras::{Column, TableBuilder};
 
 const ROW_HEIGHT: f32 = 20.0;
 
+/// 논리 행 번호(logical)에 해당하는 줄을 offset으로 조회해 디코딩·개행 제거·구분자
+/// 분리까지 수행한다. 헤더 행, col_count 샘플링, 데이터 행 렌더링이 모두 이 함수를
+/// 공유해 세 곳에서 같은 파싱 파이프라인이 갈라지지 않도록 한다.
+/// 해당 논리 행이 인덱스에 없으면(범위 밖 등) `None`.
+fn parse_logical_line(doc: &Document, logical: usize) -> Option<Vec<String>> {
+    doc.index.line_range(logical).map(|(s, e)| {
+        let text = crate::parse::decode_line(doc.source.slice(s, e), doc.enc);
+        crate::parse::split_fields(text.trim_end_matches(['\r', '\n']), doc.delim)
+    })
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 상단 툴바
@@ -175,17 +186,26 @@ impl eframe::App for App {
             // 헤더 행 데이터(있으면 첫 줄)와 데이터 시작 행 결정
             let total_lines = doc.index.line_count();
             let header_fields: Option<Vec<String>> = if doc.has_header && total_lines > 0 {
-                doc.index.line_range(0).map(|(s, e)| {
-                    let text = crate::parse::decode_line(doc.source.slice(s, e), doc.enc);
-                    crate::parse::split_fields(text.trim_end_matches(['\r', '\n']), doc.delim)
-                })
+                parse_logical_line(doc, 0)
             } else {
                 None
             };
 
             let data_start = if doc.has_header { 1 } else { 0 };
             let data_rows = total_lines.saturating_sub(data_start);
-            let col_count = header_fields.as_ref().map(|h| h.len()).unwrap_or(1).max(1);
+
+            // col_count는 헤더 필드 수와, 앞부분 데이터 행 몇 개를 샘플링한 필드 수의
+            // 최댓값으로 정한다. 헤더가 없는 파일(header_fields == None)에서 1로
+            // 고정되어 컬럼이 다 숨는 문제, 그리고 헤더보다 넓은 행이 잘리는 문제를
+            // 함께 해결한다.
+            const COL_COUNT_SAMPLE_ROWS: usize = 10;
+            let mut col_count = header_fields.as_ref().map(|h| h.len()).unwrap_or(0);
+            for logical in data_start..data_start + COL_COUNT_SAMPLE_ROWS {
+                if let Some(fields) = parse_logical_line(doc, logical) {
+                    col_count = col_count.max(fields.len());
+                }
+            }
+            let col_count = col_count.max(1);
 
             let table = TableBuilder::new(ui)
                 .striped(true)
@@ -216,17 +236,7 @@ impl eframe::App for App {
                             ui.label(format!("{line_no}"));
                         });
                         // 데이터 컬럼들 — 이 행만 offset으로 조회·디코딩·파싱
-                        let fields = doc
-                            .index
-                            .line_range(logical)
-                            .map(|(s, e)| {
-                                let text = crate::parse::decode_line(doc.source.slice(s, e), doc.enc);
-                                crate::parse::split_fields(
-                                    text.trim_end_matches(['\r', '\n']),
-                                    doc.delim,
-                                )
-                            })
-                            .unwrap_or_default();
+                        let fields = parse_logical_line(doc, logical).unwrap_or_default();
                         for c in 0..col_count {
                             row.col(|ui| {
                                 ui.label(fields.get(c).cloned().unwrap_or_default());
@@ -270,5 +280,56 @@ mod tests {
         app.open_path(std::path::Path::new("nope_xyz.csv"), &ctx);
         assert!(app.doc.is_none());
         assert!(app.error.is_some());
+    }
+
+    /// update()의 col_count 계산 로직을 GUI 없이 그대로 재현해 검증하는 헬퍼.
+    /// 렌더 코드(본문 테이블 부분)와 동일한 공식을 사용한다.
+    fn compute_col_count(doc: &Document) -> usize {
+        let total_lines = doc.index.line_count();
+        let header_fields: Option<Vec<String>> = if doc.has_header && total_lines > 0 {
+            parse_logical_line(doc, 0)
+        } else {
+            None
+        };
+        let data_start = if doc.has_header { 1 } else { 0 };
+        const COL_COUNT_SAMPLE_ROWS: usize = 10;
+        let mut col_count = header_fields.as_ref().map(|h| h.len()).unwrap_or(0);
+        for logical in data_start..data_start + COL_COUNT_SAMPLE_ROWS {
+            if let Some(fields) = parse_logical_line(doc, logical) {
+                col_count = col_count.max(fields.len());
+            }
+        }
+        col_count.max(1)
+    }
+
+    #[test]
+    fn headerless_ragged_file_col_count_matches_widest_row() {
+        // has_header가 false로 판정되도록 전부 숫자인 CSV(detect_header가 false 반환).
+        // 첫 줄은 4개, 이후 5개 필드짜리 행 포함 → col_count는 4가 아니라 5여야 함
+        // (샘플링이 헤더 없는 파일에서 실제 데이터 폭을 반영하는지 검증).
+        let p = temp(b"1,2,3,4\n5,6,7,8,9\n10,11,12,13\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc.as_mut().unwrap();
+        // 인덱싱을 완료까지 join해 line_count/line_range가 안정적으로 채워지게 한다.
+        doc.indexer.take().unwrap().join().unwrap();
+
+        assert!(!doc.has_header, "전부 숫자인 파일은 헤더 없음으로 판정되어야 함");
+        assert_eq!(compute_col_count(doc), 5);
+    }
+
+    #[test]
+    fn headerless_uniform_file_col_count_matches_field_count() {
+        // 브리프에 명시된 케이스: 헤더 없는 4열 파일 → col_count는 1이 아니라 4.
+        let p = temp(b"1,2,3,4\n5,6,7,8\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc.as_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+
+        assert!(!doc.has_header);
+        assert_eq!(compute_col_count(doc), 4);
     }
 }
