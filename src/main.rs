@@ -1,4 +1,5 @@
 mod parse;
+mod source;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
