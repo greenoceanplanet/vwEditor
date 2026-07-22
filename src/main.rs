@@ -1,3 +1,4 @@
+mod app;
 mod index;
 mod indexer;
 mod parse;
@@ -8,16 +9,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "textViewer",
         options,
-        Box::new(|_cc| Ok(Box::new(PlaceholderApp))),
+        Box::new(|_cc| Ok(Box::new(app::App::default()))),
     )
-}
-
-struct PlaceholderApp;
-
-impl eframe::App for PlaceholderApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("textViewer");
-        });
-    }
 }
