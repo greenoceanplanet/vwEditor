@@ -54,9 +54,15 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    // 테스트마다 고유한 임시 파일명을 만든다. 내용 길이만으로 이름을 지으면
+    // 같은 길이의 내용을 쓰는 병렬 테스트끼리 같은 파일을 truncate/mmap 하며
+    // 경합(len()==0 등)이 나므로, 원자적 카운터로 유일성을 보장한다.
     fn temp_file_with(content: &[u8]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut path = std::env::temp_dir();
-        path.push(format!("tv_test_{}.txt", content.len()));
+        path.push(format!("tv_test_{}_{}.txt", std::process::id(), id));
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content).unwrap();
         path
