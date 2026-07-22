@@ -1,0 +1,9 @@
+# Rust
+/target/
+
+# SDD 작업용 스크래치 (원장, 브리프, 리포트)
+/.superpowers/
+
+# 테스트용 생성 파일
+big_test.csv
+sample.csv
