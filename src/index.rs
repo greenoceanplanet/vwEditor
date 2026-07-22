@@ -43,8 +43,20 @@ impl LineIndex {
         }
     }
 
+    /// offset 하나를 뒤에 추가. 병렬 인덱싱 전환 후 프로덕션 경로는
+    /// `replace_offsets`(벌크 교체)를 쓰므로, 이 단건 API는 현재 테스트에서
+    /// offset 배열을 구성하는 데만 쓰인다. API 대칭성을 위해 남겨둔다.
+    #[allow(dead_code)]
     pub fn push_offset(&self, off: u64) {
         self.inner.offsets.write().unwrap().push(off);
+    }
+
+    /// offset 배열 전체를 한 번의 락으로 교체한다. 병렬 스캔 결과(전체 파일의
+    /// 완전한 offset 배열)를 반영할 때 사용한다. 프라이밍이 채운 앞부분은
+    /// 병렬 결과의 접두부와 동일하므로, 교체해도 이음새 없이 이어진다.
+    /// 프라이밍 도중(교체 전)에는 기존 앞부분이 남아 첫 화면이 유지된다.
+    pub fn replace_offsets(&self, offsets: Vec<u64>) {
+        *self.inner.offsets.write().unwrap() = offsets;
     }
 
     pub fn line_count(&self) -> usize {
@@ -128,6 +140,18 @@ mod tests {
         idx.push_offset(10);
         // 마지막 행(1)은 다음 offset이 없으니 total_bytes(30)까지
         assert_eq!(idx.line_range(1), Some((10, 30)));
+    }
+
+    #[test]
+    fn replace_offsets_swaps_whole_array() {
+        let idx = LineIndex::new(100);
+        idx.push_offset(0);
+        idx.push_offset(10);
+        assert_eq!(idx.line_count(), 2);
+        // 프라이밍이 채운 앞부분을 병렬 완료 결과로 통째 교체.
+        idx.replace_offsets(vec![0, 10, 20, 30, 40]);
+        assert_eq!(idx.line_count(), 5);
+        assert_eq!(idx.line_range(4), Some((40, 100)));
     }
 
     #[test]

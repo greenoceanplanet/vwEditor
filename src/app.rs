@@ -172,10 +172,13 @@ impl eframe::App for App {
                         }
                         Phase::Paused => {
                             ui.label(format!(
-                                "일시정지 — {done_gb:.2} / {total_gb:.2} GB ({pct}%)"
+                                "중단됨 — 앞부분 {} 행 표시 중 ({done_gb:.2} / {total_gb:.2} GB)",
+                                doc.index.line_count()
                             ));
                             if ui.button("이어서 읽기").clicked() {
-                                // 새 워커 spawn(재개). 기존 핸들은 이미 종료됨.
+                                // 재개 = 처음부터 다시 병렬 스캔. spawn_indexer가
+                                // 프라이밍→병렬을 새로 수행하며 인덱스를 덮어쓴다.
+                                // 기존 핸들은 이미 종료됨.
                                 let handle = crate::indexer::spawn_indexer(
                                     doc.source.clone(),
                                     doc.index.clone(),
