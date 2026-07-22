@@ -150,6 +150,34 @@ pub fn split_fields(line: &str, delim: u8) -> Vec<String> {
     fields
 }
 
+/// 첫 줄이 헤더인지 추정.
+/// - 첫 줄 전부 비수치 && 아래 줄들에 수치 필드 존재 → 헤더
+/// - 애매하면(첫 줄과 아래 타입이 유사) → 안전하게 true(헤더 ON)
+pub fn detect_header(rows: &[Vec<String>]) -> bool {
+    if rows.len() < 2 {
+        return true; // 판단 근거 부족 → 안전 기본값
+    }
+    let is_numeric = |s: &str| s.trim().parse::<f64>().is_ok();
+
+    let first = &rows[0];
+    let first_all_text = !first.is_empty() && first.iter().all(|f| !is_numeric(f));
+
+    let body_has_numeric = rows[1..]
+        .iter()
+        .any(|r| r.iter().any(|f| is_numeric(f)));
+
+    if first_all_text && body_has_numeric {
+        return true;
+    }
+    // 첫 줄에 수치가 섞여 있고 아래도 비슷하면 데이터일 가능성 → 헤더 아님
+    let first_has_numeric = first.iter().any(|f| is_numeric(f));
+    if first_has_numeric && body_has_numeric {
+        return false;
+    }
+    // 그 외(전부 텍스트 등 애매) → 헤더 ON
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +270,34 @@ mod tests {
     #[test]
     fn split_empty_fields() {
         assert_eq!(split_fields("a,,c", b','), vec!["a", "", "c"]);
+    }
+
+    #[test]
+    fn header_when_first_row_text_rest_numeric() {
+        let rows = vec![
+            vec!["name".to_string(), "age".to_string()],
+            vec!["Alice".to_string(), "30".to_string()],
+            vec!["Bob".to_string(), "25".to_string()],
+        ];
+        assert!(detect_header(&rows));
+    }
+
+    #[test]
+    fn no_header_when_all_numeric() {
+        let rows = vec![
+            vec!["1".to_string(), "2".to_string()],
+            vec!["3".to_string(), "4".to_string()],
+        ];
+        assert!(!detect_header(&rows));
+    }
+
+    #[test]
+    fn header_on_when_ambiguous_all_text() {
+        // 전부 문자열이면 애매 → 안전하게 헤더 ON
+        let rows = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["c".to_string(), "d".to_string()],
+        ];
+        assert!(detect_header(&rows));
     }
 }
