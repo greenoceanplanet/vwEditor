@@ -222,7 +222,13 @@ const ROW_HEIGHT: f32 = 22.0;
 /// 선택 음영(컬럼 선택·셀 사각 선택 공통). 줄무늬 위에 덧그리는 반투명 파랑.
 /// `from_rgba_unmultiplied`가 const가 아니라 함수로 둔다.
 fn sel_shade() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(80, 150, 230, 70)
+    egui::Color32::from_rgba_unmultiplied(60, 120, 200, 80)
+}
+
+/// 헤더 클릭으로 선택된 컬럼 헤더 칸의 불투명 배경색. `sel_shade()`와 같은
+/// 비율로 어둡게 유지해 톤을 맞춘다(둘 중 하나만 바꾸면 어긋난다).
+fn header_sel_color() -> egui::Color32 {
+    egui::Color32::from_rgb(45, 90, 155)
 }
 
 /// 논리 행 번호(logical)에 해당하는 줄을 mmap offset으로 조회해 디코딩·개행
@@ -359,7 +365,17 @@ impl eframe::App for App {
             // dirty가 아니면 그대로 닫히게 둔다.
         }
 
-        // 최상단 메뉴바 (파일 / 도구)
+        // 메뉴바 클로저 안에서는 self를 가변 대여할 수 없으므로, 되돌리기
+        // 클릭 여부만 받아 두었다가 update() 끝에서 적용한다.
+        let mut undo_clicked = false;
+        // "실행 취소" 항목 활성 조건: 편집 모드 + 되돌릴 게 있음.
+        let can_undo = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.edit.as_ref())
+            .map_or(false, |e| !e.undo.is_empty());
+
+        // 최상단 메뉴바 (파일 / 편집 / 도구)
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("파일", |ui| {
@@ -387,6 +403,14 @@ impl eframe::App for App {
                             self.show_save_dialog = true;
                             self.save_as = true;
                             self.init_save_defaults();
+                            ui.close_menu();
+                        }
+                    });
+                });
+                ui.menu_button("편집", |ui| {
+                    ui.add_enabled_ui(can_undo, |ui| {
+                        if ui.button("실행 취소 (Ctrl+Z)").clicked() {
+                            undo_clicked = true;
                             ui.close_menu();
                         }
                     });
@@ -678,7 +702,60 @@ impl eframe::App for App {
             self.save_as = false;
             self.init_save_defaults();
         }
+
+        // Ctrl+Z — 되돌리기(편집 모드 전용). 인라인 셀 편집 중이거나 다른
+        // 위젯이 포커스를 쥐고 있으면(툴바 TextEdit 등) 그쪽에 양보한다.
+        let can_undo_key = self.doc.as_ref().map_or(false, |d| {
+            d.edit.is_some() && d.editing_cell.is_none()
+        }) && self.pending_action.is_none()
+            && !self.show_save_dialog
+            && ctx.memory(|m| m.focused().is_none());
+        if can_undo_key
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z))
+        {
+            if let Some(doc) = &mut self.doc {
+                undo_once(doc);
+            }
+        }
+
+        // 메뉴에서 고른 되돌리기(단축키를 모르는 사용자용). 메뉴바 클로저 안에서는
+        // self를 가변 대여할 수 없어 인텐트만 받아 여기서 적용한다.
+        if undo_clicked {
+            if let Some(doc) = &mut self.doc {
+                undo_once(doc);
+            }
+        }
     }
+}
+
+/// 되돌리기 한 단계를 편집 버퍼에 적용하고, 행 수가 줄었을 수 있으므로
+/// 선택/커서를 현재 버퍼 범위로 클램프한다. 되돌린 게 있으면 dirty를 세운다
+/// (되돌리기도 "저장되지 않은 상태"를 만든다 — 저장 시점과 다른 내용이 된다).
+fn undo_once(doc: &mut Document) {
+    let Some(e) = doc.edit.as_mut() else { return };
+    if !e.undo.undo(&mut e.lines) {
+        return;
+    }
+    e.dirty = true;
+    let len = e.lines.len();
+    // 표 모드 상태: 되돌리기로 행이 줄면 낡은 인덱스가 남는다.
+    doc.editing_cell = None;
+    doc.cell_edit_text.clear();
+    doc.cell_drag_active = false;
+    doc.cell_sel = doc.cell_sel.and_then(|(r0, c0, r1, c1)| {
+        if len == 0 {
+            return None;
+        }
+        let last = len - 1;
+        Some((r0.min(last), c0, r1.min(last), c1))
+    });
+    // 텍스트 모드 상태.
+    doc.text_caret = clamp_pos(&e.lines, doc.text_caret);
+    doc.text_sel = doc
+        .text_sel
+        .map(|(a, b)| (clamp_pos(&e.lines, a), clamp_pos(&e.lines, b)))
+        .filter(|(a, b)| a != b);
+    doc.text_drag_active = false;
 }
 
 /// 저장 다이얼로그. 인코딩/BOM을 고르고 저장하거나 취소한다.
@@ -1118,6 +1195,11 @@ fn apply_edit_sort(doc: &mut Document, specs: &[SortSpec], delim: u8, data_start
         return;
     }
     let order = sort::sort_lines(&e.lines, specs, delim, data_start);
+    // 되돌리기: 역순열을 적용하면 원래 행 순서로 돌아온다. 재배치 **전에** 기록.
+    e.undo.push(crate::edit::EditOp::Reorder {
+        inverse: crate::edit::inverse_of(&order, data_start),
+        data_start,
+    });
     crate::edit::apply_permutation(&mut e.lines, &order, data_start);
     e.dirty = true;
     // 정렬로 행이 뒤섞였으니 행을 가리키던 상태는 무효.
@@ -1272,6 +1354,38 @@ fn normalize_rect(sel: (usize, usize, usize, usize)) -> (usize, usize, usize, us
     (r0.min(r1), c0.min(c1), r0.max(r1), c0.max(c1))
 }
 
+/// 컬럼 선택(헤더 클릭)을 데이터 전 구간 사각 선택으로 바꾼다.
+/// 헤더 행은 제외하고 `data_start`부터 마지막 행(`line_count - 1`)까지.
+/// 데이터 행이 하나도 없으면 None.
+fn column_as_rect(
+    col: usize,
+    data_start: usize,
+    line_count: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if line_count <= data_start {
+        return None;
+    }
+    Some((data_start, col, line_count - 1, col))
+}
+
+/// 복사/잘라내기/붙여넣기/지우기가 실제로 대상으로 삼을 사각 범위.
+///
+/// 셀 사각 선택이 있으면 그것을 쓰고, 없고 헤더 클릭 컬럼 선택만 있으면
+/// 그 컬럼 전체(데이터 행만)를 사각 범위로 환산한다. 둘 다 없으면 None.
+/// 반환값은 정규화된 (r0, c0, r1, c1).
+fn effective_cell_rect(
+    cell_sel: Option<(usize, usize, usize, usize)>,
+    selected_col: Option<usize>,
+    data_start: usize,
+    line_count: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if let Some(sel) = cell_sel {
+        return Some(normalize_rect(sel));
+    }
+    let col = selected_col?;
+    column_as_rect(col, data_start, line_count)
+}
+
 /// (row, col)이 정규화 전 선택 사각형 안에 들어가는지.
 fn rect_contains(sel: (usize, usize, usize, usize), row: usize, col: usize) -> bool {
     let (r0, c0, r1, c1) = normalize_rect(sel);
@@ -1353,6 +1467,24 @@ fn render_table(
     // 프레임부터는 무조건 꺼진 것으로 본다.
     let drag_active = doc.cell_drag_active && primary_down;
 
+    // ---- 키보드 단축키(Ctrl+C/X/V, Delete) ----
+    // 텍스트 모드(`render_text`)와 같은 규율:
+    //  - 편집 모드일 때만,
+    //  - 다른 위젯이 키보드 포커스를 갖고 있지 않을 때만(keyboard_free),
+    //  - 인라인 셀 편집기가 떠 있으면 처리하지 않는다(TextEdit이 가져가야 함).
+    // egui-winit은 Ctrl+C/X/V를 `Key` 이벤트가 아니라
+    // `Event::Copy`/`Cut`/`Paste`로 보내므로 그 이벤트를 읽는다.
+    // `Event::Paste(s)`는 시스템 클립보드 문자열을 직접 주므로 외부 앱(엑셀 등)
+    // → 뷰어 붙여넣기가 여기서 성립한다.
+    let key_actions: Vec<(CellMenuAction, Option<String>)> = if editing
+        && doc.editing_cell.is_none()
+        && ui.memory(|m| m.focused().is_none())
+    {
+        ui.input(collect_cell_key_actions)
+    } else {
+        Vec::new()
+    };
+
     // col_count는 헤더 필드 수와, 앞부분 데이터 행 몇 개를 샘플링한 필드 수의
     // 최댓값으로 정한다. 헤더가 없는 파일(header_fields == None)에서 1로
     // 고정되어 컬럼이 다 숨는 문제, 그리고 헤더보다 넓은 행이 잘리는 문제를
@@ -1401,11 +1533,7 @@ fn render_table(
                     );
                     // 선택된 컬럼은 헤더 칸 전체에 밝은 파란 음영.
                     if selected {
-                        ui.painter().rect_filled(
-                            cell_rect,
-                            0.0,
-                            egui::Color32::from_rgb(60, 110, 180),
-                        );
+                        ui.painter().rect_filled(cell_rect, 0.0, header_sel_color());
                     }
                     // 헤더 텍스트: "번호 이름" + 정렬 화살표. 번호는 col_base 반영.
                     let cn = c + col_base;
@@ -1613,12 +1741,17 @@ fn render_table(
         });
 
     // 클로저 종료 후 헤더 클릭 결과를 반영(같은 컬럼 재클릭이면 선택 해제 토글).
+    // 셀 사각 선택도 함께 지운다 — 컬럼을 고른 순간 사용자의 대상은 그 컬럼이고,
+    // 남아 있는 셀 선택이 `effective_cell_rect`에서 컬럼을 가려 버리면
+    // "헤더를 눌렀는데 컬럼이 복사되지 않는" 혼란이 생긴다.
     if let Some(c) = clicked_col.get() {
         doc.selected_col = if doc.selected_col == Some(c) {
             None
         } else {
             Some(c)
         };
+        doc.cell_sel = None;
+        doc.cell_drag_active = false;
     }
 
     // ---- 여기서부터 편집 인텐트 적용(테이블 클로저 종료 → doc 가변 대여 가능) ----
@@ -1678,15 +1811,46 @@ fn render_table(
     // 판정은 프레임 시작 스냅샷(`cur_sel`)이 아니라 **현재** `doc.cell_sel`로
     // 한다 — 위 3)/4)가 이미 선택을 바꿨을 수 있고, 그 최신 선택이 "우클릭이
     // 선택 안이었나"의 진실이다.
+    // 예외: 셀 선택이 없고 **그 컬럼이 헤더 클릭으로 선택돼 있으면** 컬럼 전체가
+    // 대상이므로 단일 셀로 무너뜨리지 않는다(`effective_cell_rect`가 컬럼을
+    // 사각 범위로 환산한다). 그래야 우클릭 메뉴에서도 컬럼 전체 복사가 된다.
     if let Some((lrow, c)) = menu_target.get() {
+        let column_targeted = doc.cell_sel.is_none() && doc.selected_col == Some(c);
         let inside = doc.cell_sel.map_or(false, |s| rect_contains(s, lrow, c));
-        if !inside {
+        if !inside && !column_targeted {
             doc.cell_sel = Some((lrow, c, lrow, c));
         }
     }
     if let Some(act) = menu_action.get() {
-        apply_cell_menu_action(ui, doc, delim, clipboard, act);
+        apply_cell_menu_action(ui, doc, delim, clipboard, act, None);
     }
+
+    // 6) 키보드 단축키. 메뉴 동작과 **같은 경로**를 태워 구현이 하나로 유지된다.
+    //    `Event::Paste(s)`가 준 시스템 클립보드 문자열은 그대로 넘긴다.
+    for (act, paste) in key_actions {
+        apply_cell_menu_action(ui, doc, delim, clipboard, act, paste.as_deref());
+    }
+}
+
+/// 표 모드 키 입력에서 셀 동작을 뽑는다. `collect_text_intents`와 같은 이유로
+/// (egui-winit이 Ctrl+C/X/V를 Key가 아닌 Copy/Cut/Paste 이벤트로 보낸다)
+/// 그 세 개는 이벤트로만 처리한다. Delete는 일반 Key 이벤트로 온다.
+fn collect_cell_key_actions(i: &egui::InputState) -> Vec<(CellMenuAction, Option<String>)> {
+    let mut out = Vec::new();
+    for ev in &i.events {
+        match ev {
+            egui::Event::Copy => out.push((CellMenuAction::Copy, None)),
+            egui::Event::Cut => out.push((CellMenuAction::Cut, None)),
+            egui::Event::Paste(s) => out.push((CellMenuAction::Paste, Some(s.clone()))),
+            egui::Event::Key {
+                key: egui::Key::Delete,
+                pressed: true,
+                ..
+            } => out.push((CellMenuAction::Clear, None)),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// "셀에서 시작된 드래그가 진행 중인가" 상태 전이. egui의 `primary_down`은
@@ -1712,20 +1876,55 @@ fn commit_editing_cell(doc: &mut Document, delim: u8) {
     if lrow >= e.lines.len() {
         return;
     }
+    // 되돌리기용 이전 줄 전체를 **쓰기 전에** 캡처한다. push 자체는 적용 뒤에
+    // 하지만 담기는 내용은 편집 전 상태이므로 의미가 같고, 값이 그대로일 때
+    // 빈 undo 단계가 쌓이는 것을 막을 수 있다.
+    let before = e.lines[lrow].clone();
     crate::edit::set_cell(&mut e.lines, lrow, c, &text, delim);
+    if e.lines[lrow] == before {
+        return;
+    }
+    e.undo
+        .push(crate::edit::EditOp::Replace(vec![(lrow, before)]));
     e.dirty = true;
 }
 
-/// 컨텍스트 메뉴 동작을 편집 버퍼에 적용한다. 선택 사각형은 논리 행/열 기준.
+/// [r0..=r1] 범위 각 행의 **현재** 전체 텍스트를 `EditOp::Replace`로 만든다.
+/// 편집을 적용하기 **직전에** 호출해 되돌리기용 이전 상태를 캡처한다.
+/// 범위를 벗어난 행은 담지 않는다(`undo`도 조용히 건너뛰지만 낭비를 줄인다).
+fn replace_op_for_rows(lines: &[String], r0: usize, r1: usize) -> crate::edit::EditOp {
+    let mut items = Vec::new();
+    for r in r0..=r1 {
+        if r >= lines.len() {
+            break;
+        }
+        items.push((r, lines[r].clone()));
+    }
+    crate::edit::EditOp::Replace(items)
+}
+
+/// 컨텍스트 메뉴/키보드 단축키 동작을 편집 버퍼에 적용한다.
+/// 선택 사각형은 논리 행/열 기준. 셀 선택이 없고 헤더 클릭 컬럼 선택만 있으면
+/// 그 컬럼 전체(데이터 행)를 대상으로 삼는다(`effective_cell_rect`).
+///
+/// `paste_text`는 시스템 클립보드에서 직접 받은 문자열(`Event::Paste`)이다.
+/// 있으면 그것을 우선 쓰고(외부 앱 → 뷰어 붙여넣기), 없으면 앱 내부
+/// `clipboard` 캐시로 폴백한다.
 fn apply_cell_menu_action(
     ui: &mut egui::Ui,
     doc: &mut Document,
     delim: u8,
     clipboard: &mut String,
     act: CellMenuAction,
+    paste_text: Option<&str>,
 ) {
-    let Some(sel) = doc.cell_sel else { return };
-    let (r0, c0, r1, c1) = normalize_rect(sel);
+    let data_start = if doc.has_header { 1 } else { 0 };
+    let line_count = doc.edit.as_ref().map_or(0, |e| e.lines.len());
+    let Some((r0, c0, r1, c1)) =
+        effective_cell_rect(doc.cell_sel, doc.selected_col, data_start, line_count)
+    else {
+        return;
+    };
     let Some(e) = doc.edit.as_mut() else { return };
 
     match act {
@@ -1738,30 +1937,96 @@ fn apply_cell_menu_action(
             let tsv = crate::edit::cells_to_tsv(&e.lines, r0, c0, r1, c1, delim);
             *clipboard = tsv.clone();
             ui.output_mut(|o| o.copied_text = tsv);
+            e.undo.push(replace_op_for_rows(&e.lines, r0, r1));
             crate::edit::clear_cells(&mut e.lines, r0, c0, r1, c1, delim);
             e.dirty = true;
         }
         CellMenuAction::Paste => {
-            if !clipboard.is_empty() {
-                crate::edit::paste_tsv(&mut e.lines, r0, c0, clipboard, delim);
-                e.dirty = true;
+            // 시스템 클립보드 문자열이 있으면 그것이 진실. 없으면 내부 캐시.
+            let src: String = match paste_text {
+                Some(s) if !s.is_empty() => s.to_owned(),
+                _ => clipboard.clone(),
+            };
+            if src.is_empty() {
+                return;
             }
+            // 붙여넣기 전 행 수를 재 두어야 "행이 늘었는지"를 알 수 있다.
+            let before_len = e.lines.len();
+            // 덮어쓸 행 범위 = r0부터 (붙여넣을 줄 수 - 1)까지. 기존 행을
+            // 덮는 부분만 Replace로 담는다(늘어난 행은 RemoveInserted가 지운다).
+            let paste_rows = src.split('\n').count();
+            let overwrite_last = (r0 + paste_rows - 1).min(before_len.saturating_sub(1));
+            let replace = if r0 < before_len {
+                Some(replace_op_for_rows(&e.lines, r0, overwrite_last))
+            } else {
+                None
+            };
+            crate::edit::paste_tsv(&mut e.lines, r0, c0, &src, delim);
+            let grew = e.lines.len() > before_len;
+            // 한 번의 Ctrl+Z로 값 복원 + 늘어난 행 제거가 모두 일어나야 하므로
+            // Batch로 묶는다. Batch 안은 담긴 순서대로 적용되므로 "늘어난 행
+            // 제거"를 먼저 두어 인덱스가 어긋나지 않게 한다.
+            let op = match (replace, grew) {
+                (Some(rep), true) => Some(crate::edit::EditOp::Batch(vec![
+                    crate::edit::EditOp::RemoveInserted {
+                        at: before_len,
+                        count: e.lines.len() - before_len,
+                    },
+                    rep,
+                ])),
+                (Some(rep), false) => Some(rep),
+                (None, true) => Some(crate::edit::EditOp::RemoveInserted {
+                    at: before_len,
+                    count: e.lines.len() - before_len,
+                }),
+                (None, false) => None,
+            };
+            if let Some(op) = op {
+                e.undo.push(op);
+            }
+            e.dirty = true;
         }
         CellMenuAction::Clear => {
+            e.undo.push(replace_op_for_rows(&e.lines, r0, r1));
             crate::edit::clear_cells(&mut e.lines, r0, c0, r1, c1, delim);
             e.dirty = true;
         }
         CellMenuAction::InsertRowAbove => {
+            e.undo.push(crate::edit::EditOp::RemoveInserted { at: r0, count: 1 });
             crate::edit::insert_row(&mut e.lines, r0, String::new());
             e.dirty = true;
             // 삽입된 빈 행 아래로 선택이 밀린다.
             doc.cell_sel = Some((r0 + 1, c0, r1 + 1, c1));
         }
         CellMenuAction::InsertRowBelow => {
+            let at = (r1 + 1).min(e.lines.len());
+            e.undo.push(crate::edit::EditOp::RemoveInserted { at, count: 1 });
             crate::edit::insert_row(&mut e.lines, r1 + 1, String::new());
             e.dirty = true;
         }
         CellMenuAction::DeleteRows => {
+            // 되돌리기: 지워질 행들을 순서대로 담아 그 자리에 되꽂는다.
+            let removed: Vec<String> = (r0..=r1)
+                .filter(|&r| r < e.lines.len())
+                .map(|r| e.lines[r].clone())
+                .collect();
+            if removed.is_empty() {
+                return;
+            }
+            // 버퍼를 통째로 지우면 `remove_row`가 빈 한 줄을 남긴다(빈 lines
+            // 방지). 그 유령 줄을 그대로 두고 되꽂으면 `[...원본, ""]`이 되어
+            // 한 줄이 늘어나므로, 되돌리기에서 **먼저 그 줄을 치운 뒤** 되꽂도록
+            // Batch로 묶는다(Ctrl+Z 한 번에 끝나야 한다).
+            let removes_everything = removed.len() == e.lines.len();
+            let reinsert = crate::edit::EditOp::ReinsertRemoved { at: r0, lines: removed };
+            e.undo.push(if removes_everything {
+                crate::edit::EditOp::Batch(vec![
+                    crate::edit::EditOp::RemoveInserted { at: 0, count: 1 },
+                    reinsert,
+                ])
+            } else {
+                reinsert
+            });
             // 뒤에서부터 지워야 인덱스가 밀리지 않는다.
             for r in (r0..=r1).rev() {
                 crate::edit::remove_row(&mut e.lines, r);
@@ -2389,6 +2654,18 @@ fn apply_text_intent(
 ) {
     use crate::edit::{backspace, delete_range, insert_str, normalize, selection_text, split_line};
 
+    // 이 인텐트가 버퍼를 바꾸는가. 순수 이동/복사/전체선택은 되돌리기 기록이
+    // 필요 없으므로 스냅샷 비용도 들이지 않는다.
+    let mutating = matches!(
+        intent,
+        TextEditIntent::Insert(_)
+            | TextEditIntent::Newline
+            | TextEditIntent::Backspace
+            | TextEditIntent::Delete
+            | TextEditIntent::Cut
+            | TextEditIntent::Paste(_)
+    );
+
     let caret = doc.text_caret;
     let sel_raw = doc.text_sel;
     let Some(e) = doc.edit.as_mut() else { return };
@@ -2407,6 +2684,20 @@ fn apply_text_intent(
     let delete_sel = |lines: &mut Vec<String>, sel: Option<(_, _)>| -> Option<crate::edit::TextPos> {
         sel.map(|(a, b)| delete_range(lines, a, b))
     };
+
+    // ---- 되돌리기 스냅샷(편집 **전**) ----
+    // 텍스트 편집이 건드릴 수 있는 줄 범위를 미리 통째로 복사해 둔다.
+    // 범위는 [start, end]:
+    //  - Backspace는 캐럿의 앞 줄까지 병합할 수 있으므로 start를 한 줄 넓힌다.
+    //  - Delete는 캐럿의 다음 줄을 끌어올릴 수 있으므로 end를 한 줄 넓힌다.
+    //  - 선택이 있으면 선택 전 구간이 대상이다.
+    // 편집 뒤 행 수 변화(delta)를 보고 op를 고른다(아래 `record_undo`).
+    let snap = if mutating {
+        Some(text_edit_snapshot(&e.lines, caret, sel, &intent))
+    } else {
+        None
+    };
+    let before_len = e.lines.len();
 
     match intent {
         TextEditIntent::Insert(t) => {
@@ -2505,6 +2796,113 @@ fn apply_text_intent(
             e.dirty = true;
         }
     }
+
+    // ---- 되돌리기 기록(편집 **후**, 담기는 내용은 편집 전 스냅샷) ----
+    // 스냅샷 구간이 실제로 바뀌었을 때만 쌓는다. 맨 앞 Backspace/문서 끝
+    // Delete처럼 아무것도 하지 않은 경우에 빈 undo 단계가 생기면 Ctrl+Z가
+    // "아무 일도 안 일어나는" 헛발질이 된다.
+    if let Some(snap) = snap {
+        let changed = e.lines.len() != before_len
+            || snap
+                .lines
+                .iter()
+                .enumerate()
+                .any(|(k, s)| e.lines.get(snap.start + k) != Some(s));
+        if changed {
+            if let Some(op) = undo_op_from_snapshot(snap, before_len, e.lines.len()) {
+                e.undo.push(op);
+            }
+        }
+    }
+}
+
+/// 텍스트 편집 전 스냅샷: 영향을 받을 수 있는 줄 구간 `[start, ..]`의 원본.
+struct TextSnapshot {
+    start: usize,
+    /// 편집 전 `lines[start..=end]`의 사본(end는 lines 길이로 클램프됨).
+    lines: Vec<String>,
+}
+
+/// 인텐트가 건드릴 수 있는 줄 구간을 잡아 편집 **전** 내용을 복사한다.
+///
+/// 텍스트 편집은 대부분 한두 줄만 건드리므로 비용이 작다. 정확성을 위해
+/// 경계를 한 줄씩 넉넉히 잡는다(Backspace는 앞 줄과 병합, Delete는 다음 줄을
+/// 끌어올림). 붙여넣기/입력은 캐럿 줄 하나에서 시작해 아래로만 늘어난다.
+fn text_edit_snapshot(
+    lines: &[String],
+    caret: crate::edit::TextPos,
+    sel: Option<(crate::edit::TextPos, crate::edit::TextPos)>,
+    intent: &TextEditIntent,
+) -> TextSnapshot {
+    let (mut lo, mut hi) = match sel {
+        Some((a, b)) => {
+            let (a, b) = crate::edit::normalize(a, b);
+            (a.line, b.line)
+        }
+        None => (caret.line, caret.line),
+    };
+    if sel.is_none() {
+        match intent {
+            TextEditIntent::Backspace => lo = lo.saturating_sub(1),
+            TextEditIntent::Delete => hi += 1,
+            _ => {}
+        }
+    }
+    let hi = hi.min(lines.len().saturating_sub(1));
+    let start = lo.min(hi);
+    TextSnapshot {
+        start,
+        lines: lines[start..=hi].to_vec(),
+    }
+}
+
+/// 스냅샷 + 행 수 변화로 되돌리기 op 하나를 만든다.
+///
+/// 행 수가 그대로면 스냅샷 구간을 통째로 `Replace`하면 원상복구된다.
+/// 행이 늘었으면(Enter/여러 줄 붙여넣기) 늘어난 만큼을 먼저 제거한 뒤
+/// 스냅샷을 되돌려야 하고, 줄었으면(Backspace 병합/멀티라인 삭제) 부족한
+/// 줄을 되꽂은 뒤 스냅샷을 되돌려야 한다 — 둘 다 `Batch`로 한 단계에 묶는다.
+/// (Batch 내부는 담긴 순서대로 적용되므로 구조 변경을 먼저 둔다.)
+fn undo_op_from_snapshot(
+    snap: TextSnapshot,
+    before_len: usize,
+    after_len: usize,
+) -> Option<crate::edit::EditOp> {
+    if snap.lines.is_empty() {
+        return None;
+    }
+    let n = snap.lines.len();
+    let restore = crate::edit::EditOp::Replace(
+        snap.lines
+            .iter()
+            .enumerate()
+            .map(|(k, s)| (snap.start + k, s.clone()))
+            .collect(),
+    );
+    Some(match after_len.cmp(&before_len) {
+        std::cmp::Ordering::Equal => restore,
+        std::cmp::Ordering::Greater => {
+            // 늘어난 줄들은 스냅샷 구간 바로 뒤에 생긴다(삽입은 캐럿 줄
+            // 아래로만 확장된다). 먼저 그것들을 제거해 길이를 맞춘 뒤 복원.
+            let added = after_len - before_len;
+            crate::edit::EditOp::Batch(vec![
+                crate::edit::EditOp::RemoveInserted { at: snap.start + n, count: added },
+                restore,
+            ])
+        }
+        std::cmp::Ordering::Less => {
+            // 줄어든 만큼 자리를 만들어 준 뒤 스냅샷으로 덮는다. 내용은
+            // 어차피 restore가 전부 덮으므로 자리표시자로 빈 줄을 꽂는다.
+            let lost = before_len - after_len;
+            crate::edit::EditOp::Batch(vec![
+                crate::edit::EditOp::ReinsertRemoved {
+                    at: (snap.start + n).saturating_sub(lost),
+                    lines: vec![String::new(); lost],
+                },
+                restore,
+            ])
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2987,6 +3385,52 @@ mod tests {
     }
 
     #[test]
+    fn column_as_rect_covers_data_rows_only() {
+        // 헤더 있음(data_start=1), 4줄 파일 → 데이터 행 1..=3.
+        assert_eq!(column_as_rect(2, 1, 4), Some((1, 2, 3, 2)));
+        // 헤더 없음 → 0..=3.
+        assert_eq!(column_as_rect(0, 0, 4), Some((0, 0, 3, 0)));
+        // 데이터 행이 없으면(헤더뿐) None.
+        assert_eq!(column_as_rect(0, 1, 1), None);
+        assert_eq!(column_as_rect(0, 0, 0), None);
+        // 한 줄뿐인 헤더 없는 파일.
+        assert_eq!(column_as_rect(3, 0, 1), Some((0, 3, 0, 3)));
+    }
+
+    #[test]
+    fn effective_rect_prefers_cell_selection() {
+        // 셀 선택이 있으면 컬럼 선택은 무시된다(정규화해서 돌려준다).
+        assert_eq!(
+            effective_cell_rect(Some((5, 4, 2, 1)), Some(0), 1, 10),
+            Some((2, 1, 5, 4))
+        );
+        // 셀 선택이 없고 컬럼만 선택 → 컬럼 전체 사각 범위.
+        assert_eq!(effective_cell_rect(None, Some(2), 1, 4), Some((1, 2, 3, 2)));
+        // 둘 다 없으면 None.
+        assert_eq!(effective_cell_rect(None, None, 1, 4), None);
+        // 컬럼은 선택됐지만 데이터 행이 없으면 None.
+        assert_eq!(effective_cell_rect(None, Some(2), 1, 1), None);
+    }
+
+    /// 컬럼 선택 복사가 헤더를 제외하고 그 컬럼만 세로로 뽑는지.
+    /// (`cells_to_tsv`는 한 컬럼이면 행마다 필드 하나 → "값\n값\n값".)
+    #[test]
+    fn column_copy_excludes_header_and_is_vertical() {
+        let (mut app, delim) = edit_doc(b"h1,h2\na,1\nb,2\nc,3\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        doc.selected_col = Some(1);
+        doc.cell_sel = None;
+        let lines = &doc.edit.as_ref().unwrap().lines;
+        let (r0, c0, r1, c1) =
+            effective_cell_rect(doc.cell_sel, doc.selected_col, 1, lines.len()).unwrap();
+        assert_eq!(
+            crate::edit::cells_to_tsv(lines, r0, c0, r1, c1, delim),
+            "1\n2\n3",
+            "헤더 h2는 빠지고 데이터만 세로로"
+        );
+    }
+
+    #[test]
     fn rect_contains_respects_unnormalized_input() {
         // 역방향으로 저장된 선택도 포함 판정이 정확해야 한다(우클릭 셀이
         // 선택 안인지 밖인지 판단하는 데 쓰임).
@@ -3368,6 +3812,359 @@ mod tests {
             Some(editor),
             "다른 셀의 surrender_focus가 편집 중인 TextEdit의 포커스를 빼앗으면 안 된다"
         );
+    }
+
+    // ---- Task 15: 되돌리기 배선 ----
+
+    /// 정렬 → Ctrl+Z 하면 원래 행 순서로 돌아와야 한다(실제 `apply_edit_sort` 경유).
+    #[test]
+    fn undo_restores_row_order_after_edit_sort() {
+        let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\nBob,2\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let before = doc.edit.as_ref().unwrap().lines.clone();
+        let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
+        apply_edit_sort(doc, &[spec], delim, 1);
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines,
+            v(&["name,n", "Alice,1", "Bob,2", "Charlie,3"])
+        );
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, before, "정렬 전 순서 복원");
+    }
+
+    #[test]
+    fn undo_restores_cell_edit() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        doc.editing_cell = Some((1, 0));
+        doc.cell_edit_text = "ZZZ".into();
+        commit_editing_cell(doc, delim);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", "ZZZ,1"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", "a,1"]));
+    }
+
+    #[test]
+    fn cell_edit_with_same_value_pushes_no_undo_step() {
+        // 값이 그대로면 헛된 Ctrl+Z 단계가 쌓이면 안 된다.
+        let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        doc.editing_cell = Some((1, 0));
+        doc.cell_edit_text = "a".into();
+        commit_editing_cell(doc, delim);
+        assert!(doc.edit.as_ref().unwrap().undo.is_empty());
+        assert!(!doc.edit.as_ref().unwrap().dirty);
+    }
+
+    /// `apply_cell_menu_action`을 실제로 태우기 위한 최소 egui Ui 하네스.
+    /// (GUI를 띄우지 않고 한 프레임만 돌려 클립보드/버퍼 변화를 본다.)
+    fn with_ui<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let ctx = egui::Context::default();
+        let mut out = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                out = Some(f(ui));
+            });
+        });
+        out.expect("CentralPanel 클로저가 한 번은 실행된다")
+    }
+
+    #[test]
+    fn undo_restores_cleared_cells() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        doc.cell_sel = Some((1, 0, 2, 1));
+        let mut clip = String::new();
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::Clear, None)
+        });
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", ",", ","]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", "a,1", "b,2"]));
+    }
+
+    #[test]
+    fn undo_restores_row_insert_and_delete() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        let mut clip = String::new();
+        doc.cell_sel = Some((1, 0, 1, 0));
+        with_ui(|ui| {
+            apply_cell_menu_action(
+                ui,
+                doc,
+                delim,
+                &mut clip,
+                CellMenuAction::InsertRowAbove,
+                None,
+            )
+        });
+        assert_eq!(doc.edit.as_ref().unwrap().lines.len(), 4);
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig, "삽입 취소");
+
+        doc.cell_sel = Some((1, 0, 2, 1));
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::DeleteRows, None)
+        });
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig, "삭제 취소");
+    }
+
+    /// 버퍼를 통째로 지우면 `remove_row`가 빈 한 줄을 남긴다. 되돌리기가
+    /// 그 유령 줄까지 치워 정확히 원본이 되어야 한다(Ctrl+Z 한 번에).
+    #[test]
+    fn undo_full_buffer_delete_leaves_no_ghost_line() {
+        let (mut app, delim) = edit_doc(b"a,1\nb,2\n", false);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        let mut clip = String::new();
+        doc.cell_sel = Some((0, 0, 1, 1));
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::DeleteRows, None)
+        });
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&[""]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig);
+    }
+
+    /// 붙여넣기가 행을 늘리면 값 복원 + 늘어난 행 제거가 Ctrl+Z 한 번에.
+    #[test]
+    fn undo_paste_that_grows_rows() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        let mut clip = String::new();
+        doc.cell_sel = Some((1, 0, 1, 0));
+        with_ui(|ui| {
+            apply_cell_menu_action(
+                ui,
+                doc,
+                delim,
+                &mut clip,
+                CellMenuAction::Paste,
+                Some("X\tY\nZ\tW"),
+            )
+        });
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines,
+            v(&["h,v", "X,Y", "Z,W"]),
+            "행이 하나 늘고 기존 행은 덮인다"
+        );
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig);
+    }
+
+    /// `Event::Paste(s)`의 시스템 클립보드 문자열이 내부 캐시보다 우선한다
+    /// (외부 앱 → 뷰어 붙여넣기가 이걸로 성립한다).
+    #[test]
+    fn paste_prefers_system_clipboard_string() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let mut clip = String::from("CACHE");
+        doc.cell_sel = Some((1, 0, 1, 0));
+        with_ui(|ui| {
+            apply_cell_menu_action(
+                ui,
+                doc,
+                delim,
+                &mut clip,
+                CellMenuAction::Paste,
+                Some("EXTERNAL"),
+            )
+        });
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", "EXTERNAL,1"]));
+    }
+
+    /// 컬럼 선택 상태에서 잘라내기 → 그 컬럼 데이터만 비고, Ctrl+Z로 복원.
+    #[test]
+    fn column_cut_clears_whole_column_and_undoes() {
+        let (mut app, delim) = edit_doc(b"h1,h2\na,1\nb,2\nc,3\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        doc.selected_col = Some(1);
+        doc.cell_sel = None;
+        let mut clip = String::new();
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::Cut, None)
+        });
+        assert_eq!(clip, "1\n2\n3");
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines,
+            v(&["h1,h2", "a,", "b,", "c,"]),
+            "헤더는 그대로, 데이터 컬럼만 빈다"
+        );
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig);
+    }
+
+    /// 텍스트 모드 인텐트 하나를 실제 경로로 적용한다(GUI 없이).
+    fn apply_text(doc: &mut Document, clip: &mut String, intent: TextEditIntent) {
+        with_ui(|ui| apply_text_intent(ui, doc, clip, intent));
+    }
+
+    /// 텍스트 모드 문자 입력 → Ctrl+Z(행 수 불변 → Replace).
+    #[test]
+    fn undo_text_insert() {
+        let (mut app, _d) = edit_doc(b"abc\ndef\n", false);
+        let doc = app.doc.as_mut().unwrap();
+        doc.sep = SeparatorMode::None;
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        doc.text_caret = tp(1, 1);
+        let mut clip = String::new();
+        apply_text(doc, &mut clip, TextEditIntent::Insert("XY".into()));
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["abc", "dXYef"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig);
+    }
+
+    /// Enter(줄 분할)는 행 수가 늘어난다 → Batch(RemoveInserted + Replace).
+    #[test]
+    fn undo_text_newline_split() {
+        let (mut app, _d) = edit_doc(b"abcd\nzz\n", false);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        doc.text_caret = tp(0, 2);
+        let mut clip = String::new();
+        apply_text(doc, &mut clip, TextEditIntent::Newline);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["ab", "cd", "zz"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig, "줄 분할 취소");
+    }
+
+    /// 줄 맨 앞 Backspace(줄 병합)는 행 수가 준다 → Batch(ReinsertRemoved + Replace).
+    #[test]
+    fn undo_text_backspace_merge() {
+        let (mut app, _d) = edit_doc(b"ab\ncd\nef\n", false);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        doc.text_caret = tp(1, 0);
+        let mut clip = String::new();
+        apply_text(doc, &mut clip, TextEditIntent::Backspace);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["abcd", "ef"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig, "줄 병합 취소");
+    }
+
+    /// 여러 줄에 걸친 선택 삭제(Cut)도 한 번에 되돌아온다.
+    #[test]
+    fn undo_text_multiline_cut() {
+        let (mut app, _d) = edit_doc(b"hello\nworld\nagain\n", false);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        doc.text_sel = Some((tp(0, 2), tp(2, 3)));
+        doc.text_caret = tp(2, 3);
+        let mut clip = String::new();
+        apply_text(doc, &mut clip, TextEditIntent::Cut);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["hein"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig);
+    }
+
+    /// 여러 줄 붙여넣기(행 증가)도 한 번에 되돌아온다.
+    #[test]
+    fn undo_text_multiline_paste() {
+        let (mut app, _d) = edit_doc(b"ab\ncd\n", false);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        doc.text_caret = tp(0, 1);
+        let mut clip = String::new();
+        apply_text(doc, &mut clip, TextEditIntent::Paste("1\n2\n3".into()));
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["a1", "2", "3b", "cd"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig);
+    }
+
+    /// 문서 맨 앞 Backspace는 아무것도 바꾸지 않으므로 undo 단계도 쌓이지 않는다
+    /// (그렇지 않으면 Ctrl+Z가 아무 일도 안 하는 헛발질이 된다).
+    #[test]
+    fn noop_backspace_pushes_no_undo_step() {
+        let (mut app, _d) = edit_doc(b"ab\n", false);
+        let doc = app.doc.as_mut().unwrap();
+        doc.text_caret = tp(0, 0);
+        let mut clip = String::new();
+        apply_text(doc, &mut clip, TextEditIntent::Backspace);
+        assert!(doc.edit.as_ref().unwrap().undo.is_empty());
+    }
+
+    /// 순수 이동/복사/전체 선택은 되돌리기 대상이 아니다.
+    #[test]
+    fn non_mutating_text_intents_push_no_undo() {
+        let (mut app, _d) = edit_doc(b"ab\ncd\n", false);
+        let doc = app.doc.as_mut().unwrap();
+        let mut clip = String::new();
+        apply_text(doc, &mut clip, TextEditIntent::SelectAll);
+        apply_text(doc, &mut clip, TextEditIntent::Copy);
+        apply_text(doc, &mut clip, TextEditIntent::Move(CaretMove::Right, false));
+        assert!(doc.edit.as_ref().unwrap().undo.is_empty());
+    }
+
+    /// 여러 번 편집 후 Ctrl+Z를 반복하면 LIFO로 하나씩 되돌아간다.
+    #[test]
+    fn repeated_undo_walks_back_lifo() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let s0 = doc.edit.as_ref().unwrap().lines.clone();
+        doc.editing_cell = Some((1, 0));
+        doc.cell_edit_text = "X".into();
+        commit_editing_cell(doc, delim);
+        let s1 = doc.edit.as_ref().unwrap().lines.clone();
+        doc.editing_cell = Some((1, 1));
+        doc.cell_edit_text = "9".into();
+        commit_editing_cell(doc, delim);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", "X,9"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, s1);
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, s0);
+        // 더 되돌릴 게 없으면 아무 일도 없다.
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, s0);
+    }
+
+    /// 되돌리기로 행이 줄어도 선택/캐럿이 범위 밖에 남지 않아야 한다.
+    #[test]
+    fn undo_clamps_selection_and_caret() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let mut clip = String::new();
+        doc.cell_sel = Some((1, 0, 1, 0));
+        // 붙여넣기로 행을 늘린 뒤 늘어난 행을 선택해 둔다.
+        with_ui(|ui| {
+            apply_cell_menu_action(
+                ui,
+                doc,
+                delim,
+                &mut clip,
+                CellMenuAction::Paste,
+                Some("X\nY\nZ"),
+            )
+        });
+        assert_eq!(doc.edit.as_ref().unwrap().lines.len(), 4);
+        doc.cell_sel = Some((3, 0, 3, 0));
+        doc.text_caret = tp(3, 0);
+        undo_once(doc);
+        let len = doc.edit.as_ref().unwrap().lines.len();
+        assert_eq!(len, 2);
+        let (r0, _, r1, _) = doc.cell_sel.unwrap();
+        assert!(r0 < len && r1 < len, "선택이 범위 안으로 클램프");
+        assert!(doc.text_caret.line < len, "캐럿이 범위 안으로 클램프");
+    }
+
+    /// 뷰 전용 모드(편집 버퍼 없음)에서는 되돌리기가 아무 일도 하지 않는다.
+    #[test]
+    fn undo_is_noop_in_view_only_mode() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc.as_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        assert!(doc.edit.is_none());
+        undo_once(doc); // 패닉하지 않고 조용히 통과
+        assert!(doc.edit.is_none());
     }
 
     #[test]

@@ -340,6 +340,13 @@ pub enum EditOp {
     /// 정렬 등 전체 재배치를 되돌린다. inverse[i] = 재배치 후 i번째 줄이
     /// 원래 있던 위치. data_start 이전(헤더)은 건드리지 않는다.
     Reorder { inverse: Vec<u32>, data_start: usize },
+    /// 여러 op를 **한 단계**로 묶는다. 한 번의 사용자 동작이 구조 변화와 값
+    /// 변화를 동시에 일으킬 때(예: 붙여넣기로 행이 늘어남, Enter로 줄이 갈라짐)
+    /// Ctrl+Z 한 번에 전부 되돌아가야 하기 때문에 필요하다.
+    /// 내부 op는 **앞에서부터 순서대로** 적용된다 — 즉 `Batch(vec![a, b])`는
+    /// a를 먼저, b를 나중에 되돌린다(스택의 LIFO와 반대 방향이므로,
+    /// 만드는 쪽이 "되돌릴 순서"대로 담으면 된다).
+    Batch(Vec<EditOp>),
 }
 
 /// 되돌리기 스택. limit을 넘으면 가장 오래된 것부터 버린다(FIFO).
@@ -386,34 +393,48 @@ impl UndoStack {
         let Some(op) = self.ops.pop() else {
             return false;
         };
-        match op {
-            EditOp::Replace(items) => {
-                for (row, text) in items {
-                    if row < lines.len() {
-                        lines[row] = text;
-                    }
-                }
-            }
-            EditOp::RemoveInserted { at, count } => {
-                let end = (at + count).min(lines.len());
-                if at < end {
-                    lines.drain(at..end);
-                }
-                if lines.is_empty() {
-                    lines.push(String::new());
-                }
-            }
-            EditOp::ReinsertRemoved { at, lines: removed } => {
-                let at = at.min(lines.len());
-                for (k, text) in removed.into_iter().enumerate() {
-                    lines.insert(at + k, text);
-                }
-            }
-            EditOp::Reorder { inverse, data_start } => {
-                apply_permutation(lines, &inverse, data_start);
-            }
+        apply_undo_op(lines, op);
+        // "lines는 비어 있지 않다" 불변식은 **한 단계가 끝난 뒤**에만 강제한다.
+        // Batch 중간에 강제하면 유령 줄이 다시 생겨(제거 → 즉시 재삽입) 뒤이은
+        // 되꽂기가 한 줄 늘어난 결과를 낳는다.
+        if lines.is_empty() {
+            lines.push(String::new());
         }
         true
+    }
+}
+
+/// op 하나를 lines에 적용한다(되돌리기 실행). `Batch`는 담긴 순서대로 재귀 적용.
+/// 빈 lines 방어는 호출측(`UndoStack::undo`)이 한 단계 끝에 한 번만 한다.
+fn apply_undo_op(lines: &mut Vec<String>, op: EditOp) {
+    match op {
+        EditOp::Replace(items) => {
+            for (row, text) in items {
+                if row < lines.len() {
+                    lines[row] = text;
+                }
+            }
+        }
+        EditOp::RemoveInserted { at, count } => {
+            let end = (at + count).min(lines.len());
+            if at < end {
+                lines.drain(at..end);
+            }
+        }
+        EditOp::ReinsertRemoved { at, lines: removed } => {
+            let at = at.min(lines.len());
+            for (k, text) in removed.into_iter().enumerate() {
+                lines.insert(at + k, text);
+            }
+        }
+        EditOp::Reorder { inverse, data_start } => {
+            apply_permutation(lines, &inverse, data_start);
+        }
+        EditOp::Batch(ops) => {
+            for inner in ops {
+                apply_undo_op(lines, inner);
+            }
+        }
     }
 }
 
@@ -845,6 +866,39 @@ mod tests {
         st.push(EditOp::Replace(vec![(5, "x".to_string())]));
         assert!(st.undo(&mut lines));
         assert_eq!(lines, v(&["a"]));
+    }
+
+    #[test]
+    fn undo_batch_is_one_step() {
+        // 붙여넣기로 행이 늘어난 상황: 덮어쓴 행 복원 + 늘어난 행 제거가
+        // Ctrl+Z 한 번에 모두 일어나야 한다.
+        let mut lines = v(&["a,b"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::Batch(vec![
+            EditOp::RemoveInserted { at: 1, count: 1 },
+            EditOp::Replace(vec![(0, "a,b".to_string())]),
+        ]));
+        paste_tsv(&mut lines, 0, 0, "1\t2\n3\t4", b',');
+        assert_eq!(lines, v(&["1,2", "3,4"]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["a,b"]), "한 번의 undo로 완전 복구");
+        assert!(st.is_empty(), "Batch는 한 단계만 소비한다");
+    }
+
+    #[test]
+    fn undo_batch_applies_in_order() {
+        // 담긴 순서대로 적용된다: 먼저 유령 줄 제거 → 그다음 원본 되꽂기.
+        let mut lines = v(&["only"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::Batch(vec![
+            EditOp::RemoveInserted { at: 0, count: 1 },
+            EditOp::ReinsertRemoved { at: 0, lines: v(&["x", "y"]) },
+        ]));
+        // 전부 삭제 → remove_row가 빈 한 줄을 남긴다.
+        remove_row(&mut lines, 0);
+        assert_eq!(lines, v(&[""]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["x", "y"]), "유령 줄 없이 정확히 복원");
     }
 
     #[test]
