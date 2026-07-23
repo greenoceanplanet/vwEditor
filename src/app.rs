@@ -199,6 +199,7 @@ impl eframe::App for App {
                                             col,
                                             kind: SortKind::Text,
                                             dir: SortDir::Asc,
+                                            ci: true,
                                         });
                                     }
                                     doc.show_sort_dialog = true;
@@ -475,6 +476,8 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
     let mut open = true;
     let mut do_sort = false;
     let mut remove_idx: Option<usize> = None;
+    // 순서 변경(위/아래로 한 칸): (from, to). 클로저 종료 후 swap.
+    let mut swap_pair: Option<(usize, usize)> = None;
 
     egui::Window::new("다중 컬럼 정렬")
         .open(&mut open)
@@ -485,16 +488,29 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
             ui.label("위에 있는 기준이 1차 정렬입니다. 위→아래 순으로 적용됩니다.");
             ui.separator();
 
+            // 각 기준이 현재 선택 중인 컬럼 목록(스냅샷). 드롭다운에서 "다른 행이
+            // 이미 쓰는 컬럼"을 제외해 같은 컬럼 중복 선택을 막는다.
+            let selected_cols: Vec<usize> = doc.sort_specs.iter().map(|s| s.col).collect();
+
             for i in 0..doc.sort_specs.len() {
                 ui.horizontal(|ui| {
                     ui.label(format!("{}순위", i + 1));
 
-                    // 컬럼 선택 드롭다운.
+                    // 컬럼 선택 드롭다운. 다른 기준이 이미 선택한 컬럼은 목록에서 제외.
                     let cur_col = doc.sort_specs[i].col.min(col_count - 1);
                     egui::ComboBox::from_id_source(("sortcol", i))
                         .selected_text(col_label(cur_col))
                         .show_ui(ui, |ui| {
                             for c in 0..col_count {
+                                // 이 행(i) 자신의 현재 값은 남기고, 다른 행이 쓰는
+                                // 컬럼만 숨긴다.
+                                let used_by_other = selected_cols
+                                    .iter()
+                                    .enumerate()
+                                    .any(|(j, &sc)| j != i && sc == c);
+                                if used_by_other {
+                                    continue;
+                                }
                                 ui.selectable_value(&mut doc.sort_specs[i].col, c, col_label(c));
                             }
                         });
@@ -527,8 +543,26 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
                             ui.selectable_value(&mut doc.sort_specs[i].dir, SortDir::Desc, "내림차순");
                         });
 
+                    // 대소문자 무시(문자 기준일 때만). 체크됨 = 무시(ci=true).
+                    if doc.sort_specs[i].kind == SortKind::Text {
+                        ui.checkbox(&mut doc.sort_specs[i].ci, "대소문자 무시");
+                    }
+
+                    // 순서 변경(↑ 위로, ↓ 아래로). 맨 위/맨 아래에선 해당 버튼 비활성.
+                    let n = doc.sort_specs.len();
+                    ui.add_enabled_ui(i > 0, |ui| {
+                        if ui.button("↑").clicked() {
+                            swap_pair = Some((i, i - 1));
+                        }
+                    });
+                    ui.add_enabled_ui(i + 1 < n, |ui| {
+                        if ui.button("↓").clicked() {
+                            swap_pair = Some((i, i + 1));
+                        }
+                    });
+
                     // 삭제(기준이 2개 이상일 때만).
-                    if doc.sort_specs.len() > 1 && ui.button("✖").clicked() {
+                    if n > 1 && ui.button("✖").clicked() {
                         remove_idx = Some(i);
                     }
                 });
@@ -536,17 +570,30 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
 
             ui.separator();
             ui.horizontal(|ui| {
-                // 기준 추가(MAX_KEYS 미만일 때).
-                if doc.sort_specs.len() < sort::MAX_KEYS && ui.button("+ 기준 추가").clicked() {
-                    let col = doc.sort_specs.last().map(|s| s.col).unwrap_or(0);
-                    doc.sort_specs.push(SortSpec {
-                        col,
-                        kind: SortKind::Text,
-                        dir: SortDir::Asc,
-                    });
-                }
+                // 아직 안 쓰인 컬럼이 있어야, 그리고 MAX_KEYS/전체 컬럼 수 미만일 때만
+                // 기준을 추가할 수 있다(같은 컬럼 중복 금지 정책).
+                let used: Vec<usize> = doc.sort_specs.iter().map(|s| s.col).collect();
+                let next_free = (0..col_count).find(|c| !used.contains(c));
+                let can_add = doc.sort_specs.len() < sort::MAX_KEYS
+                    && doc.sort_specs.len() < col_count
+                    && next_free.is_some();
+
+                ui.add_enabled_ui(can_add, |ui| {
+                    if ui.button("+ 기준 추가").clicked() {
+                        if let Some(col) = next_free {
+                            doc.sort_specs.push(SortSpec {
+                                col,
+                                kind: SortKind::Text,
+                                dir: SortDir::Asc,
+                                ci: true,
+                            });
+                        }
+                    }
+                });
                 if doc.sort_specs.len() >= sort::MAX_KEYS {
                     ui.label(format!("(최대 {}개)", sort::MAX_KEYS));
+                } else if doc.sort_specs.len() >= col_count {
+                    ui.label("(모든 컬럼 사용 중)");
                 }
             });
 
@@ -563,6 +610,11 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
 
     if let Some(i) = remove_idx {
         doc.sort_specs.remove(i);
+    }
+    if let Some((a, b)) = swap_pair {
+        if a < doc.sort_specs.len() && b < doc.sort_specs.len() {
+            doc.sort_specs.swap(a, b);
+        }
     }
     // 창 X로 닫아도 다이얼로그 종료.
     if !open {
@@ -660,6 +712,7 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
                     col,
                     kind: SortKind::Text,
                     dir: SortDir::Asc,
+                    ci: true,
                 });
             }
             doc.show_sort_dialog = true;
@@ -677,6 +730,9 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
 
     // 정렬 버튼이 눌리면 백그라운드 작업을 띄운다.
     if let (Some((kind, dir)), Some(col)) = (do_sort, selected) {
+        // 단일 문자 정렬은 대소문자 무시를 기본으로(사람 직관). 세밀 제어는
+        // 다중 정렬 다이얼로그에서.
+        let ci = kind == SortKind::Text;
         doc.sort_job = Some(sort::spawn_sort(
             doc.source.clone(),
             doc.index.clone(),
@@ -686,6 +742,7 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
             data_start,
             kind,
             dir,
+            ci,
             ctx.clone(),
         ));
     }
