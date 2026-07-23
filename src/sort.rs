@@ -17,6 +17,18 @@ pub enum SortDir {
     Desc,
 }
 
+/// 다중 컬럼 정렬의 한 기준: 어떤 컬럼을 어떤 종류/방향으로 정렬할지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortSpec {
+    pub col: usize,
+    pub kind: SortKind,
+    pub dir: SortDir,
+}
+
+/// 다중 정렬 최대 기준 수. 키를 고정 배열 `[u64; MAX_KEYS]`로 담아 캐시 친화적
+/// 정수 비교를 한다. 4개면 대부분의 실사용을 커버한다.
+pub const MAX_KEYS: usize = 4;
+
 /// 문자 키에 인라인으로 담는 접두부 바이트 수. 앞 8바이트를 u64 하나로 pack해
 /// 정수 비교 한 번으로 대소를 가른다. 8바이트가 완전히 같은 경우에만(그리고
 /// 필드가 8바이트를 넘을 때만) 원본 바이트로 tie-break 한다.
@@ -94,10 +106,12 @@ struct SortShared {
 pub struct SortJob {
     shared: Arc<SortShared>,
     handle: Option<std::thread::JoinHandle<()>>,
-    /// 어떤 정렬인지(완료 후 SortState 구성용).
+    /// 완료 후 SortState 구성용. 다중 정렬이면 1차 기준(화살표 표시용).
     pub col: usize,
     pub kind: SortKind,
     pub dir: SortDir,
+    /// 다중 정렬 기준(2개 이상이면 다중). 단일이면 비어 있다.
+    pub specs: Vec<SortSpec>,
 }
 
 impl SortJob {
@@ -185,6 +199,70 @@ pub fn spawn_sort(
         col,
         kind,
         dir,
+        specs: Vec::new(),
+    }
+}
+
+/// 다중 컬럼 정렬을 백그라운드에서 시작한다. specs는 1차→N차 우선순위.
+/// SortJob의 col/kind/dir은 1차 기준(헤더 화살표 표시용).
+pub fn spawn_multi_sort(
+    source: Arc<Source>,
+    index: LineIndex,
+    enc: Encoding,
+    delim: u8,
+    specs: Vec<SortSpec>,
+    data_start: usize,
+    ctx: egui::Context,
+) -> SortJob {
+    let total_rows = (index.line_count().saturating_sub(data_start)) as u64;
+    let shared = Arc::new(SortShared {
+        rows_done: AtomicU64::new(0),
+        total_rows,
+        result: Mutex::new(None),
+        finished: AtomicBool::new(false),
+    });
+    // 1차 기준(비었으면 기본값 — 호출측이 빈 specs로 부르지 않도록 보장).
+    let first = specs.first().copied().unwrap_or(SortSpec {
+        col: 0,
+        kind: SortKind::Text,
+        dir: SortDir::Asc,
+    });
+
+    let shared_bg = shared.clone();
+    let specs_bg = specs.clone();
+    let handle = std::thread::spawn(move || {
+        let progress = {
+            let shared = shared_bg.clone();
+            let ctx = ctx.clone();
+            move |n: usize| {
+                shared.rows_done.fetch_add(n as u64, Ordering::Relaxed);
+                ctx.request_repaint();
+            }
+        };
+        let perm = extract_and_multi_sort(
+            &source,
+            &index,
+            enc,
+            delim,
+            &specs_bg,
+            data_start,
+            Some(&progress),
+        );
+        shared_bg
+            .rows_done
+            .store(shared_bg.total_rows, Ordering::Relaxed);
+        *shared_bg.result.lock().unwrap() = Some(perm);
+        shared_bg.finished.store(true, Ordering::Relaxed);
+        ctx.request_repaint();
+    });
+
+    SortJob {
+        shared,
+        handle: Some(handle),
+        col: first.col,
+        kind: first.kind,
+        dir: first.dir,
+        specs,
     }
 }
 
@@ -290,6 +368,121 @@ pub fn extract_and_sort(
     }
 
     keyed.into_iter().map(|(_, _, idx)| idx).collect()
+}
+
+/// 한 기준(SortSpec)에 대해 한 행의 컬럼 값 → 방향 반영 u64 키.
+/// 다중 정렬용: 방향을 키에 인코딩해 `[u64; N]` 배열의 단일 정수 비교로 오름/내림
+/// 혼합을 표현한다. 내림(Desc)은 유효 키를 비트 반전(`!key`)하되, 숫자 비수치
+/// (NUM_INVALID=u64::MAX)는 반전하지 않아 방향 무관하게 맨 뒤로 남긴다.
+///
+/// 다중 정렬은 tie-break 원본 재접근 없이 앞 8바이트 prefix로만 비교한다(설계상
+/// 단순화). truncated는 여기서 쓰지 않는다.
+fn col_key(field: Option<&[u8]>, spec: SortSpec) -> u64 {
+    let raw = match spec.kind {
+        SortKind::Text => match field {
+            Some(f) => text_key(f),
+            None => 0, // 컬럼 없음/빈값 = 사전순 맨 앞
+        },
+        SortKind::Number => match field {
+            Some(f) => number_key(f), // 비수치면 NUM_INVALID
+            None => NUM_INVALID,
+        },
+    };
+    match spec.dir {
+        SortDir::Asc => raw,
+        SortDir::Desc => {
+            // 숫자 비수치는 항상 맨 뒤 → 반전하지 않는다.
+            if spec.kind == SortKind::Number && raw == NUM_INVALID {
+                NUM_INVALID
+            } else {
+                !raw
+            }
+        }
+    }
+}
+
+/// 한 행에서 specs 순서대로 키 배열 `[u64; MAX_KEYS]`를 만든다(미사용 슬롯 0).
+fn multi_key_for_row(
+    bytes: &[u8],
+    offsets: &[u64],
+    total_bytes: u64,
+    enc: Encoding,
+    delim: u8,
+    specs: &[SortSpec],
+    logical: usize,
+) -> [u64; MAX_KEYS] {
+    let mut keys = [0u64; MAX_KEYS];
+    let Some((s, e)) = LineIndex::range_in(offsets, total_bytes, logical) else {
+        // 행 범위를 못 얻으면 각 기준의 "빈 값" 키로.
+        for (k, spec) in keys.iter_mut().zip(specs.iter()) {
+            *k = col_key(None, *spec);
+        }
+        return keys;
+    };
+    let raw = &bytes[s as usize..e as usize];
+
+    // UTF-16은 field_slice(단일바이트 전용)가 부정확하므로 디코딩 폴백.
+    match enc {
+        Encoding::Utf8 | Encoding::Cp949 => {
+            let line = trim_newline(raw);
+            for (slot, spec) in keys.iter_mut().zip(specs.iter()) {
+                let field = parse::field_slice(line, delim, spec.col);
+                *slot = col_key(field, *spec);
+            }
+        }
+        Encoding::Utf16Le | Encoding::Utf16Be => {
+            let text = parse::decode_line(raw, enc);
+            let fields = parse::split_fields(text.trim_end_matches(['\r', '\n']), delim);
+            for (slot, spec) in keys.iter_mut().zip(specs.iter()) {
+                let field = fields.get(spec.col).map(|f| f.as_bytes());
+                *slot = col_key(field, *spec);
+            }
+        }
+    }
+    keys
+}
+
+/// 다중 컬럼 정렬. specs를 앞에서부터(1차→N차) 우선순위로 적용해 permutation을
+/// 만든다. 단일 `extract_and_sort`의 다중 버전 — 같은 락 없는 snapshot + 순차
+/// 순회 인프라를 쓴다. specs가 비었으면 빈 permutation.
+pub fn extract_and_multi_sort(
+    source: &Arc<Source>,
+    index: &LineIndex,
+    enc: Encoding,
+    delim: u8,
+    specs: &[SortSpec],
+    data_start: usize,
+    progress: Option<&(dyn Fn(usize) + Sync)>,
+) -> Vec<u32> {
+    let total = index.line_count();
+    if total <= data_start || specs.is_empty() {
+        return Vec::new();
+    }
+    let data_rows = total - data_start;
+
+    let (offsets, total_bytes) = index.snapshot();
+    let offsets: &[u64] = &offsets;
+    let bytes = source.as_bytes();
+
+    // 키 배열 + 원본 행번호. par_chunks_mut로 각 워커가 자기 구간 순차 순회.
+    let mut keyed: Vec<([u64; MAX_KEYS], u32)> = vec![([0u64; MAX_KEYS], 0); data_rows];
+    const CHUNK: usize = 64 * 1024;
+    keyed.par_chunks_mut(CHUNK).enumerate().for_each(|(ci, chunk)| {
+        let base = ci * CHUNK;
+        for (j, slot) in chunk.iter_mut().enumerate() {
+            let logical = data_start + base + j;
+            let keys = multi_key_for_row(bytes, offsets, total_bytes, enc, delim, specs, logical);
+            *slot = (keys, logical as u32);
+        }
+        if let Some(p) = progress {
+            p(chunk.len());
+        }
+    });
+
+    // 키 배열 사전식 비교(방향은 키에 이미 인코딩됨) → 동률이면 행번호로 안정화.
+    keyed.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    keyed.into_iter().map(|(_, idx)| idx).collect()
 }
 
 /// 한 행의 선택 컬럼에서 정렬 키를 추출한다(락 없는 hot path 버전).
@@ -603,5 +796,108 @@ mod tests {
         let (src, idx) = open_indexed(b"-3.5\n2\n-10\n0.5\n");
         let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, None);
         assert_eq!(perm, vec![2, 0, 3, 1]);
+    }
+
+    // ---- 다중 컬럼 정렬 ----
+
+    fn spec(col: usize, kind: SortKind, dir: SortDir) -> SortSpec {
+        SortSpec { col, kind, dir }
+    }
+
+    #[test]
+    fn multi_city_then_age() {
+        // city(col0 문자 오름), age(col1 숫자 오름).
+        // 원본: 0 "B,30", 1 "A,20", 2 "B,10", 3 "A,40"
+        // 1차 city: A(1,3), B(0,2). 2차 age 오름 → A: 20(1),40(3); B: 10(2),30(0)
+        // → [1,3,2,0]
+        let (src, idx) = open_indexed(b"B,30\nA,20\nB,10\nA,40\n");
+        let specs = [
+            spec(0, SortKind::Text, SortDir::Asc),
+            spec(1, SortKind::Number, SortDir::Asc),
+        ];
+        let perm = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, None);
+        assert_eq!(perm, vec![1, 3, 2, 0]);
+    }
+
+    #[test]
+    fn multi_mixed_direction() {
+        // 1차 city 오름, 2차 age 내림.
+        // 원본: 0 "B,30", 1 "A,20", 2 "B,10", 3 "A,40"
+        // city: A(1,3), B(0,2). age 내림 → A: 40(3),20(1); B: 30(0),10(2)
+        // → [3,1,0,2]
+        let (src, idx) = open_indexed(b"B,30\nA,20\nB,10\nA,40\n");
+        let specs = [
+            spec(0, SortKind::Text, SortDir::Asc),
+            spec(1, SortKind::Number, SortDir::Desc),
+        ];
+        let perm = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, None);
+        assert_eq!(perm, vec![3, 1, 0, 2]);
+    }
+
+    #[test]
+    fn multi_first_key_tie_breaks_to_second() {
+        // 1차가 모두 같으면 2차로 완전히 갈린다.
+        // 원본: 0 "x,3", 1 "x,1", 2 "x,2" → 1차 x 동률, 2차 숫자 오름 1(1),2(2),3(0)
+        // → [1,2,0]
+        let (src, idx) = open_indexed(b"x,3\nx,1\nx,2\n");
+        let specs = [
+            spec(0, SortKind::Text, SortDir::Asc),
+            spec(1, SortKind::Number, SortDir::Asc),
+        ];
+        let perm = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, None);
+        assert_eq!(perm, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn multi_non_numeric_last_in_key() {
+        // 2차 숫자 기준에서 비수치는 그 그룹 내 맨 뒤(오름/내림 무관).
+        // 원본: 0 "A,5", 1 "A,abc", 2 "A,1"
+        // 1차 A 동률, 2차 숫자 오름: 1(2),5(0),[abc](1) → [2,0,1]
+        let (src, idx) = open_indexed(b"A,5\nA,abc\nA,1\n");
+        let specs = [
+            spec(0, SortKind::Text, SortDir::Asc),
+            spec(1, SortKind::Number, SortDir::Asc),
+        ];
+        let perm = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, None);
+        assert_eq!(perm, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn multi_non_numeric_last_even_descending() {
+        // 2차 숫자 내림에서도 비수치는 맨 뒤.
+        // 원본: 0 "A,5", 1 "A,abc", 2 "A,1"
+        // 2차 내림: 5(0),1(2),[abc](1) → [0,2,1]
+        let (src, idx) = open_indexed(b"A,5\nA,abc\nA,1\n");
+        let specs = [
+            spec(0, SortKind::Text, SortDir::Asc),
+            spec(1, SortKind::Number, SortDir::Desc),
+        ];
+        let perm = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, None);
+        assert_eq!(perm, vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn multi_single_spec_matches_single_sort() {
+        // 기준 1개면 단일 정렬과 동일 결과(회귀).
+        let (src, idx) = open_indexed(b"10\n2\n9\n");
+        let single =
+            extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, None);
+        let multi = extract_and_multi_sort(
+            &src,
+            &idx,
+            Encoding::Utf8,
+            b',',
+            &[spec(0, SortKind::Number, SortDir::Asc)],
+            0,
+            None,
+        );
+        assert_eq!(single, multi);
+    }
+
+    #[test]
+    fn multi_empty_specs_returns_empty() {
+        let (src, idx) = open_indexed(b"a\nb\n");
+        let perm = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &[], 0, None);
+        assert!(perm.is_empty());
     }
 }
