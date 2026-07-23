@@ -113,6 +113,27 @@ fn drop_hint_text(n: usize) -> String {
     }
 }
 
+/// 드롭된 파일들에 대해 "무엇을 열 것인가 / 잠금 안내를 띄울 것인가"를
+/// 결정한다. `update()`와 테스트가 이 함수 하나를 공유해야 한다 — 잠금
+/// 판단을 `update()` 안에 인라인으로 두면(과거처럼) 테스트가 그 로직을
+/// 복붙해 검증하는 꼴이 되어, 실제 가드를 지워도 테스트는 계속 통과하는
+/// 착시가 생긴다.
+enum DropPlan {
+    /// 잠겨 있어 열지 않는다. 문구를 그대로 `self.error`에 넣는다.
+    Locked(String),
+    /// 열 파일 경로들(디렉터리는 이미 걸러짐). 비어 있을 수도 있다(전부
+    /// 디렉터리였던 경우) — 그때는 아무 것도 하지 않는다.
+    Open(Vec<std::path::PathBuf>),
+}
+
+fn plan_dropped_files(dropped: Vec<std::path::PathBuf>, locked: bool) -> DropPlan {
+    if locked {
+        DropPlan::Locked("Close the open dialog before opening files.".to_owned())
+    } else {
+        DropPlan::Open(droppable_paths(dropped))
+    }
+}
+
 /// 이 동작이 "큰 컬럼 연산" 확인 대상인지. 대상 행 수가 임계치를 넘을 때만
 /// 묻는다. 행 삽입은 한 줄짜리라 범위와 무관하게 항상 즉시 수행한다.
 fn needs_big_op_confirm(act: CellMenuAction, rows: usize) -> bool {
@@ -585,22 +606,34 @@ impl eframe::App for App {
                 .collect()
         });
         if !dropped.is_empty() {
-            if locked {
-                self.error = Some("Close the open dialog before opening files.".to_owned());
-            } else {
-                // 여러 개면 순서대로 연다 — open_path가 매번 탭을 추가하고
-                // 활성화하므로 마지막 파일의 탭이 자연스럽게 활성 탭이 된다.
-                //
-                // 여기서 새 스레드를 만들지 않는다. open_path가 하는 일(파일
-                // 열기 + 앞 64KB로 인코딩/구분자/헤더 감지)은 메인 스레드에서
-                // 파일당 수 밀리초고, 그 직후 spawn_indexer가 문서마다 독립된
-                // 백그라운드 스레드를 띄운다(그 인덱서 자체가 내부적으로
-                // rayon으로 병렬 스캔한다). 그러므로 이 루프를 순차로 돌리는
-                // 것만으로 드롭된 파일들의 인덱싱은 이미 전부 동시에 진행된다
-                // — std::thread::spawn/rayon/채널을 여기 추가로 넣는 것은
-                // 불필요한 중복이다.
-                for p in droppable_paths(dropped) {
-                    self.open_path(&p, ctx);
+            match plan_dropped_files(dropped, locked) {
+                DropPlan::Locked(msg) => self.error = Some(msg),
+                DropPlan::Open(paths) => {
+                    // 여러 개면 순서대로 연다 — open_path가 매번 탭을 추가하고
+                    // 활성화하므로 마지막 파일의 탭이 자연스럽게 활성 탭이 된다.
+                    //
+                    // 여기서 새 스레드를 만들지 않는다. open_path가 하는 일(파일
+                    // 열기 + 앞 64KB로 인코딩/구분자/헤더 감지)은 메인 스레드에서
+                    // 파일당 수 밀리초고, 그 직후 spawn_indexer가 문서마다 독립된
+                    // 백그라운드 스레드를 띄운다(그 인덱서 자체가 내부적으로
+                    // rayon으로 병렬 스캔한다). 그러므로 이 루프를 순차로 돌리는
+                    // 것만으로 드롭된 파일들의 인덱싱은 이미 전부 동시에 진행된다
+                    // — std::thread::spawn/rayon/채널을 여기 추가로 넣는 것은
+                    // 불필요한 중복이다.
+                    //
+                    // open_path는 진입 시 self.error를 무조건 지운다(단일 파일
+                    // 열기에서는 그게 맞는 계약이다). 배치 중 앞쪽 파일이
+                    // 실패하고 뒤쪽 파일이 성공하면 그 지움 때문에 실패가
+                    // 조용히 사라지므로, 배치 동안의 마지막 실패 메시지를 따로
+                    // 쥐고 있다가 루프가 끝난 뒤 복원한다.
+                    let mut last_failure: Option<String> = None;
+                    for p in paths {
+                        self.open_path(&p, ctx);
+                        if let Some(e) = self.error.take() {
+                            last_failure = Some(e);
+                        }
+                    }
+                    self.error = last_failure;
                 }
             }
         }
@@ -3662,18 +3695,78 @@ mod tests {
         // 저장 다이얼로그가 떠 있는 상태(탭 바 잠금)를 재현한다. 이미 있는
         // tab_switch_blocked_while_save_dialog_open은 "탭 바가 잠기는가"를
         // 검증하고, 여기서는 그 잠금이 실제로 "드롭이 탭을 추가하지 못하게"
-        // 막는지를 확인한다 — update() 안의 드롭 처리 진입 조건과 동일하게
-        // tab_bar_locked()를 게이트로 써서 open_path 호출 자체를 건너뛴다.
+        // 막는지를 확인한다. update()가 실제로 위임하는 plan_dropped_files를
+        // 그대로 호출한다 — 가드를 인라인으로 복붙하면 update() 안의 진짜
+        // 가드를 지워도 이 테스트는 계속 통과하는 착시가 생긴다.
         let mut app = App {
             show_save_dialog: true,
             ..App::default()
         };
         let p = temp(b"a,b\n1,2\n");
         let ctx = egui::Context::default();
-        if !tab_bar_locked(&app.pending_action, app.show_save_dialog) {
-            app.open_path(&p, &ctx);
+        let locked = tab_bar_locked(&app.pending_action, app.show_save_dialog);
+        match plan_dropped_files(vec![p], locked) {
+            DropPlan::Locked(msg) => app.error = Some(msg),
+            DropPlan::Open(paths) => {
+                for p in paths {
+                    app.open_path(&p, &ctx);
+                }
+            }
         }
         assert_eq!(app.docs.len(), 0, "잠겨 있으면 드롭이 탭을 추가하지 않는다");
+        assert!(app.error.is_some(), "잠겨 있으면 안내 메시지를 남겨야 한다");
+    }
+
+    #[test]
+    fn plan_dropped_files_open_when_unlocked() {
+        let p1 = temp(b"a,b\n1,2\n");
+        let p2 = temp(b"c,d\n3,4\n");
+        match plan_dropped_files(vec![p1.clone(), p2.clone()], false) {
+            DropPlan::Open(paths) => assert_eq!(paths, vec![p1, p2]),
+            DropPlan::Locked(_) => panic!("잠겨 있지 않으면 열어야 한다"),
+        }
+    }
+
+    #[test]
+    fn plan_dropped_files_locked_reports_message_without_opening() {
+        let p = temp(b"a,b\n1,2\n");
+        match plan_dropped_files(vec![p], true) {
+            DropPlan::Locked(msg) => assert!(msg.contains("Close")),
+            DropPlan::Open(_) => panic!("잠겨 있으면 열지 않아야 한다"),
+        }
+    }
+
+    #[test]
+    fn drop_batch_keeps_last_failure_visible_after_later_success() {
+        // Important 1 회귀 테스트: 실패한 파일 뒤에 성공한 파일이 오면
+        // open_path의 "진입 시 self.error = None" 계약 때문에 실패 메시지가
+        // 조용히 사라지던 버그. update()의 드롭 처리 루프와 동일한 순서로
+        // (plan_dropped_files → open_path 반복 → 마지막 실패 복원) 재현한다.
+        let bad = std::path::PathBuf::from("nope_batch_xyz.csv");
+        let good = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+
+        let paths = match plan_dropped_files(vec![bad, good.clone()], false) {
+            DropPlan::Open(paths) => paths,
+            DropPlan::Locked(_) => panic!("잠겨 있지 않으면 열어야 한다"),
+        };
+        let mut last_failure: Option<String> = None;
+        for p in paths {
+            app.open_path(&p, &ctx);
+            if let Some(e) = app.error.take() {
+                last_failure = Some(e);
+            }
+        }
+        app.error = last_failure;
+
+        assert!(
+            app.error.is_some(),
+            "배치 중 실패가 이후 성공에 가려지면 안 된다"
+        );
+        assert_eq!(app.docs.len(), 1, "성공한 파일의 탭은 남아 있어야 한다");
+        assert_eq!(app.active, 0, "성공한 파일의 탭이 활성 상태여야 한다");
+        assert_eq!(app.docs[0].path, good);
     }
 
     /// 탭 3개를 열어 둔 App을 만든다. 각 파일 내용은 서로 달라 path로 구분 가능.
