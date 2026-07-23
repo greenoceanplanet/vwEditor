@@ -1179,10 +1179,7 @@ impl eframe::App for App {
         // 입력란 타이핑이 문서로 새지 않는다(`focused_widget_blocks_document_
         // key_intents`가 지키는 성질은 본문의 `keyboard_free` 게이트이고,
         // 그 게이트는 여기서 손대지 않는다).
-        let find_keys_live = self.doc().is_some()
-            && self.doc().is_some_and(|d| d.editing_cell.is_none())
-            && self.pending_action.is_none()
-            && !self.show_save_dialog;
+        let find_keys_live = find_keys_live(self);
         if find_keys_live {
             // Ctrl+F — 패널 열기 + 입력란 포커스. 이미 열려 있으면 포커스만
             // 다시 준다(다른 곳을 클릭한 뒤 Ctrl+F로 돌아오는 흐름).
@@ -1201,10 +1198,21 @@ impl eframe::App for App {
                     }
                 }
             }
-            // Escape — 찾기 패널 닫기. 패널이 열려 있을 때만 소비한다. 닫으면서
-            // 포커스도 놓아 준다 — 입력란이 포커스를 쥔 채 패널이 사라지면
-            // 본문의 `keyboard_free` 게이트가 닫힌 채로 남아 편집이 죽는다.
-            if self.doc().is_some_and(|d| d.show_find)
+            // Escape — 찾기 패널 닫기. 패널이 열려 있을 때만 소비한다.
+            //
+            // **포커스 판정(Minor 7).** 게이트를 `show_find`만으로 두면 툴바의
+            // 커스텀 구분자 TextEdit(`ui.add(egui::TextEdit::singleline(&mut
+            // doc.custom_sep_input)...)`, 이 파일의 그 지점 참조) 같은 **무관한**
+            // 위젯에 포커스가 있어도 Escape가 패널을 닫아 버린다 — 그 입력란은
+            // 자기 것이 아닌 키에 반응해선 안 된다. 그렇다고 "포커스가 아예
+            // 없을 때만"(`can_undo_key`식)으로 좁히면, 찾기 입력란 자신에
+            // 포커스가 있는 정상 흐름(Ctrl+F로 연 직후, 타이핑 중)에서 Escape가
+            // 죽어 버린다 — 그게 이 단축키의 존재 이유다. 그래서 "포커스가
+            // 없거나, 찾기 입력란 자신에 있을 때"로 명시적으로 좁힌다.
+            let focus = ctx.memory(|m| m.focused());
+            let escape_owner_ok = focus.is_none() || focus == Some(find_query_id());
+            if escape_owner_ok
+                && self.doc().is_some_and(|d| d.show_find)
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
             {
                 if let Some(doc) = self.doc_mut() {
@@ -1390,6 +1398,82 @@ fn find_origin(doc: &Document, forward: bool) -> crate::edit::TextPos {
     }
 }
 
+/// 찾기 단축키(Ctrl+F/F3/Escape)가 살아 있는지. `needs_big_op_confirm`/
+/// `next_cell_drag_active`/`tab_label`/`plan_dropped_files`와 같은 규율로
+/// 순수 함수로 뽑아 `update()`와 테스트가 **같은 코드**를 실행하게 한다
+/// (Minor 6) — 게이트 식을 테스트에 따로 베껴 적으면, 실제 게이트를 지우거나
+/// 뒤집어도 그 테스트는 자기 사본만 보고 계속 통과한다.
+///
+/// 문서가 있고, 인라인 셀 편집 중이 아니고, 대기 중인 확인 동작/저장
+/// 다이얼로그가 없을 때만 살아 있다 — `can_undo_key`와 같은 규율이다.
+fn find_keys_live(app: &App) -> bool {
+    app.doc().is_some()
+        && app.doc().is_some_and(|d| d.editing_cell.is_none())
+        && app.pending_action.is_none()
+        && !app.show_save_dialog
+}
+
+/// 표 모드가 실제로 그리는 컬럼 수. `render_table`의 col_count 계산
+/// (`app.rs`의 그 지점 주석 — 헤더 필드 수와 앞부분 데이터 행 몇 개를
+/// 샘플링한 필드 수의 최댓값)과 **완전히 같은 알고리즘**이어야 한다 —
+/// `render_table`은 모든 행에 이 **하나의** col_count만큼 칸을 그리므로
+/// (행마다 실제 필드 수가 달라도), "행 전체 선택"의 끝 컬럼도 이 값이어야
+/// 화면에 그려지는 칸 수와 일치한다(Important 2). 그 행 자신의 필드 수만
+/// 쓰면 다른 행이 더 넓을 때 화면보다 좁게 선택된다 — 그래서 세 번째
+/// 기준(`selected_col`처럼 매치와 무관한 UI 상태)을 새로 만들지 않고 이
+/// 함수 하나로 `render_table`과 `focus_match`가 값을 공유한다.
+fn table_col_count(doc: &Document, delim: u8) -> usize {
+    let total_lines = match &doc.edit {
+        Some(e) => e.lines.len(),
+        None => doc.index.line_count(),
+    };
+    let header_len = if doc.has_header && total_lines > 0 {
+        parse_logical_line_edit(doc, 0, delim).map_or(0, |f| f.len())
+    } else {
+        0
+    };
+    let data_start = if doc.has_header { 1 } else { 0 };
+    const COL_COUNT_SAMPLE_ROWS: usize = 10;
+    let mut col_count = header_len;
+    for logical in data_start..data_start + COL_COUNT_SAMPLE_ROWS {
+        if let Some(fields) = parse_logical_line_edit(doc, logical, delim) {
+            col_count = col_count.max(fields.len());
+        }
+    }
+    col_count.max(1)
+}
+
+/// 논리 행번호 → **헤더를 뺀** 화면 행(= `render_table`의 `view_row`,
+/// `pending_scroll_row`가 요구하는 단위). `TableBuilder`의 `scroll_to_row`가
+/// 이 값을 그대로 받는다.
+///
+/// 정렬 permutation이 있으면(뷰 모드 정렬, `doc.sort`) `render_table`이
+/// `permutation[view_row] = 논리 행`(절대 논리 행번호, 헤더 포함 좌표계 —
+/// `sort::extract_and_sort`의 문서 주석 참조)으로 화면 행을 논리 행으로
+/// 바꾸므로, 여기서는 그 **역**을 찾아야 한다(Important 1). `position()`이
+/// 이미 "몇 번째 데이터 행인가"(= view_row)를 직접 내놓으므로 — 배열 자체가
+/// data_start 이후 행만 담고 0-based이므로 — 이 경우 **추가로 data_start를
+/// 빼면 안 된다**(이중 차감 버그).
+///
+/// permutation이 없으면(정렬 없음, 또는 편집 모드 정렬 — `apply_edit_sort`가
+/// 물리적으로 줄을 재배치하고 `doc.sort`를 None으로 둔다) 화면 행은
+/// `logical - data_start`다(`render_table`의 `logical = data_start +
+/// view_row`의 역).
+///
+/// `position()`은 O(permutation 길이) 선형 탐색이다. Find Next 한 번 누를
+/// 때 한 번만 도는 것이므로(사용자 조작당 1회) 천만 행 정렬에서도 감수할
+/// 만하다 — 매 프레임 도는 코드가 아니다.
+fn logical_to_screen_row(doc: &Document, logical: usize, data_start: usize) -> usize {
+    match &doc.sort {
+        Some(s) => s
+            .permutation
+            .iter()
+            .position(|&r| r as usize == logical)
+            .unwrap_or_else(|| logical.saturating_sub(data_start)),
+        None => logical.saturating_sub(data_start),
+    }
+}
+
 /// 찾은 매치를 화면에 반영한다 — 선택 표시 + 스크롤 요청.
 ///
 /// 텍스트 모드는 매치 구간을 그대로 선택(`text_sel`)하고 캐럿을 매치 끝에
@@ -1397,6 +1481,10 @@ fn find_origin(doc: &Document, forward: bool) -> crate::edit::TextPos {
 /// 컬럼 번호가 아니고, 인용/구분자를 거슬러 셀 단위로 정밀 매핑하는 것은
 /// 이 기능이 요구하는 바가 아니다(YAGNI). 어느 쪽이든 스크롤은 다음
 /// 프레임에 `pending_scroll_row`로 이뤄진다(그 필드 주석 참조).
+///
+/// `cell_sel`의 행은 `render_table`이 **논리** 행으로 해석하므로(화면 행이
+/// 아니라) 여기서 그대로 논리 행을 담는다 — 스크롤 목적지만 화면 행으로
+/// 변환하면 된다.
 fn focus_match(doc: &mut Document, m: crate::find::Match) {
     doc.last_match = Some(m);
     doc.find_status.clear();
@@ -1408,13 +1496,15 @@ fn focus_match(doc: &mut Document, m: crate::find::Match) {
             doc.text_sel = Some((start, end));
             doc.pending_scroll_row = Some(m.line);
         }
-        SeparatorMode::Char(_) => {
-            // 표 모드의 화면 행 = 논리 행 - data_start(헤더 한 줄). 헤더 행에
-            // 매치가 있으면 0행으로 붙는다.
+        SeparatorMode::Char(d) => {
+            // 표 모드의 화면 행 = 정렬 permutation의 역 매핑(정렬 없으면
+            // 논리 행 - data_start). `logical_to_screen_row`가 이미 header를
+            // 제외한 view_row 단위를 돌려주므로 여기서 또 data_start를 빼면
+            // 이중 차감이 된다 — 헤더 행에 매치가 있으면 0행으로 붙는다.
             let data_start = if doc.has_header { 1 } else { 0 };
-            let last_col = doc.selected_col.unwrap_or(0);
+            let last_col = table_col_count(doc, d).saturating_sub(1);
             doc.cell_sel = Some((m.line, 0, m.line, last_col));
-            doc.pending_scroll_row = Some(m.line.saturating_sub(data_start));
+            doc.pending_scroll_row = Some(logical_to_screen_row(doc, m.line, data_start));
         }
     }
 }
@@ -1476,11 +1566,18 @@ fn replace_one(doc: &mut Document) {
         })
     });
     let Some(m) = target else {
-        // 아직 아무것도 안 잡혀 있으면 Find Next와 같이 동작한다.
+        // 아직 아무것도 안 잡혀 있으면 Find Next와 같이 동작한다. `target`이
+        // None이 된 것(재검증 실패)만으로는 `doc.last_match`가 지워지지
+        // 않는다 — `filter`는 지역 값만 버릴 뿐 원본 필드는 그대로다. 그
+        // 상태로 이 검색마저 실패하면(Minor 5) 낡은 `last_match`가 버퍼
+        // 범위 밖 논리 행을 가리킨 채 남아 다음 Find Next의 기준이 뒤섞인다.
         let found = search_from(doc, find_origin(doc, true), true);
         match found {
             Some(m) => focus_match(doc, m),
-            None => doc.find_status = "Not found".to_owned(),
+            None => {
+                doc.last_match = None;
+                doc.find_status = "Not found".to_owned();
+            }
         }
         return;
     };
@@ -1499,13 +1596,22 @@ fn replace_one(doc: &mut Document) {
     new.push_str(&old[..s]);
     new.push_str(&rep);
     new.push_str(&old[t..]);
-    // 되돌리기는 **바꾸기 직전**에 이전 값으로 push한다(기존 셀 편집과 동일 규율).
-    e.undo.push(crate::edit::EditOp::Replace(vec![(m.line, old)]));
-    e.lines[m.line] = new;
-    e.dirty = true;
+    // 치환문이 매치와 글자 그대로 같으면(예: "hit" → "hit") 실제로는 아무것도
+    // 안 바뀐다. 그런데도 undo를 push하고 dirty를 세우면 사용자가 저장하지
+    // 않아도 될 파일에 "● Modified"가 뜨고 되돌리기 한 칸이 아무 일도 안
+    // 하는 유령 단계가 된다(Important 3) — `commit_editing_cell`/`Cut`/
+    // `Clear`가 이미 지키는 "실제로 바뀐 경우에만 push" 규율을 여기도 따른다.
+    let changed = new != old;
+    if changed {
+        // 되돌리기는 **바꾸기 직전**에 이전 값으로 push한다(기존 셀 편집과 동일 규율).
+        e.undo.push(crate::edit::EditOp::Replace(vec![(m.line, old)]));
+        e.lines[m.line] = new;
+        e.dirty = true;
+    }
     // 다음 매치로. 치환문 길이만큼 자리가 밀렸으므로 치환 **끝** 자리를
     // 기준으로 삼아야 방금 넣은 글자를 다시 잡지 않는다(치환문이 검색어를
-    // 포함하는 경우 — "a" → "aa" — 무한 제자리걸음이 된다).
+    // 포함하는 경우 — "a" → "aa" — 무한 제자리걸음이 된다). 변경이 없었어도
+    // 자리는 그대로이므로 같은 계산식이 맞는다.
     let rep_len = rep.chars().count();
     let after = crate::edit::TextPos {
         line: m.line,
@@ -1515,7 +1621,16 @@ fn replace_one(doc: &mut Document) {
     doc.find_status.clear();
     match search_from(doc, after, true) {
         Some(next) => focus_match(doc, next),
-        None => doc.find_status = "1 replacement".to_owned(),
+        None => {
+            // 검색 실패 시 last_match를 반드시 None으로 유지한다(Minor 5) —
+            // 버퍼가 줄어든 뒤 다음 Find Next가 낡은 위치를 기준 삼지 않도록.
+            doc.last_match = None;
+            doc.find_status = if changed {
+                "1 replacement".to_owned()
+            } else {
+                "0 replacements (already matches)".to_owned()
+            };
+        }
     }
 }
 
@@ -1538,23 +1653,55 @@ fn replace_all_in_doc(doc: &mut Document) {
     let (changed, total) = crate::find::replace_all(&e.lines, &query, &rep, &opts);
     if total == 0 {
         doc.find_status = "Not found".to_owned();
+        doc.last_match = None;
+        return;
+    }
+    // `replace_all`은 "매치가 있던 행"을 돌려주지, "실제로 글자가 달라진
+    // 행"을 걸러주지 않는다 — 치환문이 검색어와 글자 그대로 같으면(예:
+    // "hit" → "hit") 매치는 있었지만 새 텍스트가 옛 텍스트와 동일하다.
+    // 그런 행까지 undo에 담으면 Ctrl+Z 한 번이 아무것도 안 바꾸는 유령
+    // 단계가 되고 dirty가 거짓으로 서므로(Important 3), 여기서 실제로
+    // 달라진 행만 추린다.
+    let actually_changed: Vec<(usize, String)> = changed
+        .into_iter()
+        .filter(|(i, text)| e.lines.get(*i).is_none_or(|cur| cur != text))
+        .collect();
+    if actually_changed.is_empty() {
+        // 매치는 total개 있었지만 전부 치환 전후가 같았다 — 바뀐 게 없다는
+        // 사실을 그대로 알린다("N replacements"라고 하면 거짓 보고가 된다).
+        doc.find_status = "0 replacements (already matches)".to_owned();
+        doc.last_match = None;
         return;
     }
     // 되돌리기: 바뀔 행들의 **이전** 값을 한 Replace에 모아 담는다. 한 사용자
     // 동작 = 한 번의 Ctrl+Z이므로 Batch로 감쌀 필요조차 없다(Replace 하나가
     // 이미 여러 행을 한 단계로 복원한다). 행 수는 변하지 않는다.
-    let before: Vec<(usize, String)> = changed
+    let before: Vec<(usize, String)> = actually_changed
         .iter()
         .map(|(i, _)| (*i, e.lines[*i].clone()))
         .collect();
     e.undo.push(crate::edit::EditOp::Replace(before));
-    for (i, text) in changed {
+    for (i, text) in actually_changed {
         e.lines[i] = text;
     }
     e.dirty = true;
     // 치환이 끝나면 이전 매치 위치는 의미가 없다(그 자리 글자가 바뀌었다).
     doc.last_match = None;
-    doc.find_status = format!("{total} replacements");
+    // 그래머: 1개면 단수, 그 외(0 포함)는 복수(Minor 4, replace_one과 일관).
+    doc.find_status = if total == 1 {
+        "1 replacement".to_owned()
+    } else {
+        format!("{total} replacements")
+    };
+}
+
+/// 찾기 입력란의 고정 `Id`. `update()`의 Escape 게이트(Minor 7 참조)가 "지금
+/// 포커스가 찾기 입력란 자신에 있는가"를 판정하려면 그 위젯의 Id가
+/// 필요한데, 위젯을 그리는 `render_find_panel`과 게이트를 보는 `update()`가
+/// 서로 다른 함수라 매 프레임 같은 Id를 재현할 수 있어야 한다. 문자열
+/// 리터럴에서 만든 `Id`는 프레임을 넘어 안정적이다(egui의 관용 패턴).
+fn find_query_id() -> egui::Id {
+    egui::Id::new("find_query_input")
 }
 
 /// 찾기/바꾸기 패널. 호출부는 이것을 상태바보다 **나중에** 부른다
@@ -1578,7 +1725,9 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
         ui.horizontal(|ui| {
             ui.label(crate::theme::chrome_text("Find:"));
             let resp = ui.add(
-                egui::TextEdit::singleline(&mut doc.find_query).desired_width(200.0),
+                egui::TextEdit::singleline(&mut doc.find_query)
+                    .id(find_query_id())
+                    .desired_width(200.0),
             );
             if want_focus {
                 resp.request_focus();
@@ -2504,15 +2653,10 @@ fn render_table(
     // col_count는 헤더 필드 수와, 앞부분 데이터 행 몇 개를 샘플링한 필드 수의
     // 최댓값으로 정한다. 헤더가 없는 파일(header_fields == None)에서 1로
     // 고정되어 컬럼이 다 숨는 문제, 그리고 헤더보다 넓은 행이 잘리는 문제를
-    // 함께 해결한다.
-    const COL_COUNT_SAMPLE_ROWS: usize = 10;
-    let mut col_count = header_fields.as_ref().map(|h| h.len()).unwrap_or(0);
-    for logical in data_start..data_start + COL_COUNT_SAMPLE_ROWS {
-        if let Some(fields) = parse_logical_line_edit(doc, logical, delim) {
-            col_count = col_count.max(fields.len());
-        }
-    }
-    let col_count = col_count.max(1);
+    // 함께 해결한다. `focus_match`(찾기 결과 "행 전체" 선택, Important 2)도
+    // 이 값을 그대로 써야 하므로 `table_col_count`로 뽑아 공유한다 — 계산을
+    // 두 곳에 따로 두면 언젠가 한쪽만 바뀌어 어긋난다.
+    let col_count = table_col_count(doc, delim);
 
     // 테이블이 남은 세로 공간을 모두 채우도록 한다.
     // - max_scroll_height 기본값(800px)이 스크롤 영역을 제한해 창을 키워도
@@ -4460,29 +4604,17 @@ mod tests {
         assert!(app.error.is_none(), "탭 전환 시 이전 오류가 지워져야 한다");
     }
 
-    /// update()의 col_count 계산 로직을 GUI 없이 그대로 재현해 검증하는 헬퍼.
-    /// 렌더 코드(render_table)와 동일한 공식을 사용한다. 표 모드 전용이므로
-    /// doc.sep이 Char임을 가정하고 그 delim을 꺼내 쓴다.
+    /// update()의 col_count 계산을 GUI 없이 검증하는 헬퍼. 표 모드 전용이므로
+    /// doc.sep이 Char임을 가정하고 그 delim을 꺼내 쓴다. 실제 계산은
+    /// `table_col_count`(render_table과 focus_match가 공유하는 그 함수)에
+    /// 그대로 위임한다 — 여기서 공식을 다시 베끼면 세 번째 사본이 생기고,
+    /// 그러면 `table_col_count`를 잘못 고쳐도 이 테스트가 자기 사본만 보고
+    /// 계속 통과한다.
     fn compute_col_count(doc: &Document) -> usize {
-        let delim = match doc.sep {
-            SeparatorMode::Char(d) => d,
-            SeparatorMode::None => return 1,
-        };
-        let total_lines = doc.index.line_count();
-        let header_fields: Option<Vec<String>> = if doc.has_header && total_lines > 0 {
-            parse_logical_line_edit(doc, 0, delim)
-        } else {
-            None
-        };
-        let data_start = if doc.has_header { 1 } else { 0 };
-        const COL_COUNT_SAMPLE_ROWS: usize = 10;
-        let mut col_count = header_fields.as_ref().map(|h| h.len()).unwrap_or(0);
-        for logical in data_start..data_start + COL_COUNT_SAMPLE_ROWS {
-            if let Some(fields) = parse_logical_line_edit(doc, logical, delim) {
-                col_count = col_count.max(fields.len());
-            }
+        match doc.sep {
+            SeparatorMode::Char(d) => table_col_count(doc, d),
+            SeparatorMode::None => 1,
         }
-        col_count.max(1)
     }
 
     #[test]
@@ -6099,9 +6231,15 @@ mod tests {
 
     /// 표 모드에서는 셀 단위가 아니라 **행 전체**를 선택하고(매치의 col은
     /// char 인덱스지 컬럼 번호가 아니다), 헤더를 뺀 화면 행으로 스크롤한다.
+    ///
+    /// Important 2 회귀: 끝 컬럼은 표가 실제로 그리는 컬럼 수
+    /// (`table_col_count` — 여기서는 헤더 4개와 모든 데이터 행이 4개라 4)에서
+    /// 나와야 한다. `selected_col`(헤더 클릭으로 고른, 매치와 무관한 UI
+    /// 상태)을 일부러 다른 값(2)으로 세팅해 두어, 만약 구현이 `selected_col`을
+    /// 끝 컬럼으로 잘못 쓰면 (row0, col0, row1, 2)가 되어 이 단언이 깨지게 한다.
     #[test]
     fn find_selects_whole_row_in_table_mode() {
-        let p = temp(b"name,city\nAlice,Seoul\nBob,Busan\n");
+        let p = temp(b"name,city,age,note\nAlice,Seoul,30,x\nBob,Busan,40,y\n");
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
@@ -6109,17 +6247,65 @@ mod tests {
         doc.indexer.take().unwrap().join().unwrap();
         assert!(matches!(doc.sep, SeparatorMode::Char(b',')));
         assert!(doc.has_header, "사전 조건: 헤더 감지됨");
+        // 매치와 무관한 UI 상태 — 끝 컬럼 계산에 섞여 들면 안 된다.
+        doc.selected_col = Some(2);
         doc.find_query = "Busan".to_owned();
         apply_find_action(doc, FindAction::Next);
         let m = doc.last_match.unwrap();
         assert_eq!(m.line, 2);
-        assert_eq!(doc.cell_sel.map(|(r0, _, r1, _)| (r0, r1)), Some((2, 2)));
+        assert_eq!(
+            doc.cell_sel,
+            Some((2, 0, 2, 3)),
+            "끝 컬럼은 실제 필드 수(4개 → 인덱스 3)에서 나와야 하고 \
+             selected_col(2)과는 무관해야 한다"
+        );
         assert_eq!(
             doc.pending_scroll_row,
             Some(1),
             "표 모드의 화면 행 = 논리 행 - 헤더 한 줄"
         );
         assert_eq!(doc.text_sel, None, "표 모드에선 텍스트 선택을 건드리지 않는다");
+    }
+
+    /// Important 1 회귀: 뷰 모드 정렬(permutation)이 걸려 있으면 화면 행은
+    /// "논리 행 - data_start"가 아니라 permutation의 **역**이어야 한다.
+    /// 리뷰어의 시나리오 — `name,v` 헤더 + zzz/aaa/mmm 3행을 컬럼 0 오름차순
+    /// 정렬하면 순서가 aaa, mmm, zzz가 되어 permutation = [2, 3, 1]
+    /// (헤더는 항상 0번 자리를 지킨다고 가정하지 않고, 데이터 행 논리 번호를
+    /// 그대로 담는다는 이 코드베이스의 관례를 따른다 — 아래 직접 구성).
+    /// "zzz"는 논리 행 1이고 permutation에서 화면 위치 2에 있다.
+    #[test]
+    fn find_scrolls_to_correct_row_under_view_sort() {
+        let p = temp(b"name,v\nzzz,1\naaa,2\nmmm,3\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        assert!(doc.has_header);
+        // 뷰 모드 정렬을 흉내낸다: 논리 행 1(zzz),2(aaa),3(mmm)을 컬럼0
+        // 오름차순으로 정렬하면 화면 순서는 aaa(2), mmm(3), zzz(1) →
+        // permutation[screen] = logical 이므로 permutation = [2, 3, 1].
+        doc.sort = Some(SortState {
+            permutation: vec![2, 3, 1],
+            col: 0,
+            kind: SortKind::Text,
+            dir: SortDir::Asc,
+            spec_count: 1,
+        });
+        doc.find_query = "zzz".to_owned();
+        apply_find_action(doc, FindAction::Next);
+        let m = doc.last_match.unwrap();
+        assert_eq!(m.line, 1, "사전 조건: 'zzz'는 논리 행 1(0-based)");
+        assert_eq!(
+            doc.pending_scroll_row,
+            Some(2),
+            "permutation에서 논리 행 1은 화면 위치 2(0-based, 헤더 제외) — \
+             saturating_sub(data_start)만으로 구한 0은 틀렸다"
+        );
+        // cell_sel의 행은 화면 행이 아니라 논리 행으로 남아야 한다
+        // (render_table이 cell_sel을 논리 행으로 해석 — 브리프 노트).
+        assert_eq!(doc.cell_sel.map(|(r0, _, r1, _)| (r0, r1)), Some((1, 1)));
     }
 
     /// 옵션을 바꾸면 이전 매치를 버린다 — 다른 규칙으로 잡힌 자리에서
@@ -6162,9 +6348,96 @@ mod tests {
         assert_eq!(doc.last_match.map(|m| m.line), Some(1));
     }
 
+    /// Important 3 회귀: 치환문이 검색어와 글자 그대로 같으면("hit" → "hit")
+    /// 매치는 있어도 실제로는 아무것도 바뀌지 않는다. 그런 경우까지 undo를
+    /// 쌓고 dirty를 세우면, 사용자가 저장할 필요가 없는 파일에 거짓
+    /// "● Modified"가 뜨고 되돌리기 한 칸이 허깨비가 된다.
+    #[test]
+    fn replace_one_noop_when_replacement_equals_match_pushes_no_undo() {
+        let mut app = find_test_doc(&["hit"]);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "hit".to_owned();
+        doc.replace_text = "hit".to_owned();
+        let before = doc.edit.as_ref().unwrap().undo.len();
+        apply_find_action(doc, FindAction::ReplaceOne); // 첫 호출은 찾기.
+        apply_find_action(doc, FindAction::ReplaceOne); // 두 번째가 "치환" 시도.
+        let e = doc.edit.as_ref().unwrap();
+        assert_eq!(e.lines[0], "hit", "내용은 그대로");
+        assert_eq!(e.undo.len(), before, "실제로 안 바뀌었으니 undo가 안 쌓인다");
+        assert!(!e.dirty, "실제로 안 바뀌었으니 dirty도 서지 않는다");
+    }
+
+    /// 같은 결함을 반복 호출로 확인한다: `"a a"`를 `"a"`로 "바꾸기"를 여러 번
+    /// 눌러도(매번 매치는 있다) 버퍼는 절대 안 바뀌므로 undo는 한 번도 늘지
+    /// 않아야 한다.
+    #[test]
+    fn replace_one_repeated_noop_never_grows_undo() {
+        let mut app = find_test_doc(&["a a"]);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "a".to_owned();
+        doc.replace_text = "a".to_owned();
+        let before = doc.edit.as_ref().unwrap().undo.len();
+        for _ in 0..4 {
+            apply_find_action(doc, FindAction::ReplaceOne);
+        }
+        let e = doc.edit.as_ref().unwrap();
+        assert_eq!(e.lines[0], "a a", "내용은 절대 안 바뀐다");
+        assert_eq!(e.undo.len(), before, "반복해도 undo가 늘지 않는다");
+        assert!(!e.dirty);
+    }
+
+    /// Important 3 회귀(Replace All): 치환문이 검색어와 같아서 매치는
+    /// 있었지만 아무 행도 실제로 안 바뀐 경우, undo/dirty를 세우지 않고
+    /// 상태 문구도 "N replacements"라고 거짓 보고하지 않는다.
+    #[test]
+    fn replace_all_noop_when_replacement_equals_match_pushes_no_undo() {
+        let mut app = find_test_doc(&["hit", "no", "hit hit"]);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "hit".to_owned();
+        doc.replace_text = "hit".to_owned();
+        let before = doc.edit.as_ref().unwrap().undo.len();
+        apply_find_action(doc, FindAction::ReplaceAll);
+        let e = doc.edit.as_ref().unwrap();
+        assert_eq!(e.lines, v(&["hit", "no", "hit hit"]), "내용은 그대로");
+        assert_eq!(e.undo.len(), before, "실제로 안 바뀌었으니 undo가 안 쌓인다");
+        assert!(!e.dirty, "실제로 안 바뀌었으니 dirty도 서지 않는다");
+        assert_ne!(
+            doc.find_status, "3 replacements",
+            "매치 수를 그대로 보고하면 바뀐 것처럼 거짓 보고하는 셈이다"
+        );
+    }
+
+    /// Minor 5 회귀: `replace_one`이 낡은 매치를 재검증하다 실패하고, 그 뒤
+    /// 이어서 시도한 검색마저 실패하면(검색어가 더 이상 어디에도 없음)
+    /// `last_match`는 반드시 `None`이어야 한다. 그대로 두면 버퍼 밖 논리
+    /// 행을 가리키는 낡은 값이 남아 다음 Find Next의 기준이 뒤섞인다.
+    #[test]
+    fn replace_one_clears_last_match_when_revalidation_and_research_both_fail() {
+        let mut app = find_test_doc(&["hit", "hit"]);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "hit".to_owned();
+        doc.replace_text = "Z".to_owned();
+        apply_find_action(doc, FindAction::Next);
+        assert_eq!(doc.last_match.map(|m| m.line), Some(0));
+        // 두 매치 행을 모두 다른 내용으로 바꿔 검색어가 문서에서 완전히
+        // 사라지게 한다 — 재검증도, 뒤이은 재검색도 둘 다 실패한다.
+        {
+            let e = doc.edit.as_mut().unwrap();
+            e.lines[0] = "gone".to_owned();
+            e.lines[1] = "gone too".to_owned();
+        }
+        apply_find_action(doc, FindAction::ReplaceOne);
+        assert_eq!(
+            doc.last_match, None,
+            "재검증도 재검색도 실패하면 last_match가 낡은 채로 남으면 안 된다"
+        );
+        assert_eq!(doc.find_status, "Not found");
+    }
+
     /// Ctrl+F가 패널을 열고 입력란 포커스를 예약한다. `update()`가 `eframe::
     /// Frame`을 요구해 테스트에서 직접 부를 수 없으므로, 단축키 블록이 쓰는
-    /// **가드 식과 consume_key 호출을 그대로** 재현해 태운다.
+    /// **실제 게이트 함수**(`find_keys_live`)와 consume_key 호출을 그대로
+    /// 재현해 태운다(Minor 6 — 가드 식을 테스트가 따로 베끼지 않는다).
     #[test]
     fn ctrl_f_opens_find_panel() {
         let mut app = find_test_doc(&["hit"]);
@@ -6178,11 +6451,7 @@ mod tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         let _ = ctx.run(input, |ctx| {
-            let live = app.doc().is_some()
-                && app.doc().is_some_and(|d| d.editing_cell.is_none())
-                && app.pending_action.is_none()
-                && !app.show_save_dialog;
-            assert!(live, "사전 조건: 찾기 단축키가 살아 있는 상태");
+            assert!(find_keys_live(&app), "사전 조건: 찾기 단축키가 살아 있는 상태");
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
                 let doc = app.doc_mut().unwrap();
                 doc.show_find = true;
@@ -6195,35 +6464,25 @@ mod tests {
     }
 
     /// 인라인 셀 편집 중에는 Ctrl+F가 문서로 새지 않는다 —
-    /// `can_undo_key`와 같은 양보 규율.
+    /// `can_undo_key`와 같은 양보 규율. 실제 게이트 함수를 호출한다(Minor 6) —
+    /// 그래야 게이트를 지우거나 뒤집으면 이 테스트가 반드시 깨진다.
     #[test]
     fn ctrl_f_yields_while_editing_a_cell() {
         let mut app = find_test_doc(&["hit"]);
         app.doc_mut().unwrap().editing_cell = Some((0, 0));
-        let live = app.doc().is_some()
-            && app.doc().is_some_and(|d| d.editing_cell.is_none())
-            && app.pending_action.is_none()
-            && !app.show_save_dialog;
-        assert!(!live, "셀 편집 중에는 찾기 단축키가 죽는다");
+        assert!(!find_keys_live(&app), "셀 편집 중에는 찾기 단축키가 죽는다");
     }
 
-    /// 저장/확인 다이얼로그가 떠 있으면 찾기 단축키도 양보한다.
+    /// 저장/확인 다이얼로그가 떠 있으면 찾기 단축키도 양보한다. 실제 게이트
+    /// 함수를 호출한다(Minor 6).
     #[test]
     fn find_keys_yield_to_dialogs() {
         let mut app = find_test_doc(&["hit"]);
         app.show_save_dialog = true;
-        let live = app.doc().is_some()
-            && app.doc().is_some_and(|d| d.editing_cell.is_none())
-            && app.pending_action.is_none()
-            && !app.show_save_dialog;
-        assert!(!live, "저장 다이얼로그가 떠 있으면 죽는다");
+        assert!(!find_keys_live(&app), "저장 다이얼로그가 떠 있으면 죽는다");
         app.show_save_dialog = false;
         app.pending_action = Some(PendingAction::ExitEditMode);
-        let live = app.doc().is_some()
-            && app.doc().is_some_and(|d| d.editing_cell.is_none())
-            && app.pending_action.is_none()
-            && !app.show_save_dialog;
-        assert!(!live, "확인 다이얼로그가 떠 있으면 죽는다");
+        assert!(!find_keys_live(&app), "확인 다이얼로그가 떠 있으면 죽는다");
     }
 
     /// F3은 검색어가 비어 있으면 아무것도 하지 않는다(빈 검색어로
@@ -6263,6 +6522,67 @@ mod tests {
             "포커스 요청은 한 프레임만 살아 있어야 한다"
         );
         assert!(app.doc().unwrap().show_find, "패널은 그대로 열려 있다");
+    }
+
+    /// Minor 7 회귀: Escape의 실제 소유권 판정 식(`update()`의 그 지점 —
+    /// `focus.is_none() || focus == Some(find_query_id())`)을 그대로
+    /// 재현해, 툴바의 커스텀 구분자 TextEdit 같은 **무관한** 위젯이 포커스를
+    /// 쥐고 있을 때는 거짓이어야 함을 확인한다. 이 판정이 없으면(게이트가
+    /// `show_find`뿐이면) 그 입력란에 타이핑하다 Escape를 누르면 패널이
+    /// 닫혀 버린다.
+    #[test]
+    fn escape_yields_when_unrelated_widget_has_focus() {
+        let ctx = egui::Context::default();
+        let toolbar_sep = egui::Id::new("toolbar_custom_sep_textedit");
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(50.0, 20.0));
+                let r = ui.interact(rect, toolbar_sep, egui::Sense::click());
+                r.request_focus();
+            });
+        });
+        let focus = ctx.memory(|m| m.focused());
+        assert_eq!(focus, Some(toolbar_sep), "사전 조건: 무관한 위젯이 포커스를 쥔다");
+        let escape_owner_ok = focus.is_none() || focus == Some(find_query_id());
+        assert!(
+            !escape_owner_ok,
+            "무관한 위젯에 포커스가 있으면 Escape가 찾기 패널을 닫으면 안 된다"
+        );
+    }
+
+    /// Escape의 반대쪽 절반: 찾기 입력란 **자신**에 포커스가 있을 때는
+    /// 여전히 참이어야 한다 — 그게 이 단축키의 정상 사용 흐름이다
+    /// (Ctrl+F로 연 직후, 또는 입력란에 타이핑하는 중에 Escape로 닫기).
+    #[test]
+    fn escape_still_fires_when_find_box_itself_has_focus() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(50.0, 20.0));
+                let r = ui.interact(rect, find_query_id(), egui::Sense::click());
+                r.request_focus();
+            });
+        });
+        let focus = ctx.memory(|m| m.focused());
+        assert_eq!(focus, Some(find_query_id()), "사전 조건: 찾기 입력란 자신이 포커스를 쥔다");
+        let escape_owner_ok = focus.is_none() || focus == Some(find_query_id());
+        assert!(
+            escape_owner_ok,
+            "찾기 입력란 자신에 포커스가 있으면 Escape가 여전히 패널을 닫아야 한다"
+        );
+    }
+
+    /// 포커스가 아예 없을 때(패널의 버튼을 클릭한 직후 등)도 Escape가
+    /// 살아 있어야 한다 — 기존 동작을 이 조건에서 유지한다.
+    #[test]
+    fn escape_fires_when_nothing_has_focus() {
+        let ctx = egui::Context::default();
+        let focus = ctx.memory(|m| m.focused());
+        assert_eq!(focus, None, "사전 조건: 아무 위젯도 포커스가 없다");
+        let escape_owner_ok = focus.is_none() || focus == Some(find_query_id());
+        assert!(escape_owner_ok, "포커스가 없으면 Escape가 패널을 닫아야 한다");
     }
 
     /// 찾기 패널이 상태바 **위**에 온다. `TopBottomPanel::bottom`은 먼저
