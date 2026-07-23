@@ -60,6 +60,115 @@ pub fn load_edit_buffer(source: &Source, enc: Encoding) -> EditBuffer {
     EditBuffer { lines, dirty: false, newline }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextPos {
+    pub line: usize,
+    pub col: usize, // 문자(char) 인덱스
+}
+
+/// 문자열의 char 인덱스 col을 바이트 오프셋으로 변환(끝이면 len).
+fn byte_of(s: &str, col: usize) -> usize {
+    s.char_indices()
+        .nth(col)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+/// 한 줄의 char 개수.
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
+pub fn normalize(a: TextPos, b: TextPos) -> (TextPos, TextPos) {
+    if (a.line, a.col) <= (b.line, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+pub fn insert_char(lines: &mut Vec<String>, pos: TextPos, ch: char) -> TextPos {
+    let b = byte_of(&lines[pos.line], pos.col);
+    lines[pos.line].insert(b, ch);
+    TextPos { line: pos.line, col: pos.col + 1 }
+}
+
+pub fn split_line(lines: &mut Vec<String>, pos: TextPos) -> TextPos {
+    let b = byte_of(&lines[pos.line], pos.col);
+    let tail = lines[pos.line].split_off(b);
+    lines.insert(pos.line + 1, tail);
+    TextPos { line: pos.line + 1, col: 0 }
+}
+
+pub fn insert_str(lines: &mut Vec<String>, pos: TextPos, s: &str) -> TextPos {
+    // s를 개행으로 나눠 삽입. 개행 없으면 단순 삽입.
+    let mut parts = s.split('\n');
+    let first = parts.next().unwrap_or("");
+    let b = byte_of(&lines[pos.line], pos.col);
+    // 현재 줄을 삽입 지점에서 자른다.
+    let tail = lines[pos.line].split_off(b);
+    lines[pos.line].push_str(first);
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        // 개행 없음: tail을 다시 붙이고 커서는 first 끝.
+        let col = pos.col + char_len(first);
+        lines[pos.line].push_str(&tail);
+        return TextPos { line: pos.line, col };
+    }
+    // 개행 있음: 중간 줄들 삽입, 마지막 줄에 tail 붙임.
+    let mut cur = pos.line;
+    for (k, seg) in rest.iter().enumerate() {
+        cur += 1;
+        if k + 1 == rest.len() {
+            let mut last = seg.to_string();
+            let col = char_len(&last);
+            last.push_str(&tail);
+            lines.insert(cur, last);
+            return TextPos { line: cur, col };
+        } else {
+            lines.insert(cur, seg.to_string());
+        }
+    }
+    unreachable!()
+}
+
+pub fn delete_range(lines: &mut Vec<String>, a: TextPos, b: TextPos) -> TextPos {
+    let (a, b) = normalize(a, b);
+    if a == b {
+        return a;
+    }
+    if a.line == b.line {
+        let sa = byte_of(&lines[a.line], a.col);
+        let sb = byte_of(&lines[a.line], b.col);
+        lines[a.line].replace_range(sa..sb, "");
+        return a;
+    }
+    // 멀티라인: a.line의 앞부분 + b.line의 뒷부분 병합, 사이 줄 제거.
+    let sa = byte_of(&lines[a.line], a.col);
+    let head = lines[a.line][..sa].to_string();
+    let sb = byte_of(&lines[b.line], b.col);
+    let tail = lines[b.line][sb..].to_string();
+    let merged = head + &tail;
+    lines[a.line] = merged;
+    // a.line+1 ..= b.line 제거.
+    lines.drain(a.line + 1..=b.line);
+    a
+}
+
+pub fn backspace(lines: &mut Vec<String>, pos: TextPos) -> TextPos {
+    if pos.col > 0 {
+        let prev = TextPos { line: pos.line, col: pos.col - 1 };
+        return delete_range(lines, prev, pos);
+    }
+    if pos.line == 0 {
+        return pos; // 문서 맨 앞: no-op
+    }
+    // 줄 맨 앞: 앞 줄과 병합. 병합점 = 앞 줄의 기존 끝.
+    let prev_len = char_len(&lines[pos.line - 1]);
+    let merge = TextPos { line: pos.line - 1, col: prev_len };
+    delete_range(lines, merge, pos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +213,92 @@ mod tests {
         let src = crate::source::Source::from_bytes_for_test(&[0xB0, 0xA1, 0xB3, 0xAA, b'\n']);
         let buf = load_edit_buffer(&src, Encoding::Cp949);
         assert_eq!(buf.lines, vec!["가나"]);
+    }
+
+    fn v(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn insert_char_mid_line() {
+        let mut lines = v(&["abc"]);
+        let p = insert_char(&mut lines, TextPos { line: 0, col: 1 }, 'X');
+        assert_eq!(lines, v(&["aXbc"]));
+        assert_eq!(p, TextPos { line: 0, col: 2 });
+    }
+
+    #[test]
+    fn split_line_enter() {
+        let mut lines = v(&["abcd"]);
+        let p = split_line(&mut lines, TextPos { line: 0, col: 2 });
+        assert_eq!(lines, v(&["ab", "cd"]));
+        assert_eq!(p, TextPos { line: 1, col: 0 });
+    }
+
+    #[test]
+    fn backspace_mid_line() {
+        let mut lines = v(&["abc"]);
+        let p = backspace(&mut lines, TextPos { line: 0, col: 2 });
+        assert_eq!(lines, v(&["ac"]));
+        assert_eq!(p, TextPos { line: 0, col: 1 });
+    }
+
+    #[test]
+    fn backspace_at_line_start_merges() {
+        // 줄 맨 앞 Backspace → 앞 줄과 병합, 커서는 병합점.
+        let mut lines = v(&["ab", "cd"]);
+        let p = backspace(&mut lines, TextPos { line: 1, col: 0 });
+        assert_eq!(lines, v(&["abcd"]));
+        assert_eq!(p, TextPos { line: 0, col: 2 });
+    }
+
+    #[test]
+    fn backspace_at_origin_noop() {
+        let mut lines = v(&["ab"]);
+        let p = backspace(&mut lines, TextPos { line: 0, col: 0 });
+        assert_eq!(lines, v(&["ab"]));
+        assert_eq!(p, TextPos { line: 0, col: 0 });
+    }
+
+    #[test]
+    fn delete_range_within_line() {
+        let mut lines = v(&["abcdef"]);
+        let p = delete_range(
+            &mut lines,
+            TextPos { line: 0, col: 1 },
+            TextPos { line: 0, col: 4 },
+        );
+        assert_eq!(lines, v(&["aef"]));
+        assert_eq!(p, TextPos { line: 0, col: 1 });
+    }
+
+    #[test]
+    fn delete_range_multiline() {
+        // 1행 col1 ~ 3행 col2 삭제 → 시작 줄 앞부분 + 끝 줄 뒷부분 병합.
+        let mut lines = v(&["abc", "XXX", "defg"]);
+        let p = delete_range(
+            &mut lines,
+            TextPos { line: 0, col: 1 },
+            TextPos { line: 2, col: 2 },
+        );
+        // "a" + "fg" = "afg"
+        assert_eq!(lines, v(&["afg"]));
+        assert_eq!(p, TextPos { line: 0, col: 1 });
+    }
+
+    #[test]
+    fn insert_str_with_newlines() {
+        let mut lines = v(&["ad"]);
+        let p = insert_str(&mut lines, TextPos { line: 0, col: 1 }, "b\nc");
+        // "a" + "b" / "c" + "d" → ["ab","cd"]
+        assert_eq!(lines, v(&["ab", "cd"]));
+        assert_eq!(p, TextPos { line: 1, col: 1 });
+    }
+
+    #[test]
+    fn normalize_swaps_when_reversed() {
+        let a = TextPos { line: 2, col: 0 };
+        let b = TextPos { line: 1, col: 3 };
+        assert_eq!(normalize(a, b), (b, a));
     }
 }
