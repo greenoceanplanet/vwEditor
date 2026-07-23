@@ -100,7 +100,11 @@ fn needs_big_op_confirm(act: CellMenuAction, rows: usize) -> bool {
 }
 
 pub struct App {
-    pub doc: Option<Document>,
+    /// 열려 있는 문서들. 탭 하나당 하나. 비어 있으면 열린 파일 없음.
+    pub docs: Vec<Document>,
+    /// 활성 탭 인덱스. docs가 비어 있지 않으면 반드시 유효한 인덱스여야 한다.
+    /// (docs가 비면 값은 0으로 두고, 접근자가 None을 반환한다.)
+    pub active: usize,
     pub error: Option<String>,
     /// 행 번호 시작값(0 또는 1). 표시 순번에 더해 라인번호로 쓴다.
     pub row_base: usize,
@@ -131,16 +135,17 @@ pub struct App {
 pub enum PendingAction {
     /// 편집 모드 종료(버퍼 폐기).
     ExitEditMode,
-    /// 다른 파일 열기(경로는 이미 고른 상태).
-    OpenFile(std::path::PathBuf),
     /// 창 닫기(X / Alt+F4). 확인되면 실제로 `ViewportCommand::Close`를 보낸다.
     CloseApp,
+    /// 탭 닫기(저장하지 않은 편집이 있는 탭). 확인되면 그 인덱스를 닫는다.
+    CloseTab(usize),
 }
 
 impl Default for App {
     fn default() -> Self {
         App {
-            doc: None,
+            docs: Vec::new(),
+            active: 0,
             error: None,
             // 요청 기본값: 행/열 모두 0부터.
             row_base: 0,
@@ -162,36 +167,54 @@ impl Default for App {
 const PRIME_BYTES: usize = 64 * 1024;
 
 impl App {
-    /// 저장하지 않은 편집 내용이 있는지.
+    /// 활성 문서(읽기). 열린 문서가 없으면 None.
+    pub fn doc(&self) -> Option<&Document> {
+        self.docs.get(self.active)
+    }
+    /// 활성 문서(쓰기). 열린 문서가 없으면 None.
+    pub fn doc_mut(&mut self) -> Option<&mut Document> {
+        self.docs.get_mut(self.active)
+    }
+
+    /// 저장하지 않은 편집 내용이 있는지(활성 문서 기준). 편집 모드 Off /
+    /// 파일 열기 확인처럼 "지금 보고 있는 탭" 이야기에 쓴다.
     pub fn edit_dirty(&self) -> bool {
-        self.doc
-            .as_ref()
+        self.doc()
             .and_then(|d| d.edit.as_ref())
             .map_or(false, |e| e.dirty)
+    }
+
+    /// 어느 탭이든 저장하지 않은 편집이 있는지. 창 닫기 확인에 쓴다.
+    pub fn any_dirty(&self) -> bool {
+        self.docs.iter().any(|d| d.edit.as_ref().map_or(false, |e| e.dirty))
     }
 
     /// 저장 다이얼로그를 열 때 인코딩/BOM 기본값을 현재 문서 기준으로 맞춘다.
     /// (원본과 같은 인코딩으로 저장하는 것이 기본 기대 동작.)
     fn init_save_defaults(&mut self) {
-        if let Some(doc) = &self.doc {
-            self.save_enc = doc.enc;
+        // doc()가 self를 빌린 채로는 save_enc/save_bom(둘 다 self 소유)을 대입할
+        // 수 없으므로, 필요한 값만 먼저 복사해 빌림을 끝낸다.
+        if let Some(enc) = self.doc().map(|d| d.enc) {
+            self.save_enc = enc;
             // CP949는 BOM이 없다. 나머지는 UTF-16이면 BOM을 기본 켬(없으면
             // 엔디안 판정이 불가능해 재열기가 깨진다).
             self.save_bom = matches!(
-                doc.enc,
+                enc,
                 crate::parse::Encoding::Utf16Le | crate::parse::Encoding::Utf16Be
             );
         }
     }
 
-    /// 파일을 열고 앞부분으로 인코딩/구분자/헤더를 감지한 뒤 백그라운드 인덱싱을 시작한다.
+    /// 파일을 열어 **새 탭으로 추가**하고 그 탭을 활성화한다. 앞부분으로
+    /// 인코딩/구분자/헤더를 감지한 뒤 백그라운드 인덱싱을 시작한다.
+    /// 실패하면 `self.error`를 채우고 탭은 추가하지 않는다(기존 탭은 그대로).
+    /// 드래그앤드롭·행 추출 등 나중 기능도 이 진입점을 쓴다.
     pub fn open_path(&mut self, path: &Path, ctx: &egui::Context) {
         self.error = None;
         let src = match source::open(path) {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 self.error = Some(format!("Failed to open file: {e}"));
-                self.doc = None;
                 return;
             }
         };
@@ -229,7 +252,7 @@ impl App {
             _ => String::new(),
         };
 
-        self.doc = Some(Document {
+        self.add_document(Document {
             source: src,
             index,
             enc,
@@ -254,6 +277,32 @@ impl App {
             text_drag_active: false,
             pending_column_op: None,
         });
+    }
+
+    /// 이미 만들어진 Document를 새 탭으로 추가하고 활성화한다.
+    /// (찾기 결과 행 추출 등 파일이 아닌 출처에서 온 문서를 위한 진입점.)
+    pub fn add_document(&mut self, doc: Document) {
+        self.docs.push(doc);
+        self.active = self.docs.len() - 1;
+    }
+
+    /// 탭을 닫는다. 활성 인덱스를 유효 범위로 다시 맞춘다.
+    /// 마지막 탭을 닫으면 docs가 비고 active는 0이 된다.
+    /// 제거된 Document가 dirty 편집 버퍼를 갖고 있어도 이 함수 자체는 묻지
+    /// 않는다 — 묻는 책임은 호출부(탭 바 UI)에 있다.
+    pub fn close_tab(&mut self, idx: usize) {
+        if idx >= self.docs.len() {
+            return;
+        }
+        self.docs.remove(idx);
+        if idx < self.active {
+            self.active -= 1;
+        } else if idx == self.active {
+            self.active = self.active.min(self.docs.len().saturating_sub(1));
+        }
+        if self.docs.is_empty() {
+            self.active = 0;
+        }
     }
 }
 
@@ -464,7 +513,7 @@ impl eframe::App for App {
         // 창 제목 = "<파일명> — textViewer". 바뀔 때만 보낸다(매 프레임 보내면
         // 창 시스템 왕복이 낭비다). "다른 이름으로 저장"으로 path가 바뀌어도
         // 이 비교가 자동으로 잡아낸다.
-        let want_title = crate::theme::window_title(self.doc.as_ref().map(|d| d.path.as_path()));
+        let want_title = crate::theme::window_title(self.doc().map(|d| d.path.as_path()));
         if want_title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(want_title.clone()));
             self.window_title = want_title;
@@ -478,20 +527,26 @@ impl eframe::App for App {
             // 닫기만 막는다 — pending_action을 덮어써 앞선 동작을 잃지 않게.
             if self.pending_action.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            } else if self.edit_dirty() {
+            } else if self.any_dirty() {
+                // 창 닫기는 활성 탭만이 아니라 어느 탭이든 저장 안 된 편집이
+                // 있으면 물어야 한다.
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.pending_action = Some(PendingAction::CloseApp);
             }
             // dirty가 아니면 그대로 닫히게 둔다.
         }
 
+        // 탭 바 클로저 안에서도 self를 가변 대여할 수 없으므로, 메뉴바의
+        // undo_clicked와 같은 패턴으로 인텐트만 받아 둔다.
+        let mut want_active: Option<usize> = None;
+        let mut want_close: Option<usize> = None;
+
         // 메뉴바 클로저 안에서는 self를 가변 대여할 수 없으므로, 되돌리기
         // 클릭 여부만 받아 두었다가 update() 끝에서 적용한다.
         let mut undo_clicked = false;
         // "실행 취소" 항목 활성 조건: 편집 모드 + 되돌릴 게 있음.
         let can_undo = self
-            .doc
-            .as_ref()
+            .doc()
             .and_then(|d| d.edit.as_ref())
             .map_or(false, |e| !e.undo.is_empty());
 
@@ -501,17 +556,14 @@ impl eframe::App for App {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            // 저장하지 않은 변경이 있으면 확인 후에 연다.
-                            if self.edit_dirty() {
-                                self.pending_action = Some(PendingAction::OpenFile(path));
-                            } else {
-                                self.open_path(&path, ctx);
-                            }
+                            // 새 탭으로 열리므로 기존 탭을 대체하지 않는다 —
+                            // 저장 안 된 변경 확인이 필요 없다.
+                            self.open_path(&path, ctx);
                         }
                         ui.close_menu();
                     }
                     // 저장 항목은 편집 모드일 때만 의미가 있다(뷰 모드는 버퍼가 없다).
-                    let editing = self.doc.as_ref().map_or(false, |d| d.edit.is_some());
+                    let editing = self.doc().map_or(false, |d| d.edit.is_some());
                     ui.add_enabled_ui(editing, |ui| {
                         if ui.button("Save").clicked() {
                             self.show_save_dialog = true;
@@ -529,20 +581,20 @@ impl eframe::App for App {
                 });
                 ui.menu_button("Edit", |ui| {
                     // 편집 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
-                    let has_doc = self.doc.is_some();
+                    let has_doc = self.doc().is_some();
                     ui.add_enabled_ui(has_doc, |ui| {
                         // 편집 모드 토글. 켜면 파일 전체를 인메모리 버퍼로 읽고,
                         // 끄면 버퍼를 버린다(dirty면 확인 후).
                         // 편집의 진입점이므로 편집 메뉴 맨 위에 둔다.
-                        let mut edit_on = self.doc.as_ref().map_or(false, |d| d.edit.is_some());
+                        let mut edit_on = self.doc().map_or(false, |d| d.edit.is_some());
                         if ui.checkbox(&mut edit_on, "Edit Mode").clicked() {
                             if edit_on {
-                                if let Some(doc) = &mut self.doc {
+                                if let Some(doc) = self.doc_mut() {
                                     enter_edit_mode(doc);
                                 }
                             } else if self.edit_dirty() {
                                 self.pending_action = Some(PendingAction::ExitEditMode);
-                            } else if let Some(doc) = &mut self.doc {
+                            } else if let Some(doc) = self.doc_mut() {
                                 exit_edit_mode(doc);
                             }
                             ui.close_menu();
@@ -558,10 +610,10 @@ impl eframe::App for App {
                 });
                 ui.menu_button("Tools", |ui| {
                     // 도구 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
-                    let has_doc = self.doc.is_some();
+                    let has_doc = self.doc().is_some();
                     ui.add_enabled_ui(has_doc, |ui| {
                         if ui.button("Sort by Columns…").clicked() {
-                            if let Some(doc) = &mut self.doc {
+                            if let Some(doc) = self.doc_mut() {
                                 // 표 모드 + 인덱싱 완료일 때만 실제로 연다.
                                 // 편집 모드는 버퍼가 파일 전체를 이미 담고 있으므로
                                 // 인덱싱 진행 상태와 무관하게 정렬할 수 있다.
@@ -591,10 +643,36 @@ impl eframe::App for App {
             });
         });
 
+        // 탭 바. 문서가 2개 이상일 때만 보인다(1개면 탭이라는 개념이 무의미하고
+        // 공간만 낭비한다).
+        if self.docs.len() > 1 {
+            egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
+                // 탭이 많으면 가로 스크롤.
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for i in 0..self.docs.len() {
+                            let label = tab_label(&self.docs[i]);
+                            let selected = i == self.active;
+                            if ui
+                                .selectable_label(selected, crate::theme::chrome_text(label))
+                                .clicked()
+                            {
+                                want_active = Some(i);
+                            }
+                            if ui.small_button("✖").clicked() {
+                                want_close = Some(i);
+                            }
+                            ui.separator();
+                        }
+                    });
+                });
+            });
+        }
+
         // 상단 툴바
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if let Some(doc) = &mut self.doc {
+                if let Some(doc) = self.doc_mut() {
                     ui.separator();
                     // 구분자 드롭다운. None(텍스트) + 표준 구분자들 + 직접 입력.
                     let sep_label = match doc.sep {
@@ -691,11 +769,11 @@ impl eframe::App for App {
                 // 필요한 때인데, 예전처럼 else-if로 두면 그 표시가 사라졌다.
                 if let Some(err) = &self.error {
                     ui.label(crate::theme::chrome_text(err).color(egui::Color32::RED));
-                    if self.doc.is_some() {
+                    if self.doc().is_some() {
                         ui.separator();
                     }
                 }
-                if let Some(doc) = &mut self.doc {
+                if let Some(doc) = self.doc_mut() {
                     let st = doc.index.status();
                     let done_gb = st.bytes_done as f64 / 1e9;
                     let total_gb = st.total_bytes as f64 / 1e9;
@@ -793,7 +871,7 @@ impl eframe::App for App {
         // 클립보드 캐시는 render_table이 복사/붙여넣기에 쓰므로 가변 대여를
         // doc과 분리해 넘긴다(App 전체를 넘기면 doc과 동시 대여가 불가능).
         let clipboard = &mut self.clipboard_cache;
-        let doc_opt = &mut self.doc;
+        let doc_opt = self.docs.get_mut(self.active);
         // 데이터 영역은 순백. 기본 CentralPanel은 panel_fill(옅은 회색)을 쓰므로
         // 프레임을 지정해 덮는다 — 메뉴/툴바/상태바만 회색으로 남아 데이터와 갈린다.
         let data_frame = egui::Frame::central_panel(&ctx.style()).fill(crate::theme::data_bg());
@@ -808,7 +886,7 @@ impl eframe::App for App {
         });
 
         // 다중 컬럼 정렬 다이얼로그(표시 중일 때만).
-        if let Some(doc) = &mut self.doc {
+        if let Some(doc) = self.doc_mut() {
             if doc.show_sort_dialog {
                 render_sort_dialog(ctx, doc, col_base);
             }
@@ -831,8 +909,7 @@ impl eframe::App for App {
 
         // 대상 행이 아주 많은 컬럼 연산 확인 다이얼로그.
         if self
-            .doc
-            .as_ref()
+            .doc()
             .map_or(false, |d| d.pending_column_op.is_some())
         {
             render_confirm_big_column_op_dialog(ctx, self);
@@ -840,7 +917,7 @@ impl eframe::App for App {
 
         // Ctrl+S — 편집 모드에서 저장 다이얼로그 열기. 다른 다이얼로그가 떠
         // 있으면 무시한다(중복 열기 방지).
-        if self.doc.as_ref().map_or(false, |d| d.edit.is_some())
+        if self.doc().map_or(false, |d| d.edit.is_some())
             && !self.show_save_dialog
             && self.pending_action.is_none()
             && ctx.input_mut(|i| {
@@ -854,7 +931,7 @@ impl eframe::App for App {
 
         // Ctrl+Z — 되돌리기(편집 모드 전용). 인라인 셀 편집 중이거나 다른
         // 위젯이 포커스를 쥐고 있으면(툴바 TextEdit 등) 그쪽에 양보한다.
-        let can_undo_key = self.doc.as_ref().map_or(false, |d| {
+        let can_undo_key = self.doc().map_or(false, |d| {
             d.edit.is_some() && d.editing_cell.is_none()
         }) && self.pending_action.is_none()
             && !self.show_save_dialog
@@ -862,7 +939,7 @@ impl eframe::App for App {
         if can_undo_key
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z))
         {
-            if let Some(doc) = &mut self.doc {
+            if let Some(doc) = self.doc_mut() {
                 undo_once(doc);
             }
         }
@@ -870,10 +947,61 @@ impl eframe::App for App {
         // 메뉴에서 고른 되돌리기(단축키를 모르는 사용자용). 메뉴바 클로저 안에서는
         // self를 가변 대여할 수 없어 인텐트만 받아 여기서 적용한다.
         if undo_clicked {
-            if let Some(doc) = &mut self.doc {
+            if let Some(doc) = self.doc_mut() {
                 undo_once(doc);
             }
         }
+
+        // 탭 바 클릭 인텐트 적용. 탭 전환은 그냥 인덱스 교체.
+        if let Some(i) = want_active {
+            self.active = i;
+        }
+        // 탭 닫기: dirty 편집 버퍼가 있으면 확인 창을 띄우고, 아니면 즉시 닫는다.
+        if let Some(i) = want_close {
+            let dirty = self
+                .docs
+                .get(i)
+                .and_then(|d| d.edit.as_ref())
+                .map_or(false, |e| e.dirty);
+            if dirty {
+                self.pending_action = Some(PendingAction::CloseTab(i));
+            } else {
+                self.close_tab(i);
+            }
+        }
+    }
+}
+
+/// 탭 바에 보여줄 라벨. 파일명(없으면 path_label, 그것도 비면 "(untitled)")에
+/// dirty 편집 버퍼가 있으면 앞에 "● "를 붙이고(상태바가 이미 ●를 쓰는 것과
+/// 일관되게), 24자를 넘으면 문자 경계 기준으로 앞 23자 + "…"로 자른다
+/// (바이트 슬라이스로 자르면 한글에서 패닉한다).
+pub(crate) fn tab_label(doc: &Document) -> String {
+    let name = doc
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if doc.path_label.is_empty() {
+                "(untitled)".to_owned()
+            } else {
+                doc.path_label.clone()
+            }
+        });
+    let dirty = doc.edit.as_ref().map_or(false, |e| e.dirty);
+    let truncated = if name.chars().count() > 24 {
+        let mut s: String = name.chars().take(23).collect();
+        s.push('…');
+        s
+    } else {
+        name
+    };
+    if dirty {
+        format!("● {truncated}")
+    } else {
+        truncated
     }
 }
 
@@ -911,14 +1039,13 @@ fn undo_once(doc: &mut Document) {
 /// `app.save_as`가 참이면 rfd 파일 선택 창으로 경로를 새로 고른다.
 fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
     // 편집 버퍼가 없으면(편집 모드 이탈 등) 다이얼로그를 닫는다.
-    if app.doc.as_ref().map_or(true, |d| d.edit.is_none()) {
+    if app.doc().map_or(true, |d| d.edit.is_none()) {
         app.show_save_dialog = false;
         return;
     }
     let title = if app.save_as { "Save As" } else { "Save" };
     let cur_label = app
-        .doc
-        .as_ref()
+        .doc()
         .map(|d| d.path_label.clone())
         .unwrap_or_default();
 
@@ -986,7 +1113,7 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
 
     // 대상 경로 결정. save_as면 파일 선택 창, 아니면 현재 경로.
     // 현재 경로가 비어 있으면(있을 수 없지만 방어) save_as로 폴백한다.
-    let cur_path = app.doc.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+    let cur_path = app.doc().map(|d| d.path.clone()).unwrap_or_default();
     let target = if app.save_as || cur_path.as_os_str().is_empty() {
         let mut dlg = rfd::FileDialog::new();
         if let Some(dir) = cur_path.parent() {
@@ -1009,21 +1136,20 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
         enc: app.save_enc,
         bom: app.save_bom,
         newline: app
-            .doc
-            .as_ref()
+            .doc()
             .and_then(|d| d.edit.as_ref())
             .map(|e| e.newline)
             .unwrap_or(crate::edit::Newline::Lf),
     };
     let result = {
-        let Some(e) = app.doc.as_ref().and_then(|d| d.edit.as_ref()) else { return };
+        let Some(e) = app.doc().and_then(|d| d.edit.as_ref()) else { return };
         crate::save::write_file(&target, &e.lines, &opts, None)
     };
 
     match result {
         Ok(()) => {
             app.error = None;
-            if let Some(doc) = &mut app.doc {
+            if let Some(doc) = app.doc_mut() {
                 if let Some(e) = &mut doc.edit {
                     e.dirty = false;
                 }
@@ -1079,20 +1205,23 @@ fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
     }
     match app.pending_action.take() {
         Some(PendingAction::ExitEditMode) => {
-            if let Some(doc) = &mut app.doc {
+            if let Some(doc) = app.doc_mut() {
                 exit_edit_mode(doc);
             }
         }
-        Some(PendingAction::OpenFile(p)) => {
-            app.open_path(&p, ctx);
-        }
         Some(PendingAction::CloseApp) => {
             // 확인됐으니 실제로 닫는다. 이번엔 close_requested 훅이 dirty를
-            // 다시 보지 않도록 편집 버퍼의 dirty를 내려 둔다(이미 폐기 동의).
-            if let Some(e) = app.doc.as_mut().and_then(|d| d.edit.as_mut()) {
-                e.dirty = false;
+            // 다시 보지 않도록 모든 탭의 dirty를 내려 둔다(이미 폐기 동의) —
+            // 활성 탭만 내리면 두 번째 X에서 다른 탭의 dirty가 다시 잡힌다.
+            for d in &mut app.docs {
+                if let Some(e) = &mut d.edit {
+                    e.dirty = false;
+                }
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        Some(PendingAction::CloseTab(i)) => {
+            app.close_tab(i);
         }
         None => {}
     }
@@ -1105,11 +1234,11 @@ fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
 /// `delim`이 필요하므로 표 모드(`SeparatorMode::Char`)에서만 의미가 있다.
 /// 텍스트 모드에는 컬럼 개념이 없어 애초에 대기 연산이 생기지 않는다.
 fn render_confirm_big_column_op_dialog(ctx: &egui::Context, app: &mut App) {
-    let Some(doc) = &app.doc else { return };
+    let Some(doc) = app.doc() else { return };
     let Some(pending) = doc.pending_column_op.clone() else { return };
     let SeparatorMode::Char(delim) = doc.sep else {
         // 구분자가 없으면 컬럼 연산 자체가 성립하지 않는다 — 조용히 취소.
-        if let Some(doc) = &mut app.doc {
+        if let Some(doc) = app.doc_mut() {
             doc.pending_column_op = None;
         }
         return;
@@ -1150,7 +1279,7 @@ fn render_confirm_big_column_op_dialog(ctx: &egui::Context, app: &mut App) {
         });
     // 창 X로 닫으면 취소와 같다(아무것도 하지 않는 쪽이 기본).
     if !open || cancel {
-        if let Some(doc) = &mut app.doc {
+        if let Some(doc) = app.doc_mut() {
             doc.pending_column_op = None;
         }
         return;
@@ -1159,8 +1288,10 @@ fn render_confirm_big_column_op_dialog(ctx: &egui::Context, app: &mut App) {
         return;
     }
     // 확인됨 — 대기 상태를 먼저 비우고(무한 재확인 방지) 같은 경로를 다시 탄다.
+    // clipboard_cache와 활성 문서를 동시에 가변 대여해야 하므로 doc_mut()
+    // 대신 필드를 직접 쪼개 빌린다(App 전체를 넘기면 동시 대여가 안 된다).
     let clipboard = &mut app.clipboard_cache;
-    let Some(doc) = &mut app.doc else { return };
+    let Some(doc) = app.docs.get_mut(app.active) else { return };
     doc.pending_column_op = None;
     // `apply_cell_menu_action_confirmed`는 `&mut egui::Ui`를 요구한다. 이 시점은
     // CentralPanel 밖이므로, 그리지 않는 임시 Area의 Ui를 하나 만들어 넘긴다
@@ -3313,7 +3444,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_ref().unwrap();
+        let doc = app.doc().unwrap();
         assert_eq!(doc.enc, crate::parse::Encoding::Utf8);
         assert_eq!(doc.sep, SeparatorMode::Char(b','));
         assert!(doc.has_header);
@@ -3325,8 +3456,136 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(std::path::Path::new("nope_xyz.csv"), &ctx);
-        assert!(app.doc.is_none());
+        assert!(app.doc().is_none());
         assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn open_path_twice_creates_two_tabs() {
+        let p1 = temp(b"a,b\n1,2\n");
+        let p2 = temp(b"c,d\n3,4\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p1, &ctx);
+        app.open_path(&p2, &ctx);
+        assert_eq!(app.docs.len(), 2);
+        assert_eq!(app.active, 1);
+        assert_eq!(app.docs[0].path, p1, "첫 탭의 path가 보존되어야 한다");
+    }
+
+    #[test]
+    fn open_failure_keeps_existing_tabs() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        app.open_path(std::path::Path::new("nope_xyz.csv"), &ctx);
+        assert_eq!(app.docs.len(), 1, "실패한 열기는 기존 탭을 건드리지 않는다");
+        assert!(app.error.is_some());
+    }
+
+    /// 탭 3개를 열어 둔 App을 만든다. 각 파일 내용은 서로 달라 path로 구분 가능.
+    fn app_with_three_tabs() -> App {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&temp(b"a,b\n1,2\n"), &ctx);
+        app.open_path(&temp(b"c,d\n3,4\n"), &ctx);
+        app.open_path(&temp(b"e,f\n5,6\n"), &ctx);
+        app
+    }
+
+    #[test]
+    fn close_tab_before_active_shifts_active_left() {
+        let mut app = app_with_three_tabs();
+        app.active = 2;
+        let third_path = app.docs[2].path.clone();
+        app.close_tab(0);
+        assert_eq!(app.docs.len(), 2);
+        assert_eq!(app.active, 1);
+        assert_eq!(
+            app.doc().unwrap().path,
+            third_path,
+            "활성 문서는 원래 3번째 파일 그대로여야 한다"
+        );
+    }
+
+    #[test]
+    fn close_tab_after_active_keeps_active() {
+        let mut app = app_with_three_tabs();
+        app.active = 0;
+        app.close_tab(2);
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn close_active_last_tab_clamps_active() {
+        let mut app = app_with_three_tabs();
+        app.close_tab(2); // 3개 -> 2개로 줄여 시작 상태를 맞춘다.
+        app.active = 1;
+        app.close_tab(1);
+        assert_eq!(app.docs.len(), 1);
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn close_last_remaining_tab_empties_docs() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&temp(b"a,b\n1,2\n"), &ctx);
+        app.close_tab(0);
+        assert!(app.docs.is_empty());
+        assert_eq!(app.active, 0);
+        assert!(app.doc().is_none());
+    }
+
+    #[test]
+    fn close_tab_out_of_range_is_noop() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&temp(b"a,b\n1,2\n"), &ctx);
+        app.close_tab(5);
+        assert_eq!(app.docs.len(), 1);
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn any_dirty_sees_inactive_tab() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&temp(b"a,b\n1,2\n"), &ctx);
+        app.open_path(&temp(b"c,d\n3,4\n"), &ctx);
+        // 비활성 탭(0번)만 편집 모드 + dirty로 만든다.
+        enter_edit_mode(&mut app.docs[0]);
+        app.docs[0].edit.as_mut().unwrap().dirty = true;
+        app.active = 1;
+        assert!(!app.edit_dirty(), "활성 탭은 dirty가 아니다");
+        assert!(app.any_dirty(), "비활성 탭의 dirty도 잡아야 한다");
+    }
+
+    #[test]
+    fn tab_label_truncates_on_char_boundary() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let mut doc = app.docs.pop().unwrap();
+        // 매우 긴 한글 파일명으로 바꿔치기(실제 파일이 존재할 필요는 없다 —
+        // tab_label은 path만 본다).
+        doc.path = std::path::PathBuf::from("가".repeat(40) + ".csv");
+        let label = tab_label(&doc);
+        assert!(label.chars().count() <= 24);
+    }
+
+    #[test]
+    fn tab_label_marks_dirty() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let mut doc = app.docs.pop().unwrap();
+        enter_edit_mode(&mut doc);
+        doc.edit.as_mut().unwrap().dirty = true;
+        assert!(tab_label(&doc).starts_with('●'));
     }
 
     /// update()의 col_count 계산 로직을 GUI 없이 그대로 재현해 검증하는 헬퍼.
@@ -3363,7 +3622,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         // 인덱싱을 완료까지 join해 line_count/line_range가 안정적으로 채워지게 한다.
         doc.indexer.take().unwrap().join().unwrap();
 
@@ -3378,7 +3637,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
 
         assert!(!doc.has_header);
@@ -3396,7 +3655,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
 
         assert_eq!(doc.sep, SeparatorMode::None, "구분자 없는 텍스트는 None으로");
@@ -3421,7 +3680,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
         doc.sep = SeparatorMode::Char(b'~');
 
@@ -3438,7 +3697,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
         enter_edit_mode(doc);
         assert!(doc.edit.is_some());
@@ -3452,7 +3711,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_ref().unwrap();
+        let doc = app.doc().unwrap();
         assert_eq!(doc.path, p);
         assert_eq!(doc.path_label, p.display().to_string());
     }
@@ -3466,12 +3725,12 @@ mod tests {
         // 파일만 열린 상태(뷰 모드)는 dirty가 아니다.
         assert!(!app.edit_dirty());
         {
-            let doc = app.doc.as_mut().unwrap();
+            let doc = app.doc_mut().unwrap();
             doc.indexer.take().unwrap().join().unwrap();
             enter_edit_mode(doc);
         }
         assert!(!app.edit_dirty(), "막 진입한 버퍼는 깨끗하다");
-        app.doc.as_mut().unwrap().edit.as_mut().unwrap().dirty = true;
+        app.doc_mut().unwrap().edit.as_mut().unwrap().dirty = true;
         assert!(app.edit_dirty());
     }
 
@@ -3481,7 +3740,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
         doc.has_header = has_header;
         enter_edit_mode(doc);
@@ -3491,7 +3750,7 @@ mod tests {
     #[test]
     fn edit_sort_rearranges_lines_and_keeps_header() {
         let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\nBob,2\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
         apply_edit_sort(doc, &[spec], delim, 1);
         let e = doc.edit.as_ref().unwrap();
@@ -3505,7 +3764,7 @@ mod tests {
         // doc.sort를 세우면 헤더 화살표/상태바가 없는 정렬을 주장하고,
         // render_table이 permutation으로 행을 한 번 더 매핑해 순서가 깨진다.
         let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
         apply_edit_sort(doc, &[spec], delim, 1);
         assert!(doc.sort.is_none());
@@ -3516,7 +3775,7 @@ mod tests {
     fn edit_sort_clears_row_pointing_state() {
         // 행이 뒤섞이면 선택/편집 중 셀이 가리키던 행이 달라진다 → 초기화.
         let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.cell_sel = Some((1, 0, 1, 1));
         doc.editing_cell = Some((1, 0));
         doc.cell_edit_text = "x".into();
@@ -3532,7 +3791,7 @@ mod tests {
         // 정렬 뒤 행을 삽입하면 재정렬되지 않고 그 자리에 남아야 한다
         // (permutation이 아니라 물리적 재배치이므로 자연히 그렇다).
         let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\nBob,2\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
         apply_edit_sort(doc, &[spec], delim, 1);
         // "Bob,2"(index 2) 위에 zzz 행 삽입.
@@ -3548,7 +3807,7 @@ mod tests {
     #[test]
     fn edit_sort_headerless_sorts_all_rows() {
         let (mut app, delim) = edit_doc(b"3,c\n1,a\n2,b\n", false);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let spec = SortSpec { col: 0, kind: SortKind::Number, dir: SortDir::Asc, ci: false };
         apply_edit_sort(doc, &[spec], delim, 0);
         assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["1,a", "2,b", "3,c"]));
@@ -3557,7 +3816,7 @@ mod tests {
     #[test]
     fn edit_sort_multi_key() {
         let (mut app, delim) = edit_doc(b"g,n\nb,2\na,2\nb,1\na,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let specs = vec![
             SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true },
             SortSpec { col: 1, kind: SortKind::Number, dir: SortDir::Desc, ci: false },
@@ -3573,7 +3832,7 @@ mod tests {
     fn edit_sort_noop_on_empty_specs_or_data() {
         // 기준이 없거나 데이터 행이 없으면 아무것도 하지 않는다(dirty도 안 켠다).
         let (mut app, delim) = edit_doc(b"name,n\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         apply_edit_sort(doc, &[], delim, 1);
         assert!(!doc.edit.as_ref().unwrap().dirty);
         let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
@@ -3587,7 +3846,7 @@ mod tests {
         // 브리프의 이월 결함: 다이얼로그가 mmap 전용 경로로 헤더를 읽으면
         // 편집 모드에서 편집 전 값이 나온다. parse_logical_line_edit 경유여야 한다.
         let (mut app, delim) = edit_doc(b"old,b\n1,2\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         crate::edit::set_cell(&mut doc.edit.as_mut().unwrap().lines, 0, 0, "new", delim);
         assert_eq!(
             parse_logical_line_edit(doc, 0, delim),
@@ -3603,7 +3862,7 @@ mod tests {
         let (mut app, _delim) = edit_doc("h,v\n가,1\n".as_bytes(), true);
         let out = temp_ext(b"", "csv");
         {
-            let e = app.doc.as_ref().unwrap().edit.as_ref().unwrap();
+            let e = app.doc().unwrap().edit.as_ref().unwrap();
             let opts = crate::save::SaveOptions {
                 enc: crate::parse::Encoding::Cp949,
                 bom: false,
@@ -3618,7 +3877,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app2 = App::default();
         app2.open_path(&out, &ctx);
-        let doc2 = app2.doc.as_mut().unwrap();
+        let doc2 = app2.doc_mut().unwrap();
         doc2.indexer.take().unwrap().join().unwrap();
         doc2.enc = crate::parse::Encoding::Cp949;
         enter_edit_mode(doc2);
@@ -3633,18 +3892,18 @@ mod tests {
     fn save_repoints_source_so_view_mode_shows_saved_content() {
         let (mut app, delim) = edit_doc(b"h,v\nold,1\n", true);
         let ctx = egui::Context::default();
-        let path = app.doc.as_ref().unwrap().path.clone();
+        let path = app.doc().unwrap().path.clone();
 
         // 편집: 셀 하나를 바꾼다.
         {
-            let doc = app.doc.as_mut().unwrap();
+            let doc = app.doc_mut().unwrap();
             crate::edit::set_cell(&mut doc.edit.as_mut().unwrap().lines, 1, 0, "new", delim);
             doc.edit.as_mut().unwrap().dirty = true;
         }
 
         // 저장 다이얼로그가 하는 일과 같은 순서: write_file → dirty 해제 → 소스 재지정.
         {
-            let doc = app.doc.as_mut().unwrap();
+            let doc = app.doc_mut().unwrap();
             let e = doc.edit.as_ref().unwrap();
             let opts = crate::save::SaveOptions {
                 enc: doc.enc,
@@ -3657,7 +3916,7 @@ mod tests {
             doc.indexer.take().unwrap().join().unwrap();
         }
 
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         // 매핑된 바이트 자체가 저장된 내용이어야 한다(옛 매핑이면 "old,1"이 보인다).
         let raw = String::from_utf8(doc.source.as_bytes().to_vec()).unwrap();
         assert!(raw.contains("new,1"), "mmap이 저장된 내용을 보여야 함: {raw:?}");
@@ -3679,8 +3938,8 @@ mod tests {
     fn repoint_after_save_preserves_edit_buffer_and_selection() {
         let (mut app, _delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
         let ctx = egui::Context::default();
-        let path = app.doc.as_ref().unwrap().path.clone();
-        let doc = app.doc.as_mut().unwrap();
+        let path = app.doc().unwrap().path.clone();
+        let doc = app.doc_mut().unwrap();
         doc.cell_sel = Some((1, 0, 2, 1));
         doc.selected_col = Some(1);
         // 디스크에는 버퍼와 다른 내용을 써 둔다 — 재지정이 버퍼를 덮어쓰면 들킨다.
@@ -3714,7 +3973,7 @@ mod tests {
         let ctx = egui::Context::default();
         let out = temp_ext(b"", "csv");
         {
-            let doc = app.doc.as_mut().unwrap();
+            let doc = app.doc_mut().unwrap();
             crate::edit::set_cell(&mut doc.edit.as_mut().unwrap().lines, 1, 0, "new", delim);
             let e = doc.edit.as_ref().unwrap();
             let opts = crate::save::SaveOptions {
@@ -3728,7 +3987,7 @@ mod tests {
             repoint_source_after_save(doc, &out, &ctx).unwrap();
             doc.indexer.take().unwrap().join().unwrap();
         }
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         exit_edit_mode(doc);
         assert_eq!(decode_logical_line(doc, 1).as_deref(), Some("new,1"));
         assert_eq!(doc.path, out);
@@ -3741,19 +4000,19 @@ mod tests {
     fn failed_save_keeps_dirty_state_visible_to_status_bar() {
         let (mut app, delim) = edit_doc(b"h,v\nold,1\n", true);
         {
-            let doc = app.doc.as_mut().unwrap();
+            let doc = app.doc_mut().unwrap();
             crate::edit::set_cell(&mut doc.edit.as_mut().unwrap().lines, 1, 0, "new", delim);
             doc.edit.as_mut().unwrap().dirty = true;
         }
         // 존재하지 않는 디렉터리로 저장 → 실패.
         let bad = std::path::Path::new("no_such_dir_xyz").join("out.csv");
-        let doc = app.doc.as_ref().unwrap();
+        let doc = app.doc().unwrap();
         let e = doc.edit.as_ref().unwrap();
         let opts = crate::save::SaveOptions { enc: doc.enc, bom: false, newline: e.newline };
         assert!(crate::save::write_file(&bad, &e.lines, &opts, None).is_err());
         // 상태바가 읽는 두 값이 모두 살아 있어야 한다.
         assert!(app.edit_dirty(), "실패한 저장은 dirty를 유지한다");
-        assert_eq!(app.doc.as_ref().unwrap().edit.as_ref().unwrap().lines.len(), 2);
+        assert_eq!(app.doc().unwrap().edit.as_ref().unwrap().lines.len(), 2);
     }
 
     #[test]
@@ -3798,7 +4057,7 @@ mod tests {
     #[test]
     fn column_copy_excludes_header_and_is_vertical() {
         let (mut app, delim) = edit_doc(b"h1,h2\na,1\nb,2\nc,3\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.selected_col = Some(1);
         doc.cell_sel = None;
         let lines = &doc.edit.as_ref().unwrap().lines;
@@ -4243,7 +4502,7 @@ mod tests {
     #[test]
     fn undo_restores_row_order_after_edit_sort() {
         let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\nBob,2\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let before = doc.edit.as_ref().unwrap().lines.clone();
         let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
         apply_edit_sort(doc, &[spec], delim, 1);
@@ -4258,7 +4517,7 @@ mod tests {
     #[test]
     fn undo_restores_cell_edit() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.editing_cell = Some((1, 0));
         doc.cell_edit_text = "ZZZ".into();
         commit_editing_cell(doc, delim);
@@ -4271,7 +4530,7 @@ mod tests {
     fn cell_edit_with_same_value_pushes_no_undo_step() {
         // 값이 그대로면 헛된 Ctrl+Z 단계가 쌓이면 안 된다.
         let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.editing_cell = Some((1, 0));
         doc.cell_edit_text = "a".into();
         commit_editing_cell(doc, delim);
@@ -4314,7 +4573,7 @@ mod tests {
     fn small_column_op_runs_without_confirm() {
         // 임계치 아래(3행)면 확인 없이 즉시 수행되고 대기 상태도 남지 않는다.
         let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.cell_sel = None;
         doc.selected_col = Some(1);
         let mut clip = String::new();
@@ -4330,7 +4589,7 @@ mod tests {
     #[test]
     fn big_column_op_defers_without_mutating() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         doc.cell_sel = Some((1, 0, BIG_COLUMN_OP_ROWS + 5, 1));
         let mut clip = String::new();
@@ -4361,7 +4620,7 @@ mod tests {
     #[test]
     fn undo_restores_cleared_cells() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.cell_sel = Some((1, 0, 2, 1));
         let mut clip = String::new();
         with_ui(|ui| {
@@ -4375,7 +4634,7 @@ mod tests {
     #[test]
     fn undo_restores_row_insert_and_delete() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         let mut clip = String::new();
         doc.cell_sel = Some((1, 0, 1, 0));
@@ -4407,7 +4666,7 @@ mod tests {
     #[test]
     fn undo_full_buffer_delete_leaves_no_ghost_line() {
         let (mut app, delim) = edit_doc(b"a,1\nb,2\n", false);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         let mut clip = String::new();
         doc.cell_sel = Some((0, 0, 1, 1));
@@ -4423,7 +4682,7 @@ mod tests {
     #[test]
     fn undo_paste_that_grows_rows() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         let mut clip = String::new();
         doc.cell_sel = Some((1, 0, 1, 0));
@@ -4451,7 +4710,7 @@ mod tests {
     #[test]
     fn paste_prefers_system_clipboard_string() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let mut clip = String::from("CACHE");
         doc.cell_sel = Some((1, 0, 1, 0));
         with_ui(|ui| {
@@ -4471,7 +4730,7 @@ mod tests {
     #[test]
     fn column_cut_clears_whole_column_and_undoes() {
         let (mut app, delim) = edit_doc(b"h1,h2\na,1\nb,2\nc,3\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         doc.selected_col = Some(1);
         doc.cell_sel = None;
@@ -4494,7 +4753,7 @@ mod tests {
     #[test]
     fn cut_on_already_empty_cells_pushes_no_undo_step() {
         let (mut app, delim) = edit_doc(b"h,v\n,\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.cell_sel = Some((1, 0, 1, 1));
         let mut clip = String::new();
         with_ui(|ui| {
@@ -4510,7 +4769,7 @@ mod tests {
     #[test]
     fn clear_on_already_empty_cells_pushes_no_undo_step() {
         let (mut app, delim) = edit_doc(b"h,v\n,\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.cell_sel = Some((1, 0, 1, 1));
         let mut clip = String::new();
         with_ui(|ui| {
@@ -4525,7 +4784,7 @@ mod tests {
     #[test]
     fn cut_on_nonempty_cells_pushes_exactly_one_undo_step() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         doc.cell_sel = Some((1, 0, 1, 1));
         let mut clip = String::new();
@@ -4545,7 +4804,7 @@ mod tests {
     #[test]
     fn clear_on_nonempty_cells_pushes_exactly_one_undo_step() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         doc.cell_sel = Some((1, 0, 2, 1));
         let mut clip = String::new();
@@ -4568,7 +4827,7 @@ mod tests {
     #[test]
     fn undo_text_insert() {
         let (mut app, _d) = edit_doc(b"abc\ndef\n", false);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.sep = SeparatorMode::None;
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         doc.text_caret = tp(1, 1);
@@ -4583,7 +4842,7 @@ mod tests {
     #[test]
     fn undo_text_newline_split() {
         let (mut app, _d) = edit_doc(b"abcd\nzz\n", false);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         doc.text_caret = tp(0, 2);
         let mut clip = String::new();
@@ -4597,7 +4856,7 @@ mod tests {
     #[test]
     fn undo_text_backspace_merge() {
         let (mut app, _d) = edit_doc(b"ab\ncd\nef\n", false);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         doc.text_caret = tp(1, 0);
         let mut clip = String::new();
@@ -4611,7 +4870,7 @@ mod tests {
     #[test]
     fn undo_text_multiline_cut() {
         let (mut app, _d) = edit_doc(b"hello\nworld\nagain\n", false);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         doc.text_sel = Some((tp(0, 2), tp(2, 3)));
         doc.text_caret = tp(2, 3);
@@ -4626,7 +4885,7 @@ mod tests {
     #[test]
     fn undo_text_multiline_paste() {
         let (mut app, _d) = edit_doc(b"ab\ncd\n", false);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let orig = doc.edit.as_ref().unwrap().lines.clone();
         doc.text_caret = tp(0, 1);
         let mut clip = String::new();
@@ -4641,7 +4900,7 @@ mod tests {
     #[test]
     fn noop_backspace_pushes_no_undo_step() {
         let (mut app, _d) = edit_doc(b"ab\n", false);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.text_caret = tp(0, 0);
         let mut clip = String::new();
         apply_text(doc, &mut clip, TextEditIntent::Backspace);
@@ -4652,7 +4911,7 @@ mod tests {
     #[test]
     fn non_mutating_text_intents_push_no_undo() {
         let (mut app, _d) = edit_doc(b"ab\ncd\n", false);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let mut clip = String::new();
         apply_text(doc, &mut clip, TextEditIntent::SelectAll);
         apply_text(doc, &mut clip, TextEditIntent::Copy);
@@ -4664,7 +4923,7 @@ mod tests {
     #[test]
     fn repeated_undo_walks_back_lifo() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let s0 = doc.edit.as_ref().unwrap().lines.clone();
         doc.editing_cell = Some((1, 0));
         doc.cell_edit_text = "X".into();
@@ -4687,7 +4946,7 @@ mod tests {
     #[test]
     fn undo_clamps_selection_and_caret() {
         let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         let mut clip = String::new();
         doc.cell_sel = Some((1, 0, 1, 0));
         // 붙여넣기로 행을 늘린 뒤 늘어난 행을 선택해 둔다.
@@ -4719,7 +4978,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
         assert!(doc.edit.is_none());
         undo_once(doc); // 패닉하지 않고 조용히 통과
@@ -4732,7 +4991,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.open_path(&p, &ctx);
-        let doc = app.doc.as_mut().unwrap();
+        let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
         enter_edit_mode(doc);
         // 편집 버퍼 값을 바꾸면 logical_line도 그 값을 반환.
