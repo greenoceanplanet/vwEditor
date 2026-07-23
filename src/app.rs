@@ -121,6 +121,9 @@ pub struct App {
     /// 저장하지 않은 변경이 있어 확인을 기다리는 동작. Some이면 확인 다이얼로그를
     /// 띄우고, 사용자가 "계속"을 누르면 그 동작을 수행한다.
     pub pending_action: Option<PendingAction>,
+    /// 마지막으로 OS에 보낸 창 제목. 매 프레임 `ViewportCommand::Title`을 보내면
+    /// 불필요한 창 시스템 왕복이 생기므로, 바뀔 때만 보내기 위해 기억해 둔다.
+    pub window_title: String,
 }
 
 /// dirty 편집 버퍼를 잃을 수 있어 확인이 필요한 동작.
@@ -149,6 +152,8 @@ impl Default for App {
             save_bom: false,
             clipboard_cache: String::new(),
             pending_action: None,
+            // eframe이 창을 만들 때 쓴 제목과 같은 값으로 시작한다(main.rs).
+            window_title: "textViewer".to_owned(),
         }
     }
 }
@@ -185,7 +190,7 @@ impl App {
         let src = match source::open(path) {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                self.error = Some(format!("파일 열기 실패: {e}"));
+                self.error = Some(format!("Failed to open file: {e}"));
                 self.doc = None;
                 return;
             }
@@ -255,18 +260,83 @@ impl App {
 use crate::index::Phase;
 use egui_extras::{Column, TableBuilder};
 
-const ROW_HEIGHT: f32 = 22.0;
+/// 표/텍스트 모드 한 행의 높이. 고정폭 13px에 맞춘 값은 `theme.rs`에 있다
+/// (격자선 간격과 직결되므로 폰트 크기와 같은 곳에서 관리한다).
+const ROW_HEIGHT: f32 = crate::theme::ROW_HEIGHT;
 
-/// 선택 음영(컬럼 선택·셀 사각 선택 공통). 줄무늬 위에 덧그리는 반투명 파랑.
+/// 선택 음영(컬럼 선택·셀 사각 선택 공통). 밝은 배경 위에 덧그리는 반투명
+/// Windows 파랑 — 글자가 그대로 읽히도록 알파를 낮게 유지한다.
 /// `from_rgba_unmultiplied`가 const가 아니라 함수로 둔다.
 fn sel_shade() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(60, 120, 200, 80)
+    egui::Color32::from_rgba_unmultiplied(0, 120, 215, 48)
 }
 
-/// 헤더 클릭으로 선택된 컬럼 헤더 칸의 불투명 배경색. `sel_shade()`와 같은
-/// 비율로 어둡게 유지해 톤을 맞춘다(둘 중 하나만 바꾸면 어긋난다).
+/// 헤더 클릭으로 선택된 컬럼 헤더 칸의 불투명 배경색. `sel_shade()`가 쓰는
+/// Windows 파랑을 밝은 헤더 회색 위에 얹은 것과 같은 톤으로 맞춘다
+/// (둘 중 하나만 바꾸면 헤더와 본문의 선택 색이 어긋난다).
 fn header_sel_color() -> egui::Color32 {
-    egui::Color32::from_rgb(45, 90, 155)
+    egui::Color32::from_rgb(197, 224, 247)
+}
+
+/// 셀 배경/격자선을 그릴 실제 사각형.
+///
+/// `ui.max_rect()`는 셀 **내용** 영역이라 인접 셀 사이에 `item_spacing`만큼
+/// 빈 띠가 남는다. 그대로 선을 그으면 격자가 끊어져 보이고 배경도 줄무늬 사이가
+/// 벌어진다. egui_extras가 줄무늬를 칠할 때 쓰는 것과 **같은 확장**
+/// (`egui_extras-0.28.1/src/layout.rs:121-123`의 `gapless_rect`)을 적용해
+/// 칸이 빈틈없이 이어지게 한다.
+fn gapless_cell_rect(ui: &egui::Ui, rect: egui::Rect) -> egui::Rect {
+    rect.expand2(0.5 * ui.spacing().item_spacing)
+}
+
+/// 셀 하나의 격자선(오른쪽 세로선 + 아래 가로선)을 긋는다. 엑셀/EMEditor처럼
+/// 칸 경계가 보이게 하는 것이 목적이다.
+///
+/// **비용**: 이 함수는 `TableBuilder`가 실제로 그리는 셀에서만 불린다. 표는
+/// 가상 스크롤이라 화면에 보이는 수십 행만 그려지므로, 행이 수억 개여도
+/// 프레임당 선 개수는 (보이는 행 × 보이는 컬럼 수)로 일정하다 — 전체 행을
+/// 도는 경로는 어디에도 없다.
+fn paint_cell_grid(ui: &egui::Ui, rect: egui::Rect) {
+    let r = gapless_cell_rect(ui, rect);
+    let stroke = egui::Stroke::new(1.0, crate::theme::grid_line());
+    let p = ui.painter();
+    p.line_segment([r.right_top(), r.right_bottom()], stroke);
+    p.line_segment([r.left_bottom(), r.right_bottom()], stroke);
+}
+
+/// 헤더 칸의 배경 + 아래 진한 구분선. 데이터 영역과 헤더를 시각적으로 가른다.
+/// (선택된 컬럼이면 배경 대신 선택색을 쓰므로 `filled`로 색을 받는다.)
+fn paint_header_cell(ui: &egui::Ui, rect: egui::Rect, filled: egui::Color32) {
+    let r = gapless_cell_rect(ui, rect);
+    let p = ui.painter();
+    p.rect_filled(r, 0.0, filled);
+    // 세로 구분선은 격자선과 같은 톤(칸 경계).
+    p.line_segment(
+        [r.right_top(), r.right_bottom()],
+        egui::Stroke::new(1.0, crate::theme::grid_line()),
+    );
+    // 헤더 하단은 진하게 — 여기서 데이터가 시작한다는 신호.
+    p.line_segment(
+        [r.left_bottom(), r.right_bottom()],
+        egui::Stroke::new(1.0, crate::theme::header_rule()),
+    );
+}
+
+/// 라인번호 칸: 배경을 살짝 구분하고 격자선을 긋는다. 번호는 오른쪽 정렬 +
+/// 흐린 색으로 그려 "데이터가 아닌 축"으로 읽히게 한다(엑셀 행 머리글과 같은 역할).
+fn paint_line_number_cell(ui: &mut egui::Ui, rect: egui::Rect, text: String) {
+    ui.painter().rect_filled(
+        gapless_cell_rect(ui, rect),
+        0.0,
+        crate::theme::line_number_bg(),
+    );
+    paint_cell_grid(ui, rect);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.add(
+            egui::Label::new(egui::RichText::new(text).color(crate::theme::line_number_fg()))
+                .truncate(),
+        );
+    });
 }
 
 /// 논리 행 번호(logical)에 해당하는 줄을 mmap offset으로 조회해 디코딩·개행
@@ -330,7 +400,7 @@ fn repoint_source_after_save(
 ) -> Result<(), String> {
     let src = match source::open(path) {
         Ok(s) => Arc::new(s),
-        Err(e) => return Err(format!("저장 후 파일 다시 열기 실패: {e}")),
+        Err(e) => return Err(format!("Failed to reopen file after saving: {e}")),
     };
     // 새 인덱스를 만들고 인덱서를 새로 띄운다(Paused → "이어서 읽기"와 같은 패턴).
     let index = LineIndex::new(src.len());
@@ -391,6 +461,15 @@ impl eframe::App for App {
             ctx.set_zoom_factor(new_factor);
         }
 
+        // 창 제목 = "<파일명> — textViewer". 바뀔 때만 보낸다(매 프레임 보내면
+        // 창 시스템 왕복이 낭비다). "다른 이름으로 저장"으로 path가 바뀌어도
+        // 이 비교가 자동으로 잡아낸다.
+        let want_title = crate::theme::window_title(self.doc.as_ref().map(|d| d.path.as_path()));
+        if want_title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(want_title.clone()));
+            self.window_title = want_title;
+        }
+
         // 창 닫기(X / Alt+F4). 저장하지 않은 편집이 있으면 닫기를 취소하고 다른
         // 폐기 경로(편집 모드 Off, 파일 → 열기…)와 같은 확인 창으로 보낸다.
         // 확인 창에서 "계속"을 누르면 그때 실제로 Close를 보낸다.
@@ -419,8 +498,8 @@ impl eframe::App for App {
         // 최상단 메뉴바 (파일 / 편집 / 도구)
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
-                ui.menu_button("파일", |ui| {
-                    if ui.button("열기…").clicked() {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             // 저장하지 않은 변경이 있으면 확인 후에 연다.
                             if self.edit_dirty() {
@@ -434,13 +513,13 @@ impl eframe::App for App {
                     // 저장 항목은 편집 모드일 때만 의미가 있다(뷰 모드는 버퍼가 없다).
                     let editing = self.doc.as_ref().map_or(false, |d| d.edit.is_some());
                     ui.add_enabled_ui(editing, |ui| {
-                        if ui.button("저장").clicked() {
+                        if ui.button("Save").clicked() {
                             self.show_save_dialog = true;
                             self.save_as = false;
                             self.init_save_defaults();
                             ui.close_menu();
                         }
-                        if ui.button("다른 이름으로 저장…").clicked() {
+                        if ui.button("Save As…").clicked() {
                             self.show_save_dialog = true;
                             self.save_as = true;
                             self.init_save_defaults();
@@ -448,22 +527,22 @@ impl eframe::App for App {
                         }
                     });
                 });
-                ui.menu_button("편집", |ui| {
+                ui.menu_button("Edit", |ui| {
                     ui.add_enabled_ui(can_undo, |ui| {
-                        if ui.button("실행 취소 (Ctrl+Z)").clicked() {
+                        if ui.button("Undo   Ctrl+Z").clicked() {
                             undo_clicked = true;
                             ui.close_menu();
                         }
                     });
                 });
-                ui.menu_button("도구", |ui| {
+                ui.menu_button("Tools", |ui| {
                     // 도구 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
                     let has_doc = self.doc.is_some();
                     ui.add_enabled_ui(has_doc, |ui| {
                         // 편집 모드 토글. 켜면 파일 전체를 인메모리 버퍼로 읽고,
                         // 끄면 버퍼를 버린다(dirty면 확인 후).
                         let mut edit_on = self.doc.as_ref().map_or(false, |d| d.edit.is_some());
-                        if ui.checkbox(&mut edit_on, "편집 모드").clicked() {
+                        if ui.checkbox(&mut edit_on, "Edit Mode").clicked() {
                             if edit_on {
                                 if let Some(doc) = &mut self.doc {
                                     enter_edit_mode(doc);
@@ -476,7 +555,7 @@ impl eframe::App for App {
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("다중 정렬…").clicked() {
+                        if ui.button("Sort by Columns…").clicked() {
                             if let Some(doc) = &mut self.doc {
                                 // 표 모드 + 인덱싱 완료일 때만 실제로 연다.
                                 // 편집 모드는 버퍼가 파일 전체를 이미 담고 있으므로
@@ -498,7 +577,7 @@ impl eframe::App for App {
                             }
                             ui.close_menu();
                         }
-                        if ui.button("행/열 번호…").clicked() {
+                        if ui.button("Row & Column Numbers…").clicked() {
                             self.show_numbering_dialog = true;
                             ui.close_menu();
                         }
@@ -514,29 +593,29 @@ impl eframe::App for App {
                     ui.separator();
                     // 구분자 드롭다운. None(텍스트) + 표준 구분자들 + 직접 입력.
                     let sep_label = match doc.sep {
-                        SeparatorMode::None => "구분 안 함(텍스트)".to_owned(),
-                        SeparatorMode::Char(b',') => "콤마 ,".to_owned(),
-                        SeparatorMode::Char(b'\t') => "탭".to_owned(),
-                        SeparatorMode::Char(b'|') => "파이프 |".to_owned(),
-                        SeparatorMode::Char(b';') => "세미콜론 ;".to_owned(),
+                        SeparatorMode::None => "None (plain text)".to_owned(),
+                        SeparatorMode::Char(b',') => "Comma ,".to_owned(),
+                        SeparatorMode::Char(b'\t') => "Tab".to_owned(),
+                        SeparatorMode::Char(b'|') => "Pipe |".to_owned(),
+                        SeparatorMode::Char(b';') => "Semicolon ;".to_owned(),
                         SeparatorMode::Char(b) if b.is_ascii_graphic() => {
-                            format!("직접: {}", b as char)
+                            format!("Custom: {}", b as char)
                         }
-                        SeparatorMode::Char(b) => format!("직접: 0x{b:02X}"),
+                        SeparatorMode::Char(b) => format!("Custom: 0x{b:02X}"),
                     };
                     let sep_before = doc.sep;
-                    egui::ComboBox::from_label("구분자")
+                    egui::ComboBox::from_label(crate::theme::chrome_text("Delimiter"))
                         .selected_text(sep_label)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut doc.sep, SeparatorMode::None, "구분 안 함(텍스트)");
-                            ui.selectable_value(&mut doc.sep, SeparatorMode::Char(b','), "콤마 ,");
-                            ui.selectable_value(&mut doc.sep, SeparatorMode::Char(b'\t'), "탭");
-                            ui.selectable_value(&mut doc.sep, SeparatorMode::Char(b'|'), "파이프 |");
-                            ui.selectable_value(&mut doc.sep, SeparatorMode::Char(b';'), "세미콜론 ;");
+                            ui.selectable_value(&mut doc.sep, SeparatorMode::None, "None (plain text)");
+                            ui.selectable_value(&mut doc.sep, SeparatorMode::Char(b','), "Comma ,");
+                            ui.selectable_value(&mut doc.sep, SeparatorMode::Char(b'\t'), "Tab");
+                            ui.selectable_value(&mut doc.sep, SeparatorMode::Char(b'|'), "Pipe |");
+                            ui.selectable_value(&mut doc.sep, SeparatorMode::Char(b';'), "Semicolon ;");
                         });
                     // 직접 입력: 한 글자 텍스트박스. 입력하면 그 글자(첫 바이트)를
                     // 구분자로 사용. ASCII 한 글자만 유효(멀티바이트는 첫 바이트).
-                    ui.label("직접:");
+                    ui.label(crate::theme::chrome_text("Custom:"));
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut doc.custom_sep_input)
                             .desired_width(28.0)
@@ -563,7 +642,7 @@ impl eframe::App for App {
                     // 인코딩 드롭다운
                     let enc_before = doc.enc;
                     let enc_label = format!("{:?}", doc.enc);
-                    egui::ComboBox::from_label("인코딩")
+                    egui::ComboBox::from_label(crate::theme::chrome_text("Encoding"))
                         .selected_text(enc_label)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut doc.enc, crate::parse::Encoding::Utf8, "UTF-8");
@@ -579,7 +658,7 @@ impl eframe::App for App {
                     // 헤더 체크박스는 표 모드에서만 의미가 있다.
                     if matches!(doc.sep, SeparatorMode::Char(_)) {
                         let hdr_before = doc.has_header;
-                        ui.checkbox(&mut doc.has_header, "헤더");
+                        ui.checkbox(&mut doc.has_header, "Header");
                         // 헤더 유무가 바뀌면 data_start가 달라져 permutation이 어긋나므로 무효화.
                         if doc.has_header != hdr_before {
                             doc.sort = None;
@@ -594,7 +673,7 @@ impl eframe::App for App {
                     }
 
                     ui.separator();
-                    ui.label(&doc.path_label);
+                    ui.label(crate::theme::chrome_text(doc.path_label.clone()));
                 }
             });
         });
@@ -606,7 +685,7 @@ impl eframe::App for App {
                 // 저장 실패 순간이야말로 "편집 중 — N 행 / ● 변경됨"이 가장
                 // 필요한 때인데, 예전처럼 else-if로 두면 그 표시가 사라졌다.
                 if let Some(err) = &self.error {
-                    ui.colored_label(egui::Color32::RED, err);
+                    ui.label(crate::theme::chrome_text(err).color(egui::Color32::RED));
                     if self.doc.is_some() {
                         ui.separator();
                     }
@@ -622,19 +701,19 @@ impl eframe::App for App {
                     };
                     match st.phase {
                         Phase::Priming | Phase::Indexing => {
-                            ui.label(format!(
-                                "인덱싱 중... {done_gb:.2} / {total_gb:.2} GB ({pct}%)"
-                            ));
-                            if ui.button("중단").clicked() {
+                            ui.label(crate::theme::chrome_text(format!(
+                                "Indexing… {done_gb:.2} / {total_gb:.2} GB ({pct}%)"
+                            )));
+                            if ui.button("Stop").clicked() {
                                 doc.index.request_pause();
                             }
                         }
                         Phase::Paused => {
-                            ui.label(format!(
-                                "중단됨 — 앞부분 {} 행 표시 중 ({done_gb:.2} / {total_gb:.2} GB)",
+                            ui.label(crate::theme::chrome_text(format!(
+                                "Stopped — showing first {} rows ({done_gb:.2} / {total_gb:.2} GB)",
                                 doc.index.line_count()
-                            ));
-                            if ui.button("이어서 읽기").clicked() {
+                            )));
+                            if ui.button("Resume").clicked() {
                                 // 재개 = 처음부터 다시 병렬 스캔. spawn_indexer가
                                 // 프라이밍→병렬을 새로 수행하며 인덱스를 덮어쓴다.
                                 // 기존 핸들은 이미 종료됨.
@@ -651,26 +730,32 @@ impl eframe::App for App {
                             }
                         }
                         Phase::Complete => {
-                            ui.label(format!("완료 — {} 행", doc.index.line_count()));
+                            ui.label(crate::theme::chrome_text(format!(
+                                "Ready — {} rows",
+                                doc.index.line_count()
+                            )));
                             // 정렬이 적용돼 있으면 어떤 기준인지 표시.
                             if let Some(s) = &doc.sort {
                                 let kind = match s.kind {
-                                    SortKind::Text => "문자",
-                                    SortKind::Number => "숫자",
+                                    SortKind::Text => "text",
+                                    SortKind::Number => "number",
                                 };
                                 let dir = match s.dir {
-                                    SortDir::Asc => "오름차순",
-                                    SortDir::Desc => "내림차순",
+                                    SortDir::Asc => "ascending",
+                                    SortDir::Desc => "descending",
                                 };
                                 ui.separator();
                                 if s.spec_count > 1 {
-                                    ui.label(format!(
-                                        "{}개 기준 정렬됨 (1차: {}번 컬럼)",
+                                    ui.label(crate::theme::chrome_text(format!(
+                                        "Sorted by {} criteria (primary: column {})",
                                         s.spec_count,
                                         s.col + 1
-                                    ));
+                                    )));
                                 } else {
-                                    ui.label(format!("{}번 컬럼 {kind} {dir} 정렬됨", s.col + 1));
+                                    ui.label(crate::theme::chrome_text(format!(
+                                        "Sorted by column {} ({kind}, {dir})",
+                                        s.col + 1
+                                    )));
                                 }
                             }
                         }
@@ -679,14 +764,20 @@ impl eframe::App for App {
                     // match 밖에 둔다. dirty면 붉은 "● 변경됨"을 덧붙인다.
                     if let Some(e) = &doc.edit {
                         ui.separator();
-                        ui.label(format!("편집 중 — {} 행", e.lines.len()));
+                        ui.label(crate::theme::chrome_text(format!(
+                            "Editing — {} rows",
+                            e.lines.len()
+                        )));
                         if e.dirty {
-                            ui.colored_label(egui::Color32::from_rgb(230, 120, 60), "● 변경됨");
+                            ui.label(
+                                crate::theme::chrome_text("● Modified")
+                                    .color(egui::Color32::from_rgb(200, 90, 20)),
+                            );
                         }
                     }
                 } else if self.error.is_none() {
                     // 문서도 오류도 없을 때만 안내 문구.
-                    ui.label("파일을 여세요");
+                    ui.label(crate::theme::chrome_text("No file open"));
                 }
             });
         });
@@ -816,7 +907,7 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
         app.show_save_dialog = false;
         return;
     }
-    let title = if app.save_as { "다른 이름으로 저장" } else { "저장" };
+    let title = if app.save_as { "Save As" } else { "Save" };
     let cur_label = app
         .doc
         .as_ref()
@@ -831,9 +922,11 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
         .resizable(false)
         .show(ctx, |ui| {
             if app.save_as {
-                ui.label("저장을 누르면 파일 위치를 고릅니다.");
+                ui.label(crate::theme::chrome_text(
+                    "You will choose the file location after clicking Save.",
+                ));
             } else {
-                ui.label(format!("덮어쓸 파일: {cur_label}"));
+                ui.label(crate::theme::chrome_text(format!("Overwrite: {cur_label}")));
             }
             ui.separator();
 
@@ -843,7 +936,7 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
                 Encoding::Utf16Le => "UTF-16LE",
                 Encoding::Utf16Be => "UTF-16BE",
             };
-            egui::ComboBox::from_label("인코딩")
+            egui::ComboBox::from_label(crate::theme::chrome_text("Encoding"))
                 .selected_text(enc_label)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut app.save_enc, Encoding::Utf8, "UTF-8");
@@ -858,18 +951,18 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
                 app.save_bom = false;
             }
             ui.add_enabled_ui(bom_allowed, |ui| {
-                ui.checkbox(&mut app.save_bom, "BOM 포함");
+                ui.checkbox(&mut app.save_bom, "Include BOM");
             });
             if !bom_allowed {
-                ui.label("(CP949는 BOM이 없습니다)");
+                ui.label(crate::theme::chrome_text("(CP949 has no BOM)"));
             }
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("저장").clicked() {
+                if ui.button("Save").clicked() {
                     do_save = true;
                 }
-                if ui.button("취소").clicked() {
+                if ui.button("Cancel").clicked() {
                     app.show_save_dialog = false;
                 }
             });
@@ -940,7 +1033,7 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
         }
         Err(err) => {
             // 실패하면 버퍼는 dirty인 채로 둔다(사용자가 다시 시도할 수 있게).
-            app.error = Some(format!("저장 실패: {err}"));
+            app.error = Some(format!("Save failed: {err}"));
         }
     }
 }
@@ -950,18 +1043,20 @@ fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
     let mut open = true;
     let mut proceed = false;
     let mut cancel = false;
-    egui::Window::new("저장하지 않은 변경")
+    egui::Window::new("Unsaved Changes")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.label("저장하지 않은 변경이 있습니다. 계속하면 변경 내용을 잃습니다.");
+            ui.label(crate::theme::chrome_text(
+                "You have unsaved changes. Continuing will discard them.",
+            ));
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("계속").clicked() {
+                if ui.button("Continue").clicked() {
                     proceed = true;
                 }
-                if ui.button("취소").clicked() {
+                if ui.button("Cancel").clicked() {
                     cancel = true;
                 }
             });
@@ -1012,31 +1107,35 @@ fn render_confirm_big_column_op_dialog(ctx: &egui::Context, app: &mut App) {
         return;
     };
     let what = match pending.act {
-        CellMenuAction::Copy => "복사",
-        CellMenuAction::Cut => "잘라내기",
-        CellMenuAction::Clear => "셀 내용 지우기",
-        CellMenuAction::DeleteRows => "행 삭제",
-        CellMenuAction::Paste => "붙여넣기",
-        CellMenuAction::InsertRowAbove | CellMenuAction::InsertRowBelow => "행 삽입",
+        CellMenuAction::Copy => "Copy",
+        CellMenuAction::Cut => "Cut",
+        CellMenuAction::Clear => "Clear Contents",
+        CellMenuAction::DeleteRows => "Delete Rows",
+        CellMenuAction::Paste => "Paste",
+        CellMenuAction::InsertRowAbove | CellMenuAction::InsertRowBelow => "Insert Row",
     };
     let rows = pending.rows;
 
     let mut open = true;
     let mut proceed = false;
     let mut cancel = false;
-    egui::Window::new("많은 행에 대한 작업")
+    egui::Window::new("Large Operation")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.label(format!("{rows}행에 대해 '{what}'를 실행합니다."));
-            ui.label("행이 많아 시간이 오래 걸리고 메모리를 많이 쓸 수 있습니다.");
+            ui.label(crate::theme::chrome_text(format!(
+                "'{what}' will be applied to {rows} rows."
+            )));
+            ui.label(crate::theme::chrome_text(
+                "This may take a while and use a lot of memory.",
+            ));
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("계속").clicked() {
+                if ui.button("Continue").clicked() {
                     proceed = true;
                 }
-                if ui.button("취소").clicked() {
+                if ui.button("Cancel").clicked() {
                     cancel = true;
                 }
             });
@@ -1076,25 +1175,27 @@ fn render_confirm_big_column_op_dialog(ctx: &egui::Context, app: &mut App) {
 /// 행/열 번호 시작값(0 또는 1) 설정 다이얼로그.
 fn render_numbering_dialog(ctx: &egui::Context, app: &mut App) {
     let mut open = true;
-    egui::Window::new("행/열 번호")
+    egui::Window::new("Row & Column Numbers")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.label("행/열 번호를 몇부터 시작할지 정합니다.");
+            ui.label(crate::theme::chrome_text(
+                "Choose the starting number for rows and columns.",
+            ));
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label("행 번호:");
-                ui.selectable_value(&mut app.row_base, 0, "0부터");
-                ui.selectable_value(&mut app.row_base, 1, "1부터");
+                ui.label(crate::theme::chrome_text("Rows:"));
+                ui.selectable_value(&mut app.row_base, 0, "From 0");
+                ui.selectable_value(&mut app.row_base, 1, "From 1");
             });
             ui.horizontal(|ui| {
-                ui.label("열 번호:");
-                ui.selectable_value(&mut app.col_base, 0, "0부터");
-                ui.selectable_value(&mut app.col_base, 1, "1부터");
+                ui.label(crate::theme::chrome_text("Columns:"));
+                ui.selectable_value(&mut app.col_base, 0, "From 0");
+                ui.selectable_value(&mut app.col_base, 1, "From 1");
             });
             ui.separator();
-            if ui.button("닫기").clicked() {
+            if ui.button("Close").clicked() {
                 app.show_numbering_dialog = false;
             }
         });
@@ -1136,7 +1237,7 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
         let n = c + col_base;
         match &header_fields {
             Some(h) => format!("{} {}", n, h.get(c).cloned().unwrap_or_default()),
-            None => format!("{n}번 컬럼"),
+            None => format!("Column {n}"),
         }
     };
 
@@ -1146,13 +1247,15 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
     // 순서 변경(위/아래로 한 칸): (from, to). 클로저 종료 후 swap.
     let mut swap_pair: Option<(usize, usize)> = None;
 
-    egui::Window::new("다중 컬럼 정렬")
+    egui::Window::new("Sort by Columns")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
-        .default_width(420.0)
+        .default_width(460.0)
         .show(ctx, |ui| {
-            ui.label("위에 있는 기준이 1차 정렬입니다. 위→아래 순으로 적용됩니다.");
+            ui.label(crate::theme::chrome_text(
+                "The topmost criterion is the primary sort; they apply top to bottom.",
+            ));
             ui.separator();
 
             // 각 기준이 현재 선택 중인 컬럼 목록(스냅샷). 드롭다운에서 "다른 행이
@@ -1161,7 +1264,7 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
 
             for i in 0..doc.sort_specs.len() {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{}순위", i + 1));
+                    ui.label(crate::theme::chrome_text(format!("Priority {}", i + 1)));
 
                     // 컬럼 선택 드롭다운. 다른 기준이 이미 선택한 컬럼은 목록에서 제외.
                     let cur_col = doc.sort_specs[i].col.min(col_count - 1);
@@ -1185,34 +1288,34 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
                     // 문자/숫자.
                     egui::ComboBox::from_id_source(("sortkind", i))
                         .selected_text(match doc.sort_specs[i].kind {
-                            SortKind::Text => "문자",
-                            SortKind::Number => "숫자",
+                            SortKind::Text => "Text",
+                            SortKind::Number => "Number",
                         })
-                        .width(56.0)
+                        .width(72.0)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut doc.sort_specs[i].kind, SortKind::Text, "문자");
+                            ui.selectable_value(&mut doc.sort_specs[i].kind, SortKind::Text, "Text");
                             ui.selectable_value(
                                 &mut doc.sort_specs[i].kind,
                                 SortKind::Number,
-                                "숫자",
+                                "Number",
                             );
                         });
 
                     // 오름/내림.
                     egui::ComboBox::from_id_source(("sortdir", i))
                         .selected_text(match doc.sort_specs[i].dir {
-                            SortDir::Asc => "오름차순",
-                            SortDir::Desc => "내림차순",
+                            SortDir::Asc => "Ascending",
+                            SortDir::Desc => "Descending",
                         })
-                        .width(80.0)
+                        .width(96.0)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut doc.sort_specs[i].dir, SortDir::Asc, "오름차순");
-                            ui.selectable_value(&mut doc.sort_specs[i].dir, SortDir::Desc, "내림차순");
+                            ui.selectable_value(&mut doc.sort_specs[i].dir, SortDir::Asc, "Ascending");
+                            ui.selectable_value(&mut doc.sort_specs[i].dir, SortDir::Desc, "Descending");
                         });
 
                     // 대소문자 무시(문자 기준일 때만). 체크됨 = 무시(ci=true).
                     if doc.sort_specs[i].kind == SortKind::Text {
-                        ui.checkbox(&mut doc.sort_specs[i].ci, "대소문자 무시");
+                        ui.checkbox(&mut doc.sort_specs[i].ci, "Ignore case");
                     }
 
                     // 순서 변경(↑ 위로, ↓ 아래로). 맨 위/맨 아래에선 해당 버튼 비활성.
@@ -1246,7 +1349,7 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
                     && next_free.is_some();
 
                 ui.add_enabled_ui(can_add, |ui| {
-                    if ui.button("+ 기준 추가").clicked() {
+                    if ui.button("+ Add criterion").clicked() {
                         if let Some(col) = next_free {
                             doc.sort_specs.push(SortSpec {
                                 col,
@@ -1258,18 +1361,18 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
                     }
                 });
                 if doc.sort_specs.len() >= sort::MAX_KEYS {
-                    ui.label(format!("(최대 {}개)", sort::MAX_KEYS));
+                    ui.label(crate::theme::chrome_text(format!("(maximum {})", sort::MAX_KEYS)));
                 } else if doc.sort_specs.len() >= col_count {
-                    ui.label("(모든 컬럼 사용 중)");
+                    ui.label(crate::theme::chrome_text("(all columns in use)"));
                 }
             });
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("정렬").clicked() {
+                if ui.button("Sort").clicked() {
                     do_sort = true;
                 }
-                if ui.button("취소").clicked() {
+                if ui.button("Cancel").clicked() {
                     doc.show_sort_dialog = false;
                 }
             });
@@ -1364,7 +1467,7 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
     // 정렬 진행 중이면 progress bar만 표시하고 버튼은 숨긴다.
     if let Some(job) = &doc.sort_job {
         let p = job.progress();
-        ui.label("정렬 중");
+        ui.label(crate::theme::chrome_text("Sorting…"));
         ui.add(
             egui::ProgressBar::new(p)
                 .desired_width(160.0)
@@ -1380,8 +1483,8 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
     let selected = doc.selected_col;
 
     match selected {
-        Some(col) => ui.label(format!("정렬: {}번 컬럼", col + 1)),
-        None => ui.label("정렬: (헤더 클릭해 컬럼 선택)"),
+        Some(col) => ui.label(crate::theme::chrome_text(format!("Sort: column {}", col + 1))),
+        None => ui.label(crate::theme::chrome_text("Sort: (click a header to select a column)")),
     };
 
     let delim = match doc.sep {
@@ -1395,23 +1498,23 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
 
     let mut do_sort: Option<(SortKind, SortDir)> = None;
     ui.add_enabled_ui(can_sort, |ui| {
-        if ui.button("문자↑").clicked() {
+        if ui.button("Text ↑").clicked() {
             do_sort = Some((SortKind::Text, SortDir::Asc));
         }
-        if ui.button("문자↓").clicked() {
+        if ui.button("Text ↓").clicked() {
             do_sort = Some((SortKind::Text, SortDir::Desc));
         }
-        if ui.button("숫자↑").clicked() {
+        if ui.button("Number ↑").clicked() {
             do_sort = Some((SortKind::Number, SortDir::Asc));
         }
-        if ui.button("숫자↓").clicked() {
+        if ui.button("Number ↓").clicked() {
             do_sort = Some((SortKind::Number, SortDir::Desc));
         }
     });
 
     // 다중 컬럼 정렬 다이얼로그 열기(인덱싱 완료일 때만).
     ui.add_enabled_ui(complete, |ui| {
-        if ui.button("다중 정렬…").clicked() {
+        if ui.button("Sort by Columns…").clicked() {
             // 다이얼로그를 열 때 기준 목록이 비어 있으면 현재 선택 컬럼(있으면)으로
             // 첫 기준을 미리 채워 사용자가 바로 편집하게 한다.
             if doc.sort_specs.is_empty() {
@@ -1429,12 +1532,14 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
 
     // 정렬 해제 버튼은 뷰 모드에서 permutation 정렬이 적용돼 있을 때만.
     // (편집 모드 정렬은 lines에 이미 반영돼 되돌릴 permutation이 없다.)
-    if doc.sort.is_some() && ui.button("정렬 해제").clicked() {
+    if doc.sort.is_some() && ui.button("Clear Sort").clicked() {
         doc.sort = None;
     }
 
     if !complete && selected.is_some() {
-        ui.label("(인덱싱 완료 후 정렬 가능)");
+        ui.label(crate::theme::chrome_text(
+            "(sorting available after indexing completes)",
+        ));
     }
 
     // 정렬 버튼이 눌리면 — 편집 모드면 lines를 즉시 재배치하고,
@@ -1676,7 +1781,12 @@ fn render_table(
     table
         .header(ROW_HEIGHT, |mut header| {
             header.col(|ui| {
-                ui.add(egui::Label::new(egui::RichText::new("#").strong()).truncate());
+                let rect = ui.max_rect();
+                paint_header_cell(ui, rect, crate::theme::header_bg());
+                // 아래 라인번호가 오른쪽 정렬이므로 머리글도 오른쪽에 맞춘다.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new("#").strong()).truncate());
+                });
             });
             for c in 0..col_count {
                 header.col(|ui| {
@@ -1690,10 +1800,13 @@ fn render_table(
                         ui.id().with(("hdr", c)),
                         egui::Sense::click(),
                     );
-                    // 선택된 컬럼은 헤더 칸 전체에 밝은 파란 음영.
-                    if selected {
-                        ui.painter().rect_filled(cell_rect, 0.0, header_sel_color());
-                    }
+                    // 헤더 배경 + 격자선. 선택된 컬럼은 배경만 파랑으로 바뀐다.
+                    let bg = if selected {
+                        header_sel_color()
+                    } else {
+                        crate::theme::header_bg()
+                    };
+                    paint_header_cell(ui, cell_rect, bg);
                     // 헤더 텍스트: "번호 이름" + 정렬 화살표. 번호는 col_base 반영.
                     let cn = c + col_base;
                     let base = if let Some(h) = &header_fields {
@@ -1727,7 +1840,8 @@ fn render_table(
                 // 라인번호 컬럼 — 화면 순번(정렬 후, row_base부터). 원본 행번호가
                 // 아니라 보이는 순서를 매겨 스크롤 위치 감각을 유지한다.
                 row.col(|ui| {
-                    ui.add(egui::Label::new(format!("{line_no}")).truncate());
+                    let rect = ui.max_rect();
+                    paint_line_number_cell(ui, rect, format!("{line_no}"));
                 });
                 let fields = logical
                     .and_then(|l| parse_logical_line_edit(doc, l, delim))
@@ -1735,10 +1849,13 @@ fn render_table(
                 for c in 0..col_count {
                     row.col(|ui| {
                         let cell_rect = ui.max_rect();
+                        // 셀 경계 격자선(보이는 행에만 그려진다 — 가상 스크롤).
+                        paint_cell_grid(ui, cell_rect);
                         // 선택된 컬럼은 셀 배경에 밝은 파란 음영(줄무늬 위에 반투명).
+                        // gapless로 칠해야 셀 사이 틈이 흰 줄로 남지 않는다.
                         if selected_col == Some(c) {
                             ui.painter().rect_filled(
-                                cell_rect,
+                                gapless_cell_rect(ui, cell_rect),
                                 0.0,
                                 sel_shade(),
                             );
@@ -1788,10 +1905,14 @@ fn render_table(
                             return;
                         }
 
-                        // 선택 사각형 음영(컬럼 음영과 같은 색).
+                        // 선택 사각형 음영(컬럼 음영과 같은 색·같은 gapless 규칙).
                         if let Some(sel) = cur_sel {
                             if rect_contains(sel, lrow, c) {
-                                ui.painter().rect_filled(cell_rect, 0.0, sel_shade());
+                                ui.painter().rect_filled(
+                                    gapless_cell_rect(ui, cell_rect),
+                                    0.0,
+                                    sel_shade(),
+                                );
                             }
                         }
 
@@ -1881,14 +2002,14 @@ fn render_table(
                                     ui.close_menu();
                                 }
                             };
-                            pick(ui, "복사", CellMenuAction::Copy);
-                            pick(ui, "잘라내기", CellMenuAction::Cut);
-                            pick(ui, "붙여넣기", CellMenuAction::Paste);
-                            pick(ui, "셀 내용 지우기", CellMenuAction::Clear);
+                            pick(ui, "Copy", CellMenuAction::Copy);
+                            pick(ui, "Cut", CellMenuAction::Cut);
+                            pick(ui, "Paste", CellMenuAction::Paste);
+                            pick(ui, "Clear Contents", CellMenuAction::Clear);
                             ui.separator();
-                            pick(ui, "위에 행 삽입", CellMenuAction::InsertRowAbove);
-                            pick(ui, "아래에 행 삽입", CellMenuAction::InsertRowBelow);
-                            pick(ui, "행 삭제", CellMenuAction::DeleteRows);
+                            pick(ui, "Insert Row Above", CellMenuAction::InsertRowAbove);
+                            pick(ui, "Insert Row Below", CellMenuAction::InsertRowBelow);
+                            pick(ui, "Delete Rows", CellMenuAction::DeleteRows);
                         });
 
                         // `TABLE_CELL_SENSE`의 `focusable: false`만으로는 부족하다.
@@ -2307,7 +2428,10 @@ enum CaretMove {
 /// 텍스트 모드에서 쓰는 고정폭 폰트. 캐럿/선택 x 좌표 매핑을 위해 줄 텍스트를
 /// 직접 레이아웃하므로, 렌더와 매핑이 같은 FontId를 써야 한다.
 fn text_font_id() -> egui::FontId {
-    egui::FontId::monospace(13.0)
+    // 뷰 전용 모드는 `Label`(= `TextStyle::Body`)로 그리고 편집 모드는 이 galley로
+    // 그린다. 두 경로가 같은 폰트여야 편집 모드 On/Off에 글자가 흔들리지 않으므로
+    // `theme::MONO_SIZE`(= Body에 넣는 크기)를 그대로 쓴다.
+    egui::FontId::monospace(crate::theme::MONO_SIZE)
 }
 
 /// 줄의 char 개수.
@@ -2579,10 +2703,17 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
     table
         .header(ROW_HEIGHT, |mut header| {
             header.col(|ui| {
-                ui.add(egui::Label::new(egui::RichText::new("#").strong()).truncate());
+                let rect = ui.max_rect();
+                paint_header_cell(ui, rect, crate::theme::header_bg());
+                // 아래 라인번호가 오른쪽 정렬이므로 머리글도 오른쪽에 맞춘다.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new("#").strong()).truncate());
+                });
             });
             header.col(|ui| {
-                ui.add(egui::Label::new(egui::RichText::new("내용").strong()).truncate());
+                let rect = ui.max_rect();
+                paint_header_cell(ui, rect, crate::theme::header_bg());
+                ui.add(egui::Label::new(egui::RichText::new("Line").strong()).truncate());
             });
         })
         .body(|body| {
@@ -2590,7 +2721,8 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                 let logical = row.index();
                 let line_no = logical + row_base;
                 row.col(|ui| {
-                    ui.add(egui::Label::new(format!("{line_no}")).truncate());
+                    let rect = ui.max_rect();
+                    paint_line_number_cell(ui, rect, format!("{line_no}"));
                 });
                 let line = logical_line(doc, logical).unwrap_or_default();
                 row.col(|ui| {
@@ -2735,12 +2867,12 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                                 ui.close_menu();
                             }
                         };
-                        pick(ui, "잘라내기", TextMenuAction::Cut);
-                        pick(ui, "복사", TextMenuAction::Copy);
-                        pick(ui, "붙여넣기", TextMenuAction::Paste);
-                        pick(ui, "삭제", TextMenuAction::Delete);
+                        pick(ui, "Cut", TextMenuAction::Cut);
+                        pick(ui, "Copy", TextMenuAction::Copy);
+                        pick(ui, "Paste", TextMenuAction::Paste);
+                        pick(ui, "Delete", TextMenuAction::Delete);
                         ui.separator();
-                        pick(ui, "전체 선택", TextMenuAction::SelectAll);
+                        pick(ui, "Select All", TextMenuAction::SelectAll);
                     });
 
                     // `TEXT_LINE_SENSE`의 `focusable: false`만으로는 부족하다.
