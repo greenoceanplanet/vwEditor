@@ -1108,10 +1108,17 @@ fn render_table(
                         );
 
                         // 이 셀 위에서 좌클릭 누름이 시작/진행 중이면 "셀에서
-                        // 시작된 드래그"로 표시한다. drag_started()는 클릭 거리
-                        // 임계값을 넘겨야 켜지므로, 누르는 동안 계속 참인
-                        // is_pointer_button_down_on()을 함께 본다.
-                        let pressed_here = resp.drag_started() || resp.is_pointer_button_down_on();
+                        // 시작된 드래그"로 표시한다. is_pointer_button_down_on()
+                        // 하나로 충분하다 — drag_started()가 참이면 이미
+                        // is_pointer_button_down_on()도 참이므로(전자가 후자를
+                        // 함의) 별도로 or할 필요가 없다.
+                        // `&& primary_down`이 핵심이다: is_pointer_button_down_on()은
+                        // 버튼을 가리지 않으므로(우클릭 press에도 true) 이 게이트가
+                        // 없으면 우클릭이 다중 셀 선택을 단일 셀로 무너뜨린다 —
+                        // 우클릭 press 프레임에 앵커가 잡혀 cell_sel이 (X,c,X,c)로
+                        // 붕괴하고, context_menu()는 release 시점에야 열리므로 그때는
+                        // 이미 선택이 무너진 뒤다.
+                        let pressed_here = resp.is_pointer_button_down_on() && primary_down;
                         if pressed_here {
                             cell_press.set(true);
                         }
