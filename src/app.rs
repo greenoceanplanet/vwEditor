@@ -1108,11 +1108,14 @@ fn render_table(
 
                         // 셀 전체를 클릭/드래그 대상으로. Label 뒤에 interact를 걸어
                         // 셀 칸 어디를 눌러도 반응하게 한다.
-                        let resp = ui.interact(
-                            cell_rect,
-                            ui.id().with(("cell", lrow, c)),
-                            egui::Sense::click_and_drag(),
-                        );
+                        // sense는 `focusable: false`를 명시한 TABLE_CELL_SENSE다 —
+                        // `Sense::click_and_drag()`는 focusable: true라 그려진 셀마다
+                        // Tab 순회 대상이 된다(상세 이유는 그 상수 주석 참조).
+                        // 이 id는 인라인 편집기 id(`("celledit", ..)`)와 다르고,
+                        // 애초에 편집 중인 셀은 위에서 early return 하므로 같은
+                        // 프레임에 둘이 공존하지 않는다.
+                        let cell_id = ui.id().with(("cell", lrow, c));
+                        let resp = ui.interact(cell_rect, cell_id, TABLE_CELL_SENSE);
 
                         // 이 셀 위에서 좌클릭 누름이 시작/진행 중이면 "셀에서
                         // 시작된 드래그"로 표시한다. is_pointer_button_down_on()
@@ -1154,8 +1157,21 @@ fn render_table(
                         }
 
                         // 우클릭 컨텍스트 메뉴.
-                        resp.context_menu(|ui| {
+                        // 어떤 셀에서 우클릭했는지는 **메뉴가 열리는 프레임에만**
+                        // 기록한다. context_menu의 클로저는 메뉴가 떠 있는 매
+                        // 프레임 다시 돌기 때문에, 그 안에서 set하면 menu_target이
+                        // 메뉴 수명 내내 Some으로 남아 아래 5)의 "선택 밖이면 단일
+                        // 선택으로" 재클램프가 매 프레임 재실행된다. 표 모드는
+                        // 현재 메뉴가 열린 채 선택을 바꿀 키 경로가 없어 증상이
+                        // 드러나지 않지만, 텍스트 모드에서 Ctrl+A로 실제 터졌던
+                        // 것과 같은 구조다. secondary_clicked()는 메뉴를 여는
+                        // release 프레임에만 참이므로(egui의 메뉴 생성 조건
+                        // `hovered && secondary_clicked`, `menu.rs:429`와 일치)
+                        // 여는 순간만 잡는다.
+                        if resp.secondary_clicked() {
                             menu_target.set(Some((lrow, c)));
+                        }
+                        resp.context_menu(|ui| {
                             let pick = |ui: &mut egui::Ui, label: &str, act: CellMenuAction| {
                                 if ui.button(label).clicked() {
                                     menu_action.set(Some(act));
@@ -1171,6 +1187,19 @@ fn render_table(
                             pick(ui, "아래에 행 삽입", CellMenuAction::InsertRowBelow);
                             pick(ui, "행 삭제", CellMenuAction::DeleteRows);
                         });
+
+                        // `TABLE_CELL_SENSE`의 `focusable: false`만으로는 부족하다.
+                        // `Response::context_menu`는 내부에서
+                        // `response.interact(Sense::click())`을 부르는데
+                        // (`egui-0.28.1/src/menu.rs:415`), `Sense::click()`은
+                        // `focusable: true`라 sense가 **union**되어
+                        // (`response.rs:855-868`) 이 셀이 다시 focusable 위젯으로
+                        // 등록된다. 그래서 이 셀이 포커스를 쥐고 있으면 즉시 반납한다.
+                        // (`surrender_focus`는 그 id가 포커스일 때만 지우므로
+                        //  `memory.rs:762-767`, 인라인 셀 편집기의 TextEdit이나
+                        //  툴바 위젯의 포커스는 건드리지 않는다 — 그것들은 id가
+                        //  다르고, 편집 중인 셀은 이 코드에 도달하지도 않는다.)
+                        ui.memory_mut(|m| m.surrender_focus(cell_id));
                     });
                 }
             });
@@ -1238,6 +1267,10 @@ fn render_table(
 
     // 5) 컨텍스트 메뉴 동작.
     // 우클릭 셀이 현재 선택 밖이면 그 셀을 단일 선택으로 만든다.
+    // menu_target은 메뉴가 열리는 프레임에만 채워진다(위 우클릭 메뉴 참조).
+    // 판정은 프레임 시작 스냅샷(`cur_sel`)이 아니라 **현재** `doc.cell_sel`로
+    // 한다 — 위 3)/4)가 이미 선택을 바꿨을 수 있고, 그 최신 선택이 "우클릭이
+    // 선택 안이었나"의 진실이다.
     if let Some((lrow, c)) = menu_target.get() {
         let inside = doc.cell_sel.map_or(false, |s| rect_contains(s, lrow, c));
         if !inside {
@@ -1539,6 +1572,28 @@ fn sel_span_on_line(
 /// Tab 한 번으로 포커스가 줄에 걸리면 `render_text`의 keyboard_free 게이트가
 /// 닫혀 모든 키 입력이 삼켜진다. 그래서 명시적으로 opt-out 한다.
 const TEXT_LINE_SENSE: egui::Sense = egui::Sense {
+    click: true,
+    drag: true,
+    focusable: false,
+};
+
+/// 표 모드 데이터 셀이 쓰는 상호작용 sense. `TEXT_LINE_SENSE`와 값은 같지만
+/// 이유가 달라 따로 둔다(한쪽을 고칠 때 다른 쪽이 딸려가지 않게).
+///
+/// 셀도 텍스트 줄과 똑같이 `Sense::click_and_drag()`(= `focusable: true`,
+/// `egui-0.28.1/src/sense.rs:92-98`)를 쓰고 있었다. 그러면 화면에 그려진
+/// **모든 셀**이 `interested_in_focus`로 등록돼(`context.rs:1050`) Tab 순회
+/// 대상이 된다. 표 모드에는 `render_text`의 `keyboard_free` 같은 전역 키
+/// 게이트가 없어 오늘 당장 편집 불가가 되지는 않지만,
+///
+/// - Tab이 셀 위에 눈에 보이지 않는 포커스를 남겨 인라인 셀 편집기
+///   (`("celledit", ..)` TextEdit)의 포커스 이동과 간섭할 여지가 있고,
+/// - 표 모드가 나중에 키보드 게이트를 갖는 순간 텍스트 모드와 똑같이
+///   문서 전체가 편집 불가가 된다.
+///
+/// 셀은 포커스가 필요 없다 — 클릭/드래그는 `interact_pointer_pos` 경로로,
+/// 편집은 별도의 `TextEdit` 위젯으로 처리한다. 그래서 명시적으로 opt-out 한다.
+const TABLE_CELL_SENSE: egui::Sense = egui::Sense {
     click: true,
     drag: true,
     focusable: false,
@@ -2493,6 +2548,108 @@ mod tests {
         // render_text의 게이트 식과 동일.
         let keyboard_free = ctx.memory(|m| m.focused().is_none());
         assert!(!keyboard_free, "포커스가 있으면 본문은 키를 소비하지 않는다");
+    }
+
+    /// Tab이 표 모드 데이터 셀로 포커스를 옮길 수 없어야 한다.
+    /// `tab_cannot_steal_focus_onto_text_line`의 표 모드 판.
+    ///
+    /// 표 모드에는 `render_text`의 `keyboard_free` 같은 전역 게이트가 없어
+    /// 오늘 당장 편집 불가가 되지는 않지만, 구조적 결함은 동일하다
+    /// (`Sense::click_and_drag()` = focusable: true → 그려진 셀마다 Tab 순회
+    /// 등록, 그리고 `context_menu`가 `Sense::click()`을 union해 그 opt-out을
+    /// 매 프레임 무효화). `TABLE_CELL_SENSE` + `surrender_focus` 두 겹이
+    /// 유지되는지를 고정한다.
+    #[test]
+    fn tab_cannot_steal_focus_onto_table_cell() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new(("cell", 3usize, 2usize));
+        // render_table이 한 셀에 대해 하는 것과 같은 순서:
+        // interact → context_menu → surrender_focus.
+        let draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(80.0, 18.0));
+                let resp = ui.interact(rect, id, TABLE_CELL_SENSE);
+                resp.context_menu(|ui| {
+                    ui.label("메뉴");
+                });
+                ui.memory_mut(|m| m.surrender_focus(id));
+            });
+        };
+        // 1프레임: 위젯 등록.
+        let _ = ctx.run(Default::default(), |ctx| draw(ctx));
+        // 2프레임: Tab.
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input, |ctx| draw(ctx));
+
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            None,
+            "Tab이 데이터 셀에 포커스를 걸면 안 된다"
+        );
+    }
+
+    /// 셀 fix가 인라인 셀 편집기의 포커스를 깨지 않는지 고정한다.
+    ///
+    /// `render_table`은 편집 중인 셀에서 **early return** 하므로 그 셀의
+    /// `interact`/`context_menu`/`surrender_focus`는 아예 실행되지 않는다.
+    /// 게다가 편집기 id(`("celledit", ..)`)는 셀 상호작용 id(`("cell", ..)`)와
+    /// 다르고, `Memory::surrender_focus`는 그 id가 포커스일 때만 지운다
+    /// (`memory.rs:762-767`). 즉 **다른** 셀들이 매 프레임 부르는
+    /// `surrender_focus`가 편집 중인 TextEdit의 포커스를 빼앗을 수 없다.
+    #[test]
+    fn cell_surrender_focus_does_not_disturb_inline_editor() {
+        let ctx = egui::Context::default();
+        let editor = egui::Id::new(("celledit", 3usize, 2usize));
+        // 이웃 셀들 — 편집 중이 아니므로 interact + surrender_focus를 돈다.
+        let neighbors = [
+            egui::Id::new(("cell", 3usize, 1usize)),
+            egui::Id::new(("cell", 4usize, 2usize)),
+        ];
+        let draw = |ctx: &egui::Context, request: bool| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // 편집 중인 셀: TextEdit이 포커스를 요청한다(render_table과 동일).
+                let mut buf = String::from("값");
+                let resp = ui.add(egui::TextEdit::singleline(&mut buf).id(editor));
+                if request {
+                    resp.request_focus();
+                }
+                // 나머지 셀들: 셀 상호작용 + 메뉴 + 포커스 반납.
+                for (i, nid) in neighbors.iter().enumerate() {
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(0.0, 40.0 + 20.0 * i as f32),
+                        egui::vec2(80.0, 18.0),
+                    );
+                    let r = ui.interact(rect, *nid, TABLE_CELL_SENSE);
+                    r.context_menu(|ui| {
+                        ui.label("메뉴");
+                    });
+                    ui.memory_mut(|m| m.surrender_focus(*nid));
+                }
+            });
+        };
+        // 1프레임: 편집기가 포커스를 잡는다.
+        let _ = ctx.run(Default::default(), |ctx| draw(ctx, true));
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(editor),
+            "사전 조건: 인라인 셀 편집기가 포커스를 쥐어야 한다"
+        );
+        // 2프레임: 편집기는 더 이상 요청하지 않는다(render_table도 has_focus면
+        // 요청하지 않는다). 이웃 셀들의 surrender_focus가 돌아도 포커스는 유지돼야 한다.
+        let _ = ctx.run(Default::default(), |ctx| draw(ctx, false));
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(editor),
+            "다른 셀의 surrender_focus가 편집 중인 TextEdit의 포커스를 빼앗으면 안 된다"
+        );
     }
 
     #[test]
