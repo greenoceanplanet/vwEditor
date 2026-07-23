@@ -172,13 +172,22 @@ pub fn backspace(lines: &mut Vec<String>, pos: TextPos) -> TextPos {
 
 /// logical 행의 col번째 필드를 value로 교체하고 줄을 재조립한다.
 /// col이 현재 필드 수보다 크면 빈 필드로 패딩한다.
+/// 셀 값은 한 행에 속하므로 개행을 포함할 수 없다 — 개행은 공백으로 치환해
+/// lines[i] 불변식(개행 없음)을 보장한다.
 pub fn set_cell(lines: &mut [String], logical: usize, col: usize, value: &str, delim: u8) {
+    let value = sanitize_cell_value(value);
     let mut fields = split_fields(&lines[logical], delim);
     if col >= fields.len() {
         fields.resize(col + 1, String::new());
     }
-    fields[col] = value.to_string();
+    fields[col] = value;
     lines[logical] = join_fields(&fields, delim);
+}
+
+/// 셀 값에 포함된 `\n`/`\r`를 공백으로 치환한다. 셀은 한 행에 속하므로
+/// 개행을 담을 수 없다 — lines[i]에 개행이 박히는 것을 방지한다.
+fn sanitize_cell_value(value: &str) -> String {
+    value.replace(['\n', '\r'], " ")
 }
 
 /// 사각 영역 [r0..=r1] x [c0..=c1]의 각 셀을 빈 값으로 만든다.
@@ -367,6 +376,23 @@ mod tests {
         let mut lines = v(&["a,b"]);
         set_cell(&mut lines, 0, 0, "x,y", b',');
         assert_eq!(lines, v(&["\"x,y\",b"]));
+    }
+
+    #[test]
+    fn set_cell_strips_newlines_from_value() {
+        // 셀 값에 개행이 있으면 공백으로 치환 — lines[i]에 개행이 박히지 않아야 한다.
+        let mut lines = v(&["a,b"]);
+        set_cell(&mut lines, 0, 0, "x\ny", b',');
+        assert_eq!(lines, v(&["x y,b"]));
+        assert!(!lines[0].contains('\n'));
+    }
+
+    #[test]
+    fn set_cell_strips_carriage_return() {
+        let mut lines = v(&["a,b"]);
+        set_cell(&mut lines, 0, 1, "p\r\nq", b',');
+        // \r\n 두 문자가 각각 공백으로 → "p  q"
+        assert_eq!(lines, v(&["a,p  q"]));
     }
 
     #[test]
