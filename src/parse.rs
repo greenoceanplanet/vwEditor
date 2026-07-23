@@ -238,6 +238,34 @@ pub fn detect_header(rows: &[Vec<String>]) -> bool {
     true
 }
 
+/// 필드 배열을 구분자로 합쳐 한 줄 문자열을 만든다. CSV 인용 규칙:
+/// 값에 delim / `"` / 개행(`\n`/`\r`)이 있으면 전체를 `"`로 감싸고 내부 `"`는 `""`로.
+pub fn join_fields(fields: &[String], delim: u8) -> String {
+    let delim_ch = delim as char;
+    let mut out = String::new();
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(delim_ch);
+        }
+        let needs_quote = f.chars().any(|c| {
+            c == delim_ch || c == '"' || c == '\n' || c == '\r'
+        });
+        if needs_quote {
+            out.push('"');
+            for c in f.chars() {
+                if c == '"' {
+                    out.push('"');
+                }
+                out.push(c);
+            }
+            out.push('"');
+        } else {
+            out.push_str(f);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +459,36 @@ mod tests {
             vec!["c".to_string(), "d".to_string()],
         ];
         assert!(detect_header(&rows));
+    }
+
+    #[test]
+    fn join_basic() {
+        let f = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(join_fields(&f, b','), "a,b,c");
+    }
+
+    #[test]
+    fn join_quotes_field_with_delim() {
+        let f = vec!["a,b".to_string(), "c".to_string()];
+        assert_eq!(join_fields(&f, b','), "\"a,b\",c");
+    }
+
+    #[test]
+    fn join_escapes_inner_quote() {
+        let f = vec!["a\"b".to_string()];
+        // 값에 " 있으면 감싸고 내부 "는 "" 로.
+        assert_eq!(join_fields(&f, b','), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn join_quotes_field_with_newline() {
+        let f = vec!["a\nb".to_string()];
+        assert_eq!(join_fields(&f, b','), "\"a\nb\"");
+    }
+
+    #[test]
+    fn join_tab_delim() {
+        let f = vec!["x".to_string(), "y".to_string()];
+        assert_eq!(join_fields(&f, b'\t'), "x\ty");
     }
 }

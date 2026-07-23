@@ -1,5 +1,6 @@
 use crate::parse::{decode_line, Encoding};
 use crate::source::Source;
+use crate::parse::{join_fields, split_fields};
 
 /// 원본 파일의 개행 스타일. 저장 시 재현한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +170,50 @@ pub fn backspace(lines: &mut Vec<String>, pos: TextPos) -> TextPos {
     delete_range(lines, merge, pos)
 }
 
+/// logical 행의 col번째 필드를 value로 교체하고 줄을 재조립한다.
+/// col이 현재 필드 수보다 크면 빈 필드로 패딩한다.
+pub fn set_cell(lines: &mut [String], logical: usize, col: usize, value: &str, delim: u8) {
+    let mut fields = split_fields(&lines[logical], delim);
+    if col >= fields.len() {
+        fields.resize(col + 1, String::new());
+    }
+    fields[col] = value.to_string();
+    lines[logical] = join_fields(&fields, delim);
+}
+
+/// 사각 영역 [r0..=r1] x [c0..=c1]의 각 셀을 빈 값으로 만든다.
+pub fn clear_cells(lines: &mut [String], r0: usize, c0: usize, r1: usize, c1: usize, delim: u8) {
+    let (r0, r1) = (r0.min(r1), r0.max(r1));
+    let (c0, c1) = (c0.min(c1), c0.max(c1));
+    for r in r0..=r1 {
+        if r >= lines.len() {
+            break;
+        }
+        let mut fields = split_fields(&lines[r], delim);
+        let hi = c1.min(fields.len().saturating_sub(1));
+        for c in c0..=hi {
+            if c < fields.len() {
+                fields[c].clear();
+            }
+        }
+        lines[r] = join_fields(&fields, delim);
+    }
+}
+
+pub fn insert_row(lines: &mut Vec<String>, at: usize, text: String) {
+    let at = at.min(lines.len());
+    lines.insert(at, text);
+}
+
+pub fn remove_row(lines: &mut Vec<String>, at: usize) {
+    if at < lines.len() {
+        lines.remove(at);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +345,52 @@ mod tests {
         let a = TextPos { line: 2, col: 0 };
         let b = TextPos { line: 1, col: 3 };
         assert_eq!(normalize(a, b), (b, a));
+    }
+
+    #[test]
+    fn set_cell_replaces_field() {
+        let mut lines = v(&["a,b,c"]);
+        set_cell(&mut lines, 0, 1, "Z", b',');
+        assert_eq!(lines, v(&["a,Z,c"]));
+    }
+
+    #[test]
+    fn set_cell_pads_missing_columns() {
+        // col 3을 설정하는데 필드가 2개뿐 → 빈 필드로 패딩.
+        let mut lines = v(&["a,b"]);
+        set_cell(&mut lines, 0, 3, "Z", b',');
+        assert_eq!(lines, v(&["a,b,,Z"]));
+    }
+
+    #[test]
+    fn set_cell_quotes_when_value_has_delim() {
+        let mut lines = v(&["a,b"]);
+        set_cell(&mut lines, 0, 0, "x,y", b',');
+        assert_eq!(lines, v(&["\"x,y\",b"]));
+    }
+
+    #[test]
+    fn clear_cells_rectangle() {
+        // 2x2 영역(행0~1, 열0~1)을 빈 값으로.
+        let mut lines = v(&["a,b,c", "d,e,f", "g,h,i"]);
+        clear_cells(&mut lines, 0, 0, 1, 1, b',');
+        assert_eq!(lines, v(&[",,c", ",,f", "g,h,i"]));
+    }
+
+    #[test]
+    fn insert_and_remove_row() {
+        let mut lines = v(&["a", "b"]);
+        insert_row(&mut lines, 1, String::new());
+        assert_eq!(lines, v(&["a", "", "b"]));
+        remove_row(&mut lines, 1);
+        assert_eq!(lines, v(&["a", "b"]));
+    }
+
+    #[test]
+    fn remove_last_row_keeps_one_empty() {
+        // 마지막 한 줄을 지우면 빈 한 줄은 남긴다(빈 lines 방지).
+        let mut lines = v(&["only"]);
+        remove_row(&mut lines, 0);
+        assert_eq!(lines, v(&[""]));
     }
 }
