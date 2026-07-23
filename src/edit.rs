@@ -15,6 +15,8 @@ pub struct EditBuffer {
     pub lines: Vec<String>,
     pub dirty: bool,
     pub newline: Newline,
+    /// 되돌리기 스택(최근 UNDO_LIMIT 단계).
+    pub undo: UndoStack,
 }
 
 /// mmap 바이트를 개행(`\n`)으로 분할하고 각 줄을 `enc`로 디코딩해 EditBuffer를 만든다.
@@ -25,7 +27,12 @@ pub struct EditBuffer {
 pub fn load_edit_buffer(source: &Source, enc: Encoding) -> EditBuffer {
     let bytes = source.as_bytes();
     if bytes.is_empty() {
-        return EditBuffer { lines: vec![String::new()], dirty: false, newline: Newline::Lf };
+        return EditBuffer {
+            lines: vec![String::new()],
+            dirty: false,
+            newline: Newline::Lf,
+            undo: UndoStack::new(UNDO_LIMIT),
+        };
     }
     let mut newline = Newline::Lf;
     let mut lines = Vec::new();
@@ -58,7 +65,7 @@ pub fn load_edit_buffer(source: &Source, enc: Encoding) -> EditBuffer {
     if lines.is_empty() {
         lines.push(String::new());
     }
-    EditBuffer { lines, dirty: false, newline }
+    EditBuffer { lines, dirty: false, newline, undo: UndoStack::new(UNDO_LIMIT) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +325,110 @@ pub fn apply_permutation(lines: &mut Vec<String>, order: &[u32], data_start: usi
     let mut out = header;
     out.append(&mut reordered);
     *lines = out;
+}
+
+/// 되돌리기 한 단계. 각 variant는 그 편집을 취소하는 데 필요한 최소 정보를 담는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditOp {
+    /// 여러 줄의 이전 내용을 복원한다(셀 편집·범위 지우기·붙여넣기 등 값 변경).
+    /// (논리 행번호, 그 행의 이전 전체 텍스트) 목록.
+    Replace(Vec<(usize, String)>),
+    /// 삽입된 행들을 제거한다. at부터 count개를 지우면 원상복구.
+    RemoveInserted { at: usize, count: usize },
+    /// 삭제된 행들을 되살린다. at 위치에 lines를 다시 끼워 넣는다.
+    ReinsertRemoved { at: usize, lines: Vec<String> },
+    /// 정렬 등 전체 재배치를 되돌린다. inverse[i] = 재배치 후 i번째 줄이
+    /// 원래 있던 위치. data_start 이전(헤더)은 건드리지 않는다.
+    Reorder { inverse: Vec<u32>, data_start: usize },
+}
+
+/// 되돌리기 스택. limit을 넘으면 가장 오래된 것부터 버린다(FIFO).
+pub struct UndoStack {
+    ops: Vec<EditOp>,
+    limit: usize,
+}
+
+/// 기본 되돌리기 깊이(사용자 확정).
+pub const UNDO_LIMIT: usize = 100;
+
+impl UndoStack {
+    pub fn new(limit: usize) -> Self {
+        UndoStack { ops: Vec::new(), limit }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// 되돌리기 한 단계를 쌓는다. limit을 넘으면 가장 오래된 것을 버린다.
+    /// **편집을 적용하기 직전에** 호출해야 한다(이전 상태를 담으므로).
+    pub fn push(&mut self, op: EditOp) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.ops.len() >= self.limit {
+            self.ops.remove(0);
+        }
+        self.ops.push(op);
+    }
+
+    pub fn clear(&mut self) {
+        self.ops.clear();
+    }
+
+    /// 가장 최근 편집을 되돌린다. 되돌릴 게 없으면 false.
+    /// 범위를 벗어난 인덱스는 조용히 건너뛴다(패닉 없음).
+    pub fn undo(&mut self, lines: &mut Vec<String>) -> bool {
+        let Some(op) = self.ops.pop() else {
+            return false;
+        };
+        match op {
+            EditOp::Replace(items) => {
+                for (row, text) in items {
+                    if row < lines.len() {
+                        lines[row] = text;
+                    }
+                }
+            }
+            EditOp::RemoveInserted { at, count } => {
+                let end = (at + count).min(lines.len());
+                if at < end {
+                    lines.drain(at..end);
+                }
+                if lines.is_empty() {
+                    lines.push(String::new());
+                }
+            }
+            EditOp::ReinsertRemoved { at, lines: removed } => {
+                let at = at.min(lines.len());
+                for (k, text) in removed.into_iter().enumerate() {
+                    lines.insert(at + k, text);
+                }
+            }
+            EditOp::Reorder { inverse, data_start } => {
+                apply_permutation(lines, &inverse, data_start);
+            }
+        }
+        true
+    }
+}
+
+/// 재배치 order의 역순열을 만든다. `apply_permutation(lines, order, ds)`를
+/// 되돌리려면 `apply_permutation(lines, inverse_of(order, ds), ds)`를 적용하면 된다.
+/// order[i] = 재배치 후 i번째 자리에 올 원본 논리 행번호.
+pub fn inverse_of(order: &[u32], data_start: usize) -> Vec<u32> {
+    let mut inv = vec![0u32; order.len()];
+    for (new_i, &orig) in order.iter().enumerate() {
+        let orig_slot = (orig as usize).saturating_sub(data_start);
+        if orig_slot < inv.len() {
+            inv[orig_slot] = (data_start + new_i) as u32;
+        }
+    }
+    inv
 }
 
 #[cfg(test)]
@@ -646,5 +757,104 @@ mod tests {
         let mut lines = v(&["b", "a", "c"]);
         apply_permutation(&mut lines, &[1, 0, 2], 0);
         assert_eq!(lines, v(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn undo_replace_restores_previous_lines() {
+        let mut lines = v(&["a,b", "c,d"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        // 1행을 바꾸기 전에 이전 값을 기록.
+        st.push(EditOp::Replace(vec![(1, lines[1].clone())]));
+        lines[1] = "X,Y".to_string();
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["a,b", "c,d"]));
+    }
+
+    #[test]
+    fn undo_remove_inserted_rows() {
+        let mut lines = v(&["a", "b"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        insert_row(&mut lines, 1, String::new());
+        st.push(EditOp::RemoveInserted { at: 1, count: 1 });
+        assert_eq!(lines, v(&["a", "", "b"]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["a", "b"]));
+    }
+
+    #[test]
+    fn undo_reinsert_removed_rows() {
+        let mut lines = v(&["a", "b", "c"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::ReinsertRemoved { at: 1, lines: vec!["b".to_string()] });
+        remove_row(&mut lines, 1);
+        assert_eq!(lines, v(&["a", "c"]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn undo_reorder_restores_original_order() {
+        // 정렬로 재배치한 뒤 undo하면 원래 순서로 돌아온다(헤더 유지).
+        let mut lines = v(&["hdr", "b", "a", "c"]);
+        let order: Vec<u32> = vec![2, 1, 3]; // a(2), b(1), c(3)
+        let inverse = inverse_of(&order, 1);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::Reorder { inverse, data_start: 1 });
+        apply_permutation(&mut lines, &order, 1);
+        assert_eq!(lines, v(&["hdr", "a", "b", "c"]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["hdr", "b", "a", "c"]));
+    }
+
+    #[test]
+    fn undo_pops_in_lifo_order() {
+        let mut lines = v(&["a"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::Replace(vec![(0, "a".to_string())]));
+        lines[0] = "b".to_string();
+        st.push(EditOp::Replace(vec![(0, "b".to_string())]));
+        lines[0] = "c".to_string();
+        st.undo(&mut lines);
+        assert_eq!(lines, v(&["b"]), "최근 것부터 되돌린다");
+        st.undo(&mut lines);
+        assert_eq!(lines, v(&["a"]));
+    }
+
+    #[test]
+    fn undo_on_empty_stack_is_false() {
+        let mut lines = v(&["a"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        assert!(!st.undo(&mut lines));
+        assert_eq!(lines, v(&["a"]));
+    }
+
+    #[test]
+    fn undo_stack_drops_oldest_beyond_limit() {
+        let mut st = UndoStack::new(2);
+        st.push(EditOp::Replace(vec![(0, "1".into())]));
+        st.push(EditOp::Replace(vec![(0, "2".into())]));
+        st.push(EditOp::Replace(vec![(0, "3".into())]));
+        assert_eq!(st.len(), 2, "가장 오래된 것이 버려진다");
+    }
+
+    #[test]
+    fn undo_replace_out_of_range_row_is_ignored() {
+        // 행이 줄어든 뒤 낡은 인덱스가 들어와도 패닉하지 않는다.
+        let mut lines = v(&["a"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::Replace(vec![(5, "x".to_string())]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["a"]));
+    }
+
+    #[test]
+    fn inverse_of_roundtrips() {
+        let order: Vec<u32> = vec![3, 1, 2];
+        let inv = inverse_of(&order, 1);
+        let mut lines = v(&["h", "x", "y", "z"]);
+        let before = lines.clone();
+        apply_permutation(&mut lines, &order, 1);
+        apply_permutation(&mut lines, &inv, 1);
+        assert_eq!(lines, before);
     }
 }
