@@ -1,19 +1,21 @@
 use crate::index::LineIndex;
 use crate::indexer;
 use crate::parse::{self, Encoding, SeparatorMode};
-use crate::sort::{self, SortDir, SortKind};
+use crate::sort::{self, SortDir, SortKind, SortSpec};
 use crate::source::{self, Source};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 /// 현재 적용된 정렬 상태. permutation[i] = 정렬 순서 i번째로 보여줄 원본 데이터
-/// 행의 논리 행번호. col/kind/dir은 헤더 화살표/버튼 상태 표시에 쓴다.
+/// 행의 논리 행번호. col/kind/dir은 헤더 화살표/버튼 상태 표시에 쓴다(다중이면
+/// 1차 기준). spec_count는 상태바에 "N개 기준" 표시용(1이면 단일).
 pub struct SortState {
     pub permutation: Vec<u32>,
     pub col: usize,
     pub kind: SortKind,
     pub dir: SortDir,
+    pub spec_count: usize,
 }
 
 pub struct Document {
@@ -32,12 +34,34 @@ pub struct Document {
     pub sort: Option<SortState>,
     /// 진행 중인 백그라운드 정렬 작업. 완료되면 sort로 옮기고 None이 된다.
     pub sort_job: Option<sort::SortJob>,
+    /// 다중 컬럼 정렬 다이얼로그 표시 여부.
+    pub show_sort_dialog: bool,
+    /// 다이얼로그에서 편집 중인 정렬 기준 목록(위가 1차).
+    pub sort_specs: Vec<SortSpec>,
 }
 
-#[derive(Default)]
 pub struct App {
     pub doc: Option<Document>,
     pub error: Option<String>,
+    /// 행 번호 시작값(0 또는 1). 표시 순번에 더해 라인번호로 쓴다.
+    pub row_base: usize,
+    /// 열 번호 시작값(0 또는 1). 컬럼 인덱스에 더해 헤더 번호로 쓴다.
+    pub col_base: usize,
+    /// 행/열 번호 설정 다이얼로그 표시 여부.
+    pub show_numbering_dialog: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        App {
+            doc: None,
+            error: None,
+            // 요청 기본값: 행/열 모두 0부터.
+            row_base: 0,
+            col_base: 0,
+            show_numbering_dialog: false,
+        }
+    }
 }
 
 /// 프라이밍 시 감지에 쓸 앞부분 바이트 크기.
@@ -101,6 +125,8 @@ impl App {
             selected_col: None,
             sort: None,
             sort_job: None,
+            show_sort_dialog: false,
+            sort_specs: Vec::new(),
         });
     }
 }
@@ -146,14 +172,52 @@ impl eframe::App for App {
             ctx.set_zoom_factor(new_factor);
         }
 
+        // 최상단 메뉴바 (파일 / 도구)
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("파일", |ui| {
+                    if ui.button("열기…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            self.open_path(&path, ctx);
+                        }
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("도구", |ui| {
+                    // 도구 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
+                    let has_doc = self.doc.is_some();
+                    ui.add_enabled_ui(has_doc, |ui| {
+                        if ui.button("다중 정렬…").clicked() {
+                            if let Some(doc) = &mut self.doc {
+                                // 표 모드 + 인덱싱 완료일 때만 실제로 연다.
+                                let complete =
+                                    doc.index.status().phase == crate::index::Phase::Complete;
+                                if matches!(doc.sep, SeparatorMode::Char(_)) && complete {
+                                    if doc.sort_specs.is_empty() {
+                                        let col = doc.selected_col.unwrap_or(0);
+                                        doc.sort_specs.push(SortSpec {
+                                            col,
+                                            kind: SortKind::Text,
+                                            dir: SortDir::Asc,
+                                        });
+                                    }
+                                    doc.show_sort_dialog = true;
+                                }
+                            }
+                            ui.close_menu();
+                        }
+                        if ui.button("행/열 번호…").clicked() {
+                            self.show_numbering_dialog = true;
+                            ui.close_menu();
+                        }
+                    });
+                });
+            });
+        });
+
         // 상단 툴바
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("파일 열기").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        self.open_path(&path, ctx);
-                    }
-                }
                 if let Some(doc) = &mut self.doc {
                     ui.separator();
                     // 구분자 드롭다운. None(텍스트) + 표준 구분자들 + 직접 입력.
@@ -200,6 +264,9 @@ impl eframe::App for App {
                         doc.sort = None;
                         doc.sort_job = None;
                         doc.selected_col = None;
+                        // 컬럼 인덱스가 무의미해지므로 다중 정렬 기준도 초기화.
+                        doc.sort_specs.clear();
+                        doc.show_sort_dialog = false;
                     }
                     // 인코딩 드롭다운
                     let enc_before = doc.enc;
@@ -297,7 +364,15 @@ impl eframe::App for App {
                                     SortDir::Desc => "내림차순",
                                 };
                                 ui.separator();
-                                ui.label(format!("{}번 컬럼 {kind} {dir} 정렬됨", s.col + 1));
+                                if s.spec_count > 1 {
+                                    ui.label(format!(
+                                        "{}개 기준 정렬됨 (1차: {}번 컬럼)",
+                                        s.spec_count,
+                                        s.col + 1
+                                    ));
+                                } else {
+                                    ui.label(format!("{}번 컬럼 {kind} {dir} 정렬됨", s.col + 1));
+                                }
                             }
                         }
                     }
@@ -308,13 +383,203 @@ impl eframe::App for App {
         });
 
         // 본문: 구분 모드에 따라 표 뷰 / 텍스트 뷰로 분기.
+        let row_base = self.row_base;
+        let col_base = self.col_base;
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(doc) = &mut self.doc else { return };
             match doc.sep {
-                SeparatorMode::Char(delim) => render_table(ui, doc, delim),
-                SeparatorMode::None => render_text(ui, &*doc),
+                SeparatorMode::Char(delim) => render_table(ui, doc, delim, row_base, col_base),
+                SeparatorMode::None => render_text(ui, &*doc, row_base),
             }
         });
+
+        // 다중 컬럼 정렬 다이얼로그(표시 중일 때만).
+        if let Some(doc) = &mut self.doc {
+            if doc.show_sort_dialog {
+                render_sort_dialog(ctx, doc, col_base);
+            }
+        }
+
+        // 행/열 번호 설정 다이얼로그.
+        if self.show_numbering_dialog {
+            render_numbering_dialog(ctx, self);
+        }
+    }
+}
+
+/// 행/열 번호 시작값(0 또는 1) 설정 다이얼로그.
+fn render_numbering_dialog(ctx: &egui::Context, app: &mut App) {
+    let mut open = true;
+    egui::Window::new("행/열 번호")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label("행/열 번호를 몇부터 시작할지 정합니다.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("행 번호:");
+                ui.selectable_value(&mut app.row_base, 0, "0부터");
+                ui.selectable_value(&mut app.row_base, 1, "1부터");
+            });
+            ui.horizontal(|ui| {
+                ui.label("열 번호:");
+                ui.selectable_value(&mut app.col_base, 0, "0부터");
+                ui.selectable_value(&mut app.col_base, 1, "1부터");
+            });
+            ui.separator();
+            if ui.button("닫기").clicked() {
+                app.show_numbering_dialog = false;
+            }
+        });
+    if !open {
+        app.show_numbering_dialog = false;
+    }
+}
+
+/// 다중 컬럼 정렬 다이얼로그. 정렬 기준(컬럼·문자/숫자·오름/내림) 목록을
+/// 위(1차)→아래(N차) 순으로 편집하고, "정렬"로 백그라운드 다중 정렬을 시작한다.
+fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) {
+    let delim = match doc.sep {
+        SeparatorMode::Char(d) => d,
+        SeparatorMode::None => {
+            doc.show_sort_dialog = false;
+            return;
+        }
+    };
+    let data_start = if doc.has_header { 1 } else { 0 };
+
+    // 컬럼 수: 헤더가 있으면 헤더 필드 수, 없으면 첫 데이터 행 필드 수로 근사.
+    let col_count = {
+        let probe = if doc.has_header { 0 } else { data_start };
+        parse_logical_line(doc, probe, delim)
+            .map(|f| f.len())
+            .unwrap_or(1)
+            .max(1)
+    };
+    // 헤더 이름(드롭다운 라벨용).
+    let header_fields: Option<Vec<String>> = if doc.has_header {
+        parse_logical_line(doc, 0, delim)
+    } else {
+        None
+    };
+    let col_label = |c: usize| -> String {
+        // 표시 번호는 col_base(0 또는 1)를 반영.
+        let n = c + col_base;
+        match &header_fields {
+            Some(h) => format!("{} {}", n, h.get(c).cloned().unwrap_or_default()),
+            None => format!("{n}번 컬럼"),
+        }
+    };
+
+    let mut open = true;
+    let mut do_sort = false;
+    let mut remove_idx: Option<usize> = None;
+
+    egui::Window::new("다중 컬럼 정렬")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            ui.label("위에 있는 기준이 1차 정렬입니다. 위→아래 순으로 적용됩니다.");
+            ui.separator();
+
+            for i in 0..doc.sort_specs.len() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}순위", i + 1));
+
+                    // 컬럼 선택 드롭다운.
+                    let cur_col = doc.sort_specs[i].col.min(col_count - 1);
+                    egui::ComboBox::from_id_source(("sortcol", i))
+                        .selected_text(col_label(cur_col))
+                        .show_ui(ui, |ui| {
+                            for c in 0..col_count {
+                                ui.selectable_value(&mut doc.sort_specs[i].col, c, col_label(c));
+                            }
+                        });
+
+                    // 문자/숫자.
+                    egui::ComboBox::from_id_source(("sortkind", i))
+                        .selected_text(match doc.sort_specs[i].kind {
+                            SortKind::Text => "문자",
+                            SortKind::Number => "숫자",
+                        })
+                        .width(56.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut doc.sort_specs[i].kind, SortKind::Text, "문자");
+                            ui.selectable_value(
+                                &mut doc.sort_specs[i].kind,
+                                SortKind::Number,
+                                "숫자",
+                            );
+                        });
+
+                    // 오름/내림.
+                    egui::ComboBox::from_id_source(("sortdir", i))
+                        .selected_text(match doc.sort_specs[i].dir {
+                            SortDir::Asc => "오름차순",
+                            SortDir::Desc => "내림차순",
+                        })
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut doc.sort_specs[i].dir, SortDir::Asc, "오름차순");
+                            ui.selectable_value(&mut doc.sort_specs[i].dir, SortDir::Desc, "내림차순");
+                        });
+
+                    // 삭제(기준이 2개 이상일 때만).
+                    if doc.sort_specs.len() > 1 && ui.button("✖").clicked() {
+                        remove_idx = Some(i);
+                    }
+                });
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                // 기준 추가(MAX_KEYS 미만일 때).
+                if doc.sort_specs.len() < sort::MAX_KEYS && ui.button("+ 기준 추가").clicked() {
+                    let col = doc.sort_specs.last().map(|s| s.col).unwrap_or(0);
+                    doc.sort_specs.push(SortSpec {
+                        col,
+                        kind: SortKind::Text,
+                        dir: SortDir::Asc,
+                    });
+                }
+                if doc.sort_specs.len() >= sort::MAX_KEYS {
+                    ui.label(format!("(최대 {}개)", sort::MAX_KEYS));
+                }
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("정렬").clicked() {
+                    do_sort = true;
+                }
+                if ui.button("취소").clicked() {
+                    doc.show_sort_dialog = false;
+                }
+            });
+        });
+
+    if let Some(i) = remove_idx {
+        doc.sort_specs.remove(i);
+    }
+    // 창 X로 닫아도 다이얼로그 종료.
+    if !open {
+        doc.show_sort_dialog = false;
+    }
+
+    if do_sort && !doc.sort_specs.is_empty() {
+        doc.show_sort_dialog = false;
+        doc.sort_job = Some(sort::spawn_multi_sort(
+            doc.source.clone(),
+            doc.index.clone(),
+            doc.enc,
+            delim,
+            doc.sort_specs.clone(),
+            data_start,
+            ctx.clone(),
+        ));
     }
 }
 
@@ -327,11 +592,13 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
     // 진행 중인 정렬 작업이 끝났는지 먼저 폴링해 결과를 수거.
     if let Some(job) = &mut doc.sort_job {
         if let Some(perm) = job.take_result() {
+            let spec_count = job.specs.len().max(1);
             doc.sort = Some(SortState {
                 permutation: perm,
                 col: job.col,
                 kind: job.kind,
                 dir: job.dir,
+                spec_count,
             });
             doc.sort_job = None;
         }
@@ -382,6 +649,23 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
         }
     });
 
+    // 다중 컬럼 정렬 다이얼로그 열기(인덱싱 완료일 때만).
+    ui.add_enabled_ui(complete, |ui| {
+        if ui.button("다중 정렬…").clicked() {
+            // 다이얼로그를 열 때 기준 목록이 비어 있으면 현재 선택 컬럼(있으면)으로
+            // 첫 기준을 미리 채워 사용자가 바로 편집하게 한다.
+            if doc.sort_specs.is_empty() {
+                let col = doc.selected_col.unwrap_or(0);
+                doc.sort_specs.push(SortSpec {
+                    col,
+                    kind: SortKind::Text,
+                    dir: SortDir::Asc,
+                });
+            }
+            doc.show_sort_dialog = true;
+        }
+    });
+
     // 정렬 해제 버튼은 정렬이 적용돼 있을 때만.
     if doc.sort.is_some() && ui.button("정렬 해제").clicked() {
         doc.sort = None;
@@ -409,7 +693,7 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
 
 /// 표 모드 렌더: 라인번호 + 구분자로 분리한 필드 컬럼들.
 /// 헤더 클릭으로 컬럼을 선택하고, 정렬이 적용돼 있으면 permutation 순서로 렌더.
-fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8) {
+fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8, row_base: usize, col_base: usize) {
     use std::cell::Cell;
 
     // 헤더 행 데이터(있으면 첫 줄)와 데이터 시작 행 결정
@@ -487,11 +771,12 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8) {
                             egui::Color32::from_rgb(60, 110, 180),
                         );
                     }
-                    // 헤더 텍스트: "번호 이름" + 정렬 화살표.
+                    // 헤더 텍스트: "번호 이름" + 정렬 화살표. 번호는 col_base 반영.
+                    let cn = c + col_base;
                     let base = if let Some(h) = &header_fields {
-                        format!("{} {}", c + 1, h.get(c).cloned().unwrap_or_default())
+                        format!("{} {}", cn, h.get(c).cloned().unwrap_or_default())
                     } else {
-                        format!("{}", c + 1)
+                        format!("{cn}")
                     };
                     let arrow = match sorted_col_dir {
                         Some((sc, SortDir::Asc)) if sc == c => " ↑",
@@ -509,15 +794,15 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8) {
         .body(|body| {
             body.rows(ROW_HEIGHT, data_rows, |mut row| {
                 let view_row = row.index();
-                let line_no = view_row + 1;
+                let line_no = view_row + row_base;
                 // 정렬이 적용돼 있으면 permutation으로 원본 논리 행번호를 얻는다.
                 // 없으면 원본 순서(data_start + view_row).
                 let logical = match permutation {
                     Some(perm) => perm.get(view_row).map(|&r| r as usize),
                     None => Some(data_start + view_row),
                 };
-                // 라인번호 컬럼 — 화면 순번(정렬 후 1..N). 원본 행번호가 아니라
-                // 보이는 순서를 매겨 스크롤 위치 감각을 유지한다.
+                // 라인번호 컬럼 — 화면 순번(정렬 후, row_base부터). 원본 행번호가
+                // 아니라 보이는 순서를 매겨 스크롤 위치 감각을 유지한다.
                 row.col(|ui| {
                     ui.add(egui::Label::new(format!("{line_no}")).truncate());
                 });
@@ -555,7 +840,7 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8) {
 
 /// 텍스트 모드 렌더: 라인번호 + 줄 전체(구분 안 함). 긴 줄은 truncate하고
 /// 컬럼 폭을 넓히면(가로 스크롤) 전체가 보인다.
-fn render_text(ui: &mut egui::Ui, doc: &Document) {
+fn render_text(ui: &mut egui::Ui, doc: &Document, row_base: usize) {
     let total_lines = doc.index.line_count();
     let avail_height = ui.available_height();
 
@@ -579,7 +864,7 @@ fn render_text(ui: &mut egui::Ui, doc: &Document) {
         .body(|body| {
             body.rows(ROW_HEIGHT, total_lines, |mut row| {
                 let logical = row.index();
-                let line_no = logical + 1;
+                let line_no = logical + row_base;
                 row.col(|ui| {
                     ui.add(egui::Label::new(format!("{line_no}")).truncate());
                 });
