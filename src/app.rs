@@ -45,6 +45,10 @@ pub struct Document {
     pub cell_edit_text: String,
     /// 셀 사각 선택(표 모드): (r0,c0,r1,c1) 논리 행/열.
     pub cell_sel: Option<(usize, usize, usize, usize)>,
+    /// 드래그 선택이 셀에서 시작됐는지. 표 밖에서 누른 채 들어온 포인터가
+    /// 선택을 끌고 가는 것을 막는다(egui의 primary_down은 전역 상태라
+    /// 그것만으로는 시작 지점을 알 수 없다).
+    pub cell_drag_active: bool,
     /// 텍스트 선택(텍스트 모드): (anchor, caret).
     pub text_sel: Option<(crate::edit::TextPos, crate::edit::TextPos)>,
     /// 텍스트 커서(텍스트 모드).
@@ -157,6 +161,7 @@ impl App {
             editing_cell: None,
             cell_edit_text: String::new(),
             cell_sel: None,
+            cell_drag_active: false,
             text_sel: None,
             text_caret: crate::edit::TextPos { line: 0, col: 0 },
         });
@@ -205,6 +210,7 @@ pub fn enter_edit_mode(doc: &mut Document) {
     doc.sort_job = None;
     doc.editing_cell = None;
     doc.cell_sel = None;
+    doc.cell_drag_active = false;
     doc.text_sel = None;
     doc.text_caret = crate::edit::TextPos { line: 0, col: 0 };
 }
@@ -214,6 +220,7 @@ pub fn exit_edit_mode(doc: &mut Document) {
     doc.edit = None;
     doc.editing_cell = None;
     doc.cell_sel = None;
+    doc.cell_drag_active = false;
     doc.text_sel = None;
 }
 
@@ -913,16 +920,24 @@ fn render_table(
     // 드래그 시작 셀(논리 행, 열). 드래그 중 확장 끝점.
     let drag_anchor: Cell<Option<(usize, usize)>> = Cell::new(None);
     let drag_head: Cell<Option<(usize, usize)>> = Cell::new(None);
+    // 이번 프레임에 "셀 위에서" 좌클릭 누름이 진행 중인지. doc.cell_drag_active를
+    // 클로저 밖에서 켜기 위한 통로(클로저는 doc을 불변으로만 빌린다).
+    let cell_press: Cell<bool> = Cell::new(false);
     // 더블클릭으로 편집을 시작할 셀 + 그 셀의 현재 값.
     let begin_edit: RefCell<Option<(usize, usize, String)>> = RefCell::new(None);
     // 편집 중 셀의 커밋(Enter 또는 포커스 상실) 요청.
     let commit_edit: Cell<bool> = Cell::new(false);
+    // Esc — 편집 취소(값 버림). 커밋보다 우선한다.
+    let cancel_edit: Cell<bool> = Cell::new(false);
     // 우클릭으로 선택을 단일 셀로 바꿔야 하는 경우.
     let menu_target: Cell<Option<(usize, usize)>> = Cell::new(None);
     // 컨텍스트 메뉴에서 고른 동작.
     let menu_action: Cell<Option<CellMenuAction>> = Cell::new(None);
     // 좌클릭 버튼이 눌린 상태인지(드래그 확장 판정용). 프레임당 한 번만 읽는다.
     let primary_down = ui.input(|i| i.pointer.primary_down());
+    // 이전 프레임까지 이어져 온 "셀에서 시작된 드래그" 상태. 버튼이 떼어진
+    // 프레임부터는 무조건 꺼진 것으로 본다.
+    let drag_active = doc.cell_drag_active && primary_down;
 
     // col_count는 헤더 필드 수와, 앞부분 데이터 행 몇 개를 샘플링한 필드 수의
     // 최댓값으로 정한다. 헤더가 없는 파일(header_fields == None)에서 1로
@@ -1056,10 +1071,16 @@ fn render_table(
                             if !resp.has_focus() && !resp.lost_focus() {
                                 resp.request_focus();
                             }
+                            // Esc = 취소(값 버림). egui는 Esc에 포커스만 해제하므로
+                            // 그대로 두면 lost_focus()로 커밋돼 버린다. 키 입력을
+                            // lost_focus() 판정과 독립적으로 먼저 읽어, 같은 프레임에
+                            // 둘 다 켜지면 취소가 이기게 한다(적용 단계에서 처리).
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                cancel_edit.set(true);
+                            }
                             // 커밋 조건은 "포커스 상실" 하나로 충분하다 —
                             // singleline TextEdit은 Enter를 누르면 포커스를 놓고,
-                            // 다른 곳을 클릭해도 포커스를 놓는다. Esc는 egui가
-                            // 포커스만 해제하므로 여기선 동일하게 커밋 처리한다.
+                            // 다른 곳을 클릭해도 포커스를 놓는다.
                             if resp.lost_focus() {
                                 commit_edit.set(true);
                             }
@@ -1086,15 +1107,31 @@ fn render_table(
                             egui::Sense::click_and_drag(),
                         );
 
-                        // 드래그 시작 = 새 앵커. 단일 클릭도 그 셀 하나를 선택으로.
-                        if resp.drag_started() || resp.clicked() {
+                        // 이 셀 위에서 좌클릭 누름이 시작/진행 중이면 "셀에서
+                        // 시작된 드래그"로 표시한다. drag_started()는 클릭 거리
+                        // 임계값을 넘겨야 켜지므로, 누르는 동안 계속 참인
+                        // is_pointer_button_down_on()을 함께 본다.
+                        let pressed_here = resp.drag_started() || resp.is_pointer_button_down_on();
+                        if pressed_here {
+                            cell_press.set(true);
+                        }
+                        // 새 앵커 = "이번 프레임에 이 셀에서 누름이 시작됐다".
+                        // drag_active(이전 프레임부터 이어져 온 드래그)가 아닐 때만
+                        // 앵커를 잡는다 — 드래그가 이어지는 동안 시작 셀은 계속
+                        // is_pointer_button_down_on()이 참이므로, 그것만 보면 매
+                        // 프레임 앵커/끝점이 시작 셀로 되돌아가 확장이 깨진다.
+                        // 누르는 첫 프레임부터 앵커를 잡아야(clicked()는 release
+                        // 에서만 켜진다) 아래 확장 분기가 옛 선택을 끌고 가지 않는다.
+                        if resp.clicked() || (pressed_here && !drag_active) {
                             drag_anchor.set(Some((lrow, c)));
                             drag_head.set(Some((lrow, c)));
                         }
                         // 드래그 중 끝점 확장. 드래그 이벤트는 최초로 눌린 셀만
                         // 받으므로(egui가 포인터를 그 위젯에 캡처), 다른 행/열로
-                        // 넘어가는 확장은 "포인터가 이 셀 위 + 버튼 눌림"으로 감지한다.
-                        if resp.contains_pointer() && primary_down {
+                        // 넘어가는 확장은 "포인터가 이 셀 위 + 셀에서 시작된 드래그
+                        // 진행 중"으로 감지한다. primary_down만 보면 표 밖에서 누른
+                        // 채 들어온 포인터도 선택을 끌고 간다.
+                        if resp.contains_pointer() && drag_active {
                             drag_head.set(Some((lrow, c)));
                         }
                         if resp.double_clicked() {
@@ -1144,26 +1181,35 @@ fn render_table(
         doc.cell_edit_text = edit_text.into_inner();
     }
 
-    // 1) 셀 편집 커밋 — 새 편집 시작보다 먼저 처리해야 이전 셀 값이 저장된다.
-    if commit_edit.get() {
+    // 1) 셀 편집 종료. Esc(취소)가 커밋을 이긴다 — 값을 버리고 편집만 닫는다.
+    if cancel_edit.get() {
+        doc.editing_cell = None;
+        doc.cell_edit_text.clear();
+    } else if commit_edit.get() {
+        // 커밋 — 새 편집 시작보다 먼저 처리해야 이전 셀 값이 저장된다.
         commit_editing_cell(doc, delim);
         doc.editing_cell = None;
         doc.cell_edit_text.clear();
     }
 
-    // 2) 드래그/클릭 선택 갱신. 앵커가 새로 잡히면 앵커+끝점을 함께 설정하고,
-    // 이전 프레임에 시작된 드래그가 이어지는 중이면(버튼 눌린 상태) 앵커는
-    // 유지한 채 끝점만 확장한다.
+    // 2) 드래그 시작 지점 추적. 셀 위에서 누름이 감지되면 켜고, 버튼을 떼면 끈다.
+    // 표 밖(툴바/빈 공간)에서 누른 채 표로 들어온 포인터는 끝내 켜지지 않는다.
+    doc.cell_drag_active =
+        next_cell_drag_active(doc.cell_drag_active, primary_down, cell_press.get());
+
+    // 3) 드래그/클릭 선택 갱신. 앵커가 새로 잡히면 앵커+끝점을 함께 설정하고,
+    // 이전 프레임에 시작된 드래그가 이어지는 중이면(셀에서 시작 + 버튼 눌림)
+    // 앵커는 유지한 채 끝점만 확장한다.
     if let Some((ar, ac)) = drag_anchor.get() {
         let (hr, hc) = drag_head.get().unwrap_or((ar, ac));
         doc.cell_sel = Some((ar, ac, hr, hc));
-    } else if primary_down {
+    } else if drag_active {
         if let (Some(sel), Some((hr, hc))) = (doc.cell_sel, drag_head.get()) {
             doc.cell_sel = Some((sel.0, sel.1, hr, hc));
         }
     }
 
-    // 3) 더블클릭 → 셀 편집 시작.
+    // 4) 더블클릭 → 셀 편집 시작.
     if let Some((lrow, c, val)) = begin_edit.into_inner() {
         // 다른 셀이 아직 편집 중이면(예: 편집 셀이 스크롤 밖으로 나가 lost_focus를
         // 못 받은 경우) 그 값을 먼저 커밋해 편집 내용을 잃지 않게 한다.
@@ -1176,7 +1222,7 @@ fn render_table(
         doc.cell_sel = Some((lrow, c, lrow, c));
     }
 
-    // 4) 컨텍스트 메뉴 동작.
+    // 5) 컨텍스트 메뉴 동작.
     // 우클릭 셀이 현재 선택 밖이면 그 셀을 단일 선택으로 만든다.
     if let Some((lrow, c)) = menu_target.get() {
         let inside = doc.cell_sel.map_or(false, |s| rect_contains(s, lrow, c));
@@ -1187,6 +1233,20 @@ fn render_table(
     if let Some(act) = menu_action.get() {
         apply_cell_menu_action(ui, doc, delim, clipboard, act);
     }
+}
+
+/// "셀에서 시작된 드래그가 진행 중인가" 상태 전이. egui의 `primary_down`은
+/// 전역 버튼 상태라 그것만으로는 누름이 표 안에서 시작됐는지 알 수 없으므로,
+/// 셀 위 누름(`pressed_on_cell`)이 관측된 적이 있는지를 별도로 래치한다.
+///
+/// - 버튼을 떼면(`primary_down == false`) 무조건 꺼진다.
+/// - 셀 위에서 누름이 관측되면 켜진다.
+/// - 그 외에는 이전 상태를 유지한다(드래그가 셀 밖으로 나갔다 돌아와도 유지).
+fn next_cell_drag_active(prev: bool, primary_down: bool, pressed_on_cell: bool) -> bool {
+    if !primary_down {
+        return false;
+    }
+    prev || pressed_on_cell
 }
 
 /// 현재 `editing_cell`의 `cell_edit_text`를 편집 버퍼에 써넣는다(dirty 표시).
@@ -1482,6 +1542,23 @@ mod tests {
         assert!(!rect_contains(sel, 1, 2), "행 범위 밖");
         assert!(!rect_contains(sel, 3, 0), "열 범위 밖");
         assert!(!rect_contains(sel, 6, 4), "행 범위 밖");
+    }
+
+    #[test]
+    fn cell_drag_active_latches_only_on_cell_press() {
+        // 버튼을 뗀 프레임은 무조건 해제.
+        assert!(!next_cell_drag_active(true, false, false));
+        assert!(!next_cell_drag_active(true, false, true));
+        // 표 밖에서 누른 채 표 위로 들어온 포인터: 셀 누름이 관측된 적 없으므로
+        // 버튼이 눌려 있어도 켜지지 않는다(선택이 끌려가지 않음).
+        assert!(!next_cell_drag_active(false, true, false));
+        // 셀 위에서 누름이 시작되면 켜진다.
+        assert!(next_cell_drag_active(false, true, true));
+        // 켜진 뒤에는 포인터가 셀 밖으로 나가도 버튼이 눌린 동안 유지된다.
+        assert!(next_cell_drag_active(true, true, false));
+        // 뗐다가 다시 누르면 셀 누름이 다시 관측돼야만 켜진다.
+        let after_release = next_cell_drag_active(true, false, false);
+        assert!(!next_cell_drag_active(after_release, true, false));
     }
 
     #[test]
