@@ -794,7 +794,10 @@ impl eframe::App for App {
         // doc과 분리해 넘긴다(App 전체를 넘기면 doc과 동시 대여가 불가능).
         let clipboard = &mut self.clipboard_cache;
         let doc_opt = &mut self.doc;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // 데이터 영역은 순백. 기본 CentralPanel은 panel_fill(옅은 회색)을 쓰므로
+        // 프레임을 지정해 덮는다 — 메뉴/툴바/상태바만 회색으로 남아 데이터와 갈린다.
+        let data_frame = egui::Frame::central_panel(&ctx.style()).fill(crate::theme::data_bg());
+        egui::CentralPanel::default().frame(data_frame).show(ctx, |ui| {
             let Some(doc) = doc_opt else { return };
             match doc.sep {
                 SeparatorMode::Char(delim) => {

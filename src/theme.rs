@@ -29,6 +29,18 @@ pub const ROW_HEIGHT: f32 = 22.0;
 /// 어긋나지 않는다.
 pub const MONO_SIZE: f32 = 13.0;
 
+/// 데이터 영역(표 본문·텍스트 모드) 배경. 순백 — 엑셀/EMEditor처럼 데이터가
+/// 돋보이도록 UI 배경(옅은 회색 panel_fill)과 확실히 가른다.
+pub fn data_bg() -> Color32 {
+    Color32::WHITE
+}
+
+/// 줄무늬(짝수 행) 배경. 순백 위에 아주 옅게만 얹어 데이터를 가리지 않는다.
+/// (egui 기본 striped는 회색이 짙어 순백 배경의 이점을 지운다.)
+pub fn stripe_bg() -> Color32 {
+    Color32::from_gray(250)
+}
+
 /// 셀 격자선 색(밝은 회색). 엑셀 기본 격자선과 비슷한 밝기.
 pub fn grid_line() -> Color32 {
     Color32::from_gray(216)
@@ -175,12 +187,12 @@ pub fn install_visuals(ctx: &egui::Context) {
     // 선택 강조는 Windows 파랑 계열로 통일.
     v.selection.bg_fill = accent();
     v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-    // 패널 배경은 순백보다 아주 살짝 회색이 눈이 편하다.
+    // UI 영역(메뉴/툴바/상태바) 배경은 순백보다 살짝 회색이라야 데이터 영역과
+    // 구분된다. 데이터 영역은 CentralPanel에 data_bg()를 따로 칠한다.
     v.panel_fill = Color32::from_gray(246);
-    // 표 본문은 순백(엑셀/EMEditor와 같은 인상). CentralPanel이 이 색으로 칠해진다.
-    v.extreme_bg_color = Color32::WHITE;
-    // 줄무늬는 격자선이 생기면 오히려 시끄럽다. 아주 옅게 남겨 스캔만 돕는다.
-    v.faint_bg_color = Color32::from_gray(248);
+    v.extreme_bg_color = data_bg();
+    // 줄무늬는 격자선이 있으면 시끄러우므로 순백 위에 아주 옅게만.
+    v.faint_bg_color = stripe_bg();
     ctx.set_visuals(v);
 
     ctx.style_mut(|s| {
