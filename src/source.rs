@@ -8,6 +8,8 @@ use std::path::Path;
 /// `mmap: None`으로 표현하고, `len`/`slice`/`as_bytes`가 이를 빈 슬라이스로 처리한다.
 pub struct Source {
     mmap: Option<Mmap>,
+    /// 테스트용: 파일 없이 메모리 바이트로 만든 소스. mmap과 배타적.
+    owned: Option<Vec<u8>>,
 }
 
 /// 파일을 열어 메모리 매핑한다. 빈 파일도 허용.
@@ -16,36 +18,44 @@ pub fn open(path: &Path) -> std::io::Result<Source> {
     let meta = file.metadata()?;
     if meta.len() == 0 {
         // 빈 파일은 mmap을 만들지 않고 None으로 표시한다 (Windows에서 0바이트 매핑 불가).
-        return Ok(Source { mmap: None });
+        return Ok(Source { mmap: None, owned: None });
     }
     let mmap = unsafe { Mmap::map(&file)? };
-    Ok(Source { mmap: Some(mmap) })
+    Ok(Source { mmap: Some(mmap), owned: None })
 }
 
 impl Source {
-    pub fn len(&self) -> u64 {
-        match &self.mmap {
-            Some(m) => m.len() as u64,
-            None => 0,
+    /// 테스트 전용: 메모리 바이트로 Source를 만든다.
+    #[cfg(test)]
+    pub fn from_bytes_for_test(bytes: &[u8]) -> Source {
+        Source { mmap: None, owned: Some(bytes.to_vec()) }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        if let Some(m) = &self.mmap {
+            &m[..]
+        } else if let Some(v) = &self.owned {
+            &v[..]
+        } else {
+            &[]
         }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.bytes().len() as u64
     }
 
     /// [start, end) 범위의 바이트 슬라이스. 범위는 파일 크기로 클램프된다.
     pub fn slice(&self, start: u64, end: u64) -> &[u8] {
-        let Some(m) = &self.mmap else {
-            return &[];
-        };
-        let len = m.len() as u64;
+        let b = self.bytes();
+        let len = b.len() as u64;
         let s = start.min(len) as usize;
         let e = end.min(len).max(start.min(len)) as usize;
-        &m[s..e]
+        &b[s..e]
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        match &self.mmap {
-            Some(m) => &m[..],
-            None => &[],
-        }
+        self.bytes()
     }
 }
 

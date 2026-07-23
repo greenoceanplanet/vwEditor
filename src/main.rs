@@ -1,4 +1,5 @@
 mod app;
+mod edit;
 mod index;
 mod indexer;
 mod parse;
