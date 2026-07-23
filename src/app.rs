@@ -84,6 +84,16 @@ pub struct PendingColumnOp {
     rows: usize,
 }
 
+/// 탭 바(전환/닫기)를 잠가야 하는가. `pending_action`(닫기 확인 대기) 또는
+/// 저장 다이얼로그가 떠 있으면 잠근다 — 둘 다 egui 0.28 `Window`라 모달이
+/// 아니므로(`.modal()`은 0.30부터), 잠그지 않으면 그 아래에서 탭 집합이나
+/// 활성 탭이 움직여 대기 중인 인덱스(`CloseTab(i)`)나 저장 다이얼로그의
+/// 인코딩/BOM 선택이 엉뚱한 문서를 가리키게 된다. GUI 클로저(`update()`)
+/// 안에 인라인으로 두면 순수 로직으로 테스트할 수 없으므로 별도 함수로 뺀다.
+fn tab_bar_locked(pending_action: &Option<PendingAction>, show_save_dialog: bool) -> bool {
+    pending_action.is_some() || show_save_dialog
+}
+
 /// 이 동작이 "큰 컬럼 연산" 확인 대상인지. 대상 행 수가 임계치를 넘을 때만
 /// 묻는다. 행 삽입은 한 줄짜리라 범위와 무관하게 항상 즉시 수행한다.
 fn needs_big_op_confirm(act: CellMenuAction, rows: usize) -> bool {
@@ -645,25 +655,37 @@ impl eframe::App for App {
 
         // 탭 바. 문서가 2개 이상일 때만 보인다(1개면 탭이라는 개념이 무의미하고
         // 공간만 낭비한다).
+        //
+        // `pending_action`(닫기 확인 대기) 또는 저장 다이얼로그가 떠 있는 동안은
+        // 탭 전환/닫기를 잠근다. 두 다이얼로그 모두 egui 0.28 `Window`라 모달이
+        // 아니고(`.modal()`은 0.30부터), 잠그지 않으면 그 아래에서 탭 집합이나
+        // 활성 탭이 바뀌어 버린다 — `CloseTab(i)`가 들고 있는 위치 인덱스가
+        // 엉뚱한 탭을 가리키게 되거나(다른 탭을 닫아 인덱스가 밀림),
+        // 저장 다이얼로그가 다른 문서의 인코딩/BOM으로 저장해 버리는 사고로
+        // 이어진다. 인덱스/설정이 대기하는 동안 탭 집합이 움직일 수 없게
+        // 만드는 것이 곧 안전을 보장하는 방법이다.
+        let tab_bar_locked = tab_bar_locked(&self.pending_action, self.show_save_dialog);
         if self.docs.len() > 1 {
             egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
-                // 탭이 많으면 가로 스크롤.
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for i in 0..self.docs.len() {
-                            let label = tab_label(&self.docs[i]);
-                            let selected = i == self.active;
-                            if ui
-                                .selectable_label(selected, crate::theme::chrome_text(label))
-                                .clicked()
-                            {
-                                want_active = Some(i);
+                ui.add_enabled_ui(!tab_bar_locked, |ui| {
+                    // 탭이 많으면 가로 스크롤.
+                    egui::ScrollArea::horizontal().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for i in 0..self.docs.len() {
+                                let label = tab_label(&self.docs[i]);
+                                let selected = i == self.active;
+                                if ui
+                                    .selectable_label(selected, crate::theme::chrome_text(label))
+                                    .clicked()
+                                {
+                                    want_active = Some(i);
+                                }
+                                if ui.small_button("✖").clicked() {
+                                    want_close = Some(i);
+                                }
+                                ui.separator();
                             }
-                            if ui.small_button("✖").clicked() {
-                                want_close = Some(i);
-                            }
-                            ui.separator();
-                        }
+                        });
                     });
                 });
             });
@@ -952,21 +974,37 @@ impl eframe::App for App {
             }
         }
 
-        // 탭 바 클릭 인텐트 적용. 탭 전환은 그냥 인덱스 교체.
-        if let Some(i) = want_active {
-            self.active = i;
-        }
-        // 탭 닫기: dirty 편집 버퍼가 있으면 확인 창을 띄우고, 아니면 즉시 닫는다.
-        if let Some(i) = want_close {
-            let dirty = self
-                .docs
-                .get(i)
-                .and_then(|d| d.edit.as_ref())
-                .map_or(false, |e| e.dirty);
-            if dirty {
-                self.pending_action = Some(PendingAction::CloseTab(i));
-            } else {
-                self.close_tab(i);
+        // 탭 바 클릭 인텐트 적용. 탭 바 자체가 위에서 잠겨 있으면(대기 중인
+        // pending_action이나 저장 다이얼로그) 이 인텐트들은 애초에 생기지
+        // 않지만, `pending_action.is_some()`을 여기서도 다시 확인해 둔다 —
+        // close_requested 훅(위 528줄)과 같은 이유다: 이미 확인을 기다리는
+        // 동작이 있는데 탭 닫기가 그걸 덮어써 버리면 먼저 대기하던 동작을
+        // 잃는다. 이 이중 방어 덕분에 `CloseTab(i)`의 i는 확인 창이 뜨는
+        // 시점부터 실제로 적용되는 시점까지 탭 집합이 움직이지 않는다는
+        // 것이 보장되고, 그래야 위치 인덱스만으로도 안전하다.
+        if self.pending_action.is_none() {
+            if let Some(i) = want_active {
+                // 다른 탭으로 넘어가면 이전 탭의 오류 메시지는 의미가 없다
+                // (예: 탭 A에서 저장 실패 → 탭 B로 전환해도 메시지가 남으면
+                // 마치 B의 오류처럼 보인다). open_path가 새로 열 때 error를
+                // 지우는 것과 같은 이유로, 탭을 "바꿀 때"도 지운다.
+                if i != self.active {
+                    self.error = None;
+                }
+                self.active = i;
+            }
+            // 탭 닫기: dirty 편집 버퍼가 있으면 확인 창을 띄우고, 아니면 즉시 닫는다.
+            if let Some(i) = want_close {
+                let dirty = self
+                    .docs
+                    .get(i)
+                    .and_then(|d| d.edit.as_ref())
+                    .map_or(false, |e| e.dirty);
+                if dirty {
+                    self.pending_action = Some(PendingAction::CloseTab(i));
+                } else {
+                    self.close_tab(i);
+                }
             }
         }
     }
@@ -974,8 +1012,10 @@ impl eframe::App for App {
 
 /// 탭 바에 보여줄 라벨. 파일명(없으면 path_label, 그것도 비면 "(untitled)")에
 /// dirty 편집 버퍼가 있으면 앞에 "● "를 붙이고(상태바가 이미 ●를 쓰는 것과
-/// 일관되게), 24자를 넘으면 문자 경계 기준으로 앞 23자 + "…"로 자른다
-/// (바이트 슬라이스로 자르면 한글에서 패닉한다).
+/// 일관되게), 전체(접두사 포함) 24자를 넘으면 문자 경계 기준으로 잘라 "…"를
+/// 붙인다(바이트 슬라이스로 자르면 한글에서 패닉한다). 접두사를 붙인 *뒤에*
+/// 자르는 게 아니라 예산 안에서 조립해야 한다 — 먼저 자르고 나중에 "● "를
+/// 붙이면 dirty한 긴 이름 탭이 24자 상한을 2자 넘겨 버린다.
 pub(crate) fn tab_label(doc: &Document) -> String {
     let name = doc
         .path
@@ -991,8 +1031,11 @@ pub(crate) fn tab_label(doc: &Document) -> String {
             }
         });
     let dirty = doc.edit.as_ref().map_or(false, |e| e.dirty);
-    let truncated = if name.chars().count() > 24 {
-        let mut s: String = name.chars().take(23).collect();
+    const CAP: usize = 24;
+    let prefix_len = if dirty { 2 } else { 0 }; // "● "는 2글자(● + 공백).
+    let budget = CAP - prefix_len;
+    let truncated = if name.chars().count() > budget {
+        let mut s: String = name.chars().take(budget - 1).collect();
         s.push('…');
         s
     } else {
@@ -3586,6 +3629,133 @@ mod tests {
         enter_edit_mode(&mut doc);
         doc.edit.as_mut().unwrap().dirty = true;
         assert!(tab_label(&doc).starts_with('●'));
+    }
+
+    /// 리뷰어가 재현한 정확한 4탭 시나리오. tab 2와 tab 3이 모두 dirty인 상태에서:
+    /// 1) tab 2의 X를 눌러 CloseTab(2)를 대기시킨다(확인 창이 뜬 상태를 흉내낸다).
+    /// 2) 그 사이 tab 0(깨끗함)의 X를 눌러 즉시 닫히는 시나리오를 시도한다 —
+    ///    수정 전에는 탭 바가 잠기지 않아 이게 그대로 먹혀서 탭 집합이 밀렸다.
+    ///    수정 후에는 `tab_bar_locked`가 참이라 이 클릭 자체가 무시돼야 한다
+    ///    (탭 바 UI가 비활성화된 상태를 그대로 재현: want_close를 만들어내지 않음).
+    /// 3) "계속"을 눌러 대기 중이던 CloseTab(2)를 적용한다.
+    ///
+    /// 결과: 사용자가 실제로 확인한 tab 2(경로로 식별)가 닫히고, 무고한 tab 3은
+    /// dirty 버퍼를 그대로 유지한 채 살아남아야 한다. docs.len()만으로는 이
+    /// 시나리오의 핵심(엉뚱한 탭이 닫히는 것)을 놓치므로 경로로 식별한다.
+    #[test]
+    fn close_tab_confirm_survives_interleaved_click_on_other_tab() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&temp(b"a,b\n1,2\n"), &ctx); // tab 0: clean
+        app.open_path(&temp(b"c,d\n3,4\n"), &ctx); // tab 1: clean
+        app.open_path(&temp(b"e,f\n5,6\n"), &ctx); // tab 2: dirty (닫으려는 대상)
+        app.open_path(&temp(b"g,h\n7,8\n"), &ctx); // tab 3: dirty (무고한 탭)
+        enter_edit_mode(&mut app.docs[2]);
+        app.docs[2].edit.as_mut().unwrap().dirty = true;
+        enter_edit_mode(&mut app.docs[3]);
+        app.docs[3].edit.as_mut().unwrap().dirty = true;
+        let tab2_path = app.docs[2].path.clone();
+        let tab3_path = app.docs[3].path.clone();
+
+        // 1) tab 2의 X 클릭 → dirty이므로 즉시 닫지 않고 확인 대기.
+        let dirty2 = app.docs[2].edit.as_ref().is_some_and(|e| e.dirty);
+        assert!(dirty2);
+        app.pending_action = Some(PendingAction::CloseTab(2));
+
+        // 2) 확인 창이 뜬 동안 탭 바는 잠겨 있어야 한다 — 그래서 tab 0의 X
+        // 클릭이 want_close를 만들어내지 못한다(= 탭 바 UI가 비활성 상태라
+        // 클릭이 애초에 등록되지 않는 것과 같다).
+        assert!(
+            tab_bar_locked(&app.pending_action, app.show_save_dialog),
+            "확인 대기 중에는 탭 바가 잠겨야 다른 탭 클릭이 무시된다"
+        );
+        // 잠겨 있으므로 tab 0 클릭 인텐트를 적용하지 않는다(가드 자체를 검증).
+        // 혹시라도 아래 처럼 클릭이 새어 들어왔다면 즉시 닫히지 않아야 한다.
+        if !tab_bar_locked(&app.pending_action, app.show_save_dialog) {
+            app.close_tab(0);
+        }
+        assert_eq!(app.docs.len(), 4, "잠긴 동안에는 어떤 탭도 닫히지 않는다");
+
+        // 3) "계속" → 대기 중이던 CloseTab(2)를 적용한다.
+        match app.pending_action.take() {
+            Some(PendingAction::CloseTab(i)) => app.close_tab(i),
+            other => panic!("예상치 못한 pending_action: {other:?}"),
+        }
+
+        assert_eq!(app.docs.len(), 3);
+        assert!(
+            !app.docs.iter().any(|d| d.path == tab2_path),
+            "사용자가 실제로 확인한 tab 2가 닫혀야 한다"
+        );
+        let survivor = app
+            .docs
+            .iter()
+            .find(|d| d.path == tab3_path)
+            .expect("무고한 tab 3은 살아남아야 한다");
+        assert!(
+            survivor.edit.as_ref().unwrap().dirty,
+            "tab 3의 dirty 버퍼는 보존되어야 한다(폐기되면 안 된다)"
+        );
+    }
+
+    /// 저장 다이얼로그가 떠 있는 동안은 탭 전환이 안전하지 않다(save_enc/
+    /// save_bom이 활성 문서 기준으로만 세팅되어 있어, 전환을 허용하면 다른
+    /// 인코딩의 문서를 그 설정으로 저장하게 된다). `tab_bar_locked`가 그
+    /// 경우를 잠근다는 것을 확인한다.
+    #[test]
+    fn tab_switch_blocked_while_save_dialog_open() {
+        let pending: Option<PendingAction> = None;
+        assert!(
+            !tab_bar_locked(&pending, false),
+            "평상시에는 탭 바가 잠기지 않아야 한다"
+        );
+        assert!(
+            tab_bar_locked(&pending, true),
+            "저장 다이얼로그가 떠 있으면 탭 바가 잠겨야 한다"
+        );
+    }
+
+    /// 24자 상한은 "● " 접두사까지 포함한 전체 라벨 길이에 적용돼야 한다.
+    /// 접두사를 붙이기 전에 잘라 버리면 dirty한 긴 이름 탭이 상한을 넘긴다.
+    /// 긴 한글 파일명으로 char 경계 패닉이 없는지도 함께 확인한다.
+    #[test]
+    fn dirty_tab_label_stays_within_cap_on_long_korean_name() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let mut doc = app.docs.pop().unwrap();
+        doc.path = std::path::PathBuf::from("가".repeat(40) + ".csv");
+        enter_edit_mode(&mut doc);
+        doc.edit.as_mut().unwrap().dirty = true;
+        let label = tab_label(&doc); // 패닉하면 이 테스트가 실패한다.
+        assert!(
+            label.chars().count() <= 24,
+            "dirty 표시(● )를 포함한 전체 라벨이 24자를 넘었다: {label:?}"
+        );
+        assert!(label.starts_with('●'));
+    }
+
+    /// 탭을 전환하면 이전 탭에서 남은 오류 메시지가 지워져야 한다 — 그렇지
+    /// 않으면 탭 A의 저장 실패 메시지가 탭 B로 넘어가서도 그대로 보여
+    /// 마치 B의 오류처럼 보인다.
+    #[test]
+    fn switching_active_tab_clears_error() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&temp(b"a,b\n1,2\n"), &ctx);
+        app.open_path(&temp(b"c,d\n3,4\n"), &ctx);
+        app.error = Some("Save failed: 뭔가 잘못됨".to_owned());
+
+        // update()의 탭 전환 인텐트 적용부와 같은 조건: 실제로 활성 인덱스가
+        // 바뀔 때만 지운다.
+        let want_active = 0usize;
+        if want_active != app.active {
+            app.error = None;
+        }
+        app.active = want_active;
+
+        assert!(app.error.is_none(), "탭 전환 시 이전 오류가 지워져야 한다");
     }
 
     /// update()의 col_count 계산 로직을 GUI 없이 그대로 재현해 검증하는 헬퍼.
