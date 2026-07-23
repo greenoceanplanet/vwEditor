@@ -2124,13 +2124,18 @@ fn apply_cell_menu_action_confirmed(
     };
     // 대상 행이 너무 많으면(컬럼 전체 선택 등) 한 번 묻는다. 확인 대기 중에는
     // 아직 아무것도 바꾸지 않는다 — 되돌리기 스택도 건드리지 않는다.
+    // `pending_column_op.is_none()` 가드: 확인 다이얼로그가 이미 떠 있는 동안
+    // 새 컬럼 연산 의도(두 번째 Ctrl+C, 메뉴 재클릭 등)를 받아 덮어쓰지 않는다
+    // (다이얼로그가 비-모달 Window라 표 입력이 계속 처리되는 구조적 허점 보강).
     let rows = r1.saturating_sub(r0) + 1;
     if !confirmed && needs_big_op_confirm(act, rows) {
-        doc.pending_column_op = Some(PendingColumnOp {
-            act,
-            paste_text: paste_text.map(|s| s.to_owned()),
-            rows,
-        });
+        if doc.pending_column_op.is_none() {
+            doc.pending_column_op = Some(PendingColumnOp {
+                act,
+                paste_text: paste_text.map(|s| s.to_owned()),
+                rows,
+            });
+        }
         return;
     }
     let Some(e) = doc.edit.as_mut() else { return };

@@ -844,6 +844,86 @@ mod tests {
         assert_eq!(perm, vec![2, 0, 3, 1]);
     }
 
+    // ---- field_slice 인용 처리 수정에 대한 회귀 테스트 ----
+    //
+    // `parse::field_slice`는 예전에 모든 `"`(필드 중간에 나온 것 포함)를
+    // in_quotes 토글로 취급해, `5" pipe`처럼 필드 중간에 리터럴 `"`가 있으면
+    // 그 뒤 구분자를 인용 안으로 착각해 다음 필드까지 삼켜버렸다. 그 결과
+    // `sort.rs`가 뽑는 정렬 키도 어긋났다(잘못 병합된 필드 → 숫자 파싱 실패 →
+    // NUM_INVALID로 맨 뒤). 수정 후에는 "필드 첫 바이트가 `\"`일 때만 인용
+    // 시작"이므로 중간의 `"`는 리터럴로 남고 구분자가 정상적으로 필드를 가른다.
+    // 이 섹션은 그 수정이 sort 경로에서 실제로 지켜지는지 고정한다 — `sort::`
+    // 테스트를 되돌려도(예: field_slice가 다시 망가지면) 여기서 반드시 깨져야 한다.
+
+    #[test]
+    fn number_sort_column_after_unquoted_mid_field_quote() {
+        // 컬럼 0(문자, 인용 없음)에 리터럴 `"`가 중간에 낀 세 행. 컬럼 1(숫자)
+        // 기준으로 오름차순 정렬한다.
+        //   row0: `5" pipe,10,X`   → col1 = "10"
+        //   row1: `size 6",100,ok` → col1 = "100"
+        //   row2: `A"B,3,C`        → col1 = "3"
+        //
+        // 수정 전 field_slice는 col0의 `"`에서 in_quotes를 켠 채 그 뒤 첫 콤마를
+        // "인용 안"으로 오인해 삼켰다 → col1을 요청해도 실제로는 col0 전체(콤마
+        // 포함 뒷부분까지 병합된 것)나 잘못된 컬럼을 가리켜, 숫자 파싱이 실패하고
+        // NUM_INVALID(맨 뒤)가 되는 행이 생겼다. 수정 후에는 세 행 모두 col1이
+        // 정확히 "10"/"100"/"3"으로 뽑힌다.
+        //
+        // 기대 순서: 숫자 오름차순 3 < 10 < 100 → row2, row0, row1 → [2, 0, 1].
+        let (src, idx) =
+            open_indexed(b"5\" pipe,10,X\nsize 6\",100,ok\nA\"B,3,C\n");
+        let perm = extract_and_sort(
+            &src,
+            &idx,
+            Encoding::Utf8,
+            b',',
+            1,
+            0,
+            SortKind::Number,
+            SortDir::Asc,
+            false,
+            None,
+        );
+        assert_eq!(
+            perm,
+            vec![2, 0, 1],
+            "필드 중간의 리터럴 \" 때문에 컬럼1 숫자 키가 어긋나면 안 된다"
+        );
+    }
+
+    #[test]
+    fn quoted_field_with_embedded_delimiter_keeps_column_boundaries() {
+        // 정상적으로 인용된 필드(`"a,b"`)는 내부 콤마가 구분자가 아니라 필드의
+        // 일부다. 따라서 컬럼 0은 `"a,b"` 전체, 컬럼 1은 그 다음 값이어야 한다.
+        // 이 케이스는 인용 로직 자체(필드 첫 바이트에서만 인용 시작)가 여전히
+        // 살아 있는지 확인한다 — 위 테스트가 "중간 따옴표는 무시"만 보장하고
+        // "진짜 인용"까지 망가뜨리지 않았는지 함께 고정한다.
+        //
+        // 컬럼 1 값 하나만 있는 두 행으로 오름 정렬해 col1이 실제로 "2"/"5"임을
+        // (즉 "b"로 오분류되지 않았음을) permutation으로 확인한다.
+        //   row0: `"a,b",2` → col1 = "2"
+        //   row1: `"c,d",5` → col1 = "5"
+        // 숫자 오름: 2 < 5 → row0, row1 → [0, 1].
+        let (src, idx) = open_indexed(b"\"a,b\",2\n\"c,d\",5\n");
+        let perm = extract_and_sort(
+            &src,
+            &idx,
+            Encoding::Utf8,
+            b',',
+            1,
+            0,
+            SortKind::Number,
+            SortDir::Asc,
+            false,
+            None,
+        );
+        assert_eq!(
+            perm,
+            vec![0, 1],
+            "인용된 필드 내부 콤마가 구분자로 오인되면 컬럼1이 \"b\"/\"d\"가 되어 숫자 파싱이 실패한다"
+        );
+    }
+
     // ---- 다중 컬럼 정렬 ----
 
     fn spec(col: usize, kind: SortKind, dir: SortDir) -> SortSpec {
