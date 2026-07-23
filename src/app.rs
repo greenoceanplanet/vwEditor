@@ -38,6 +38,17 @@ pub struct Document {
     pub show_sort_dialog: bool,
     /// 다이얼로그에서 편집 중인 정렬 기준 목록(위가 1차).
     pub sort_specs: Vec<SortSpec>,
+    /// 편집 모드 인메모리 버퍼. None이면 뷰 전용(mmap).
+    pub edit: Option<crate::edit::EditBuffer>,
+    /// 셀 편집 중인 위치와 편집 텍스트(표 모드).
+    pub editing_cell: Option<(usize, usize)>,
+    pub cell_edit_text: String,
+    /// 셀 사각 선택(표 모드): (r0,c0,r1,c1) 논리 행/열.
+    pub cell_sel: Option<(usize, usize, usize, usize)>,
+    /// 텍스트 선택(텍스트 모드): (anchor, caret).
+    pub text_sel: Option<(crate::edit::TextPos, crate::edit::TextPos)>,
+    /// 텍스트 커서(텍스트 모드).
+    pub text_caret: crate::edit::TextPos,
 }
 
 pub struct App {
@@ -49,6 +60,11 @@ pub struct App {
     pub col_base: usize,
     /// 행/열 번호 설정 다이얼로그 표시 여부.
     pub show_numbering_dialog: bool,
+    /// 저장 다이얼로그 표시 + 편집 대상 인코딩/BOM 선택 상태.
+    pub show_save_dialog: bool,
+    pub save_as: bool,
+    pub save_enc: crate::parse::Encoding,
+    pub save_bom: bool,
 }
 
 impl Default for App {
@@ -60,6 +76,10 @@ impl Default for App {
             row_base: 0,
             col_base: 0,
             show_numbering_dialog: false,
+            show_save_dialog: false,
+            save_as: false,
+            save_enc: crate::parse::Encoding::Utf8,
+            save_bom: false,
         }
     }
 }
@@ -127,6 +147,12 @@ impl App {
             sort_job: None,
             show_sort_dialog: false,
             sort_specs: Vec::new(),
+            edit: None,
+            editing_cell: None,
+            cell_edit_text: String::new(),
+            cell_sel: None,
+            text_sel: None,
+            text_caret: crate::edit::TextPos { line: 0, col: 0 },
         });
     }
 }
@@ -152,6 +178,46 @@ fn decode_logical_line(doc: &Document, logical: usize) -> Option<String> {
 /// 전용. 헤더 행, col_count 샘플링, 데이터 행 렌더링이 모두 이 함수를 공유한다.
 fn parse_logical_line(doc: &Document, logical: usize, delim: u8) -> Option<Vec<String>> {
     decode_logical_line(doc, logical).map(|text| crate::parse::split_fields(&text, delim))
+}
+
+/// 편집 모드로 진입: 파일 전체를 현재 인코딩으로 줄 배열 로드.
+/// (동기 로드 — 큰 파일 백그라운드화는 Task 9에서.)
+pub fn enter_edit_mode(doc: &mut Document) {
+    if doc.edit.is_some() {
+        return;
+    }
+    let buf = crate::edit::load_edit_buffer(&doc.source, doc.enc);
+    doc.edit = Some(buf);
+    // 편집 모드에선 뷰 permutation 정렬을 폐기(이제 lines가 진실).
+    doc.sort = None;
+    doc.sort_job = None;
+    doc.editing_cell = None;
+    doc.cell_sel = None;
+    doc.text_sel = None;
+    doc.text_caret = crate::edit::TextPos { line: 0, col: 0 };
+}
+
+/// 편집 모드 이탈(버퍼 폐기). dirty 경고는 호출측 UI에서.
+pub fn exit_edit_mode(doc: &mut Document) {
+    doc.edit = None;
+    doc.editing_cell = None;
+    doc.cell_sel = None;
+    doc.text_sel = None;
+}
+
+/// logical 논리 행의 텍스트. 편집 모드면 EditBuffer에서, 아니면 mmap 디코딩.
+pub fn logical_line(doc: &Document, logical: usize) -> Option<String> {
+    if let Some(e) = &doc.edit {
+        e.lines.get(logical).cloned()
+    } else {
+        decode_logical_line(doc, logical)
+    }
+}
+
+/// `logical_line`(편집 모드 대응) 경유로 디코딩한 뒤 구분자 `delim`으로 필드
+/// 분리한다. `render_table`이 헤더/col_count 샘플/데이터 셀에서 공유한다.
+fn parse_logical_line_edit(doc: &Document, logical: usize, delim: u8) -> Option<Vec<String>> {
+    logical_line(doc, logical).map(|t| crate::parse::split_fields(&t, delim))
 }
 
 impl eframe::App for App {
@@ -754,9 +820,12 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8, row_base: usiz
     use std::cell::Cell;
 
     // 헤더 행 데이터(있으면 첫 줄)와 데이터 시작 행 결정
-    let total_lines = doc.index.line_count();
+    let total_lines = match &doc.edit {
+        Some(e) => e.lines.len(),
+        None => doc.index.line_count(),
+    };
     let header_fields: Option<Vec<String>> = if doc.has_header && total_lines > 0 {
-        parse_logical_line(doc, 0, delim)
+        parse_logical_line_edit(doc, 0, delim)
     } else {
         None
     };
@@ -781,7 +850,7 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8, row_base: usiz
     const COL_COUNT_SAMPLE_ROWS: usize = 10;
     let mut col_count = header_fields.as_ref().map(|h| h.len()).unwrap_or(0);
     for logical in data_start..data_start + COL_COUNT_SAMPLE_ROWS {
-        if let Some(fields) = parse_logical_line(doc, logical, delim) {
+        if let Some(fields) = parse_logical_line_edit(doc, logical, delim) {
             col_count = col_count.max(fields.len());
         }
     }
@@ -864,7 +933,7 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8, row_base: usiz
                     ui.add(egui::Label::new(format!("{line_no}")).truncate());
                 });
                 let fields = logical
-                    .and_then(|l| parse_logical_line(doc, l, delim))
+                    .and_then(|l| parse_logical_line_edit(doc, l, delim))
                     .unwrap_or_default();
                 for c in 0..col_count {
                     row.col(|ui| {
@@ -898,7 +967,10 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8, row_base: usiz
 /// 텍스트 모드 렌더: 라인번호 + 줄 전체(구분 안 함). 긴 줄은 truncate하고
 /// 컬럼 폭을 넓히면(가로 스크롤) 전체가 보인다.
 fn render_text(ui: &mut egui::Ui, doc: &Document, row_base: usize) {
-    let total_lines = doc.index.line_count();
+    let total_lines = match &doc.edit {
+        Some(e) => e.lines.len(),
+        None => doc.index.line_count(),
+    };
     let avail_height = ui.available_height();
 
     // 줄 전체 컬럼은 넉넉한 초기폭 + resizable. 긴 줄은 셀 안에서 truncate.
@@ -925,7 +997,7 @@ fn render_text(ui: &mut egui::Ui, doc: &Document, row_base: usize) {
                 row.col(|ui| {
                     ui.add(egui::Label::new(format!("{line_no}")).truncate());
                 });
-                let line = decode_logical_line(doc, logical).unwrap_or_default();
+                let line = logical_line(doc, logical).unwrap_or_default();
                 row.col(|ui| {
                     ui.add(egui::Label::new(line).truncate());
                 });
@@ -1077,5 +1149,32 @@ mod tests {
             Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
         );
         assert_eq!(compute_col_count(doc), 3);
+    }
+
+    #[test]
+    fn enter_edit_mode_loads_lines() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc.as_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        enter_edit_mode(doc);
+        assert!(doc.edit.is_some());
+        assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a,b", "1,2"]);
+    }
+
+    #[test]
+    fn logical_line_reads_from_edit_buffer() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc.as_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        enter_edit_mode(doc);
+        // 편집 버퍼 값을 바꾸면 logical_line도 그 값을 반환.
+        doc.edit.as_mut().unwrap().lines[1] = "X,Y".to_string();
+        assert_eq!(logical_line(doc, 1).as_deref(), Some("X,Y"));
     }
 }
