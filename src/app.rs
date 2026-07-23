@@ -29,6 +29,12 @@ pub struct Document {
     /// 되파싱하지 않고 별도로 보관한다.
     pub path: std::path::PathBuf,
     pub path_label: String,
+    /// 이 탭이 찾기 결과 행 추출로 만들어졌는가. 라벨 텍스트(`"[hit] "` 접두사
+    /// 유무)로 추측하지 않고 명시적으로 표시한다 — 텍스트로 판단하면 실제
+    /// 파일 이름이 우연히 `"[hit] "`로 시작할 때 그 파일에서 추출해도 접두사가
+    /// 또 붙지 않아, 추출 탭이 원본 파일 탭과 라벨로 구분되지 않는다
+    /// (`extracted_label` 참조).
+    pub is_extracted: bool,
     /// 툴바 "직접 입력" 커스텀 구분자 텍스트박스의 현재 값(한 글자).
     pub custom_sep_input: String,
     /// 헤더 클릭으로 선택된 컬럼(표 모드에서만). 정렬 대상.
@@ -339,6 +345,7 @@ impl App {
             indexer: Some(handle),
             path: path.to_path_buf(),
             path_label: path.display().to_string(),
+            is_extracted: false,
             custom_sep_input,
             selected_col: None,
             sort: None,
@@ -1758,6 +1765,16 @@ fn extract_allowed(app: &App) -> bool {
 /// 잠겨 있어 추출을 막았을 때 상태 문구. `plan_dropped_files`의 안내와 같은 결.
 const EXTRACT_LOCKED_STATUS: &str = "Close the open dialog first";
 
+/// "Extract Rows" 버튼이 활성화되어야 하는가. 검색어가 있을 때만 참이다 —
+/// 뷰/편집 모드 둘 다에서 동작해야 하므로(찾기와 같다) `editing` 여부는
+/// 보지 않는다. `render_find_panel`과 테스트가 이 함수 하나를 공유한다 —
+/// 버튼의 활성/비활성 판정을 렌더 클로저 안에 인라인으로 두면, 그 판정을
+/// 지워도(항상 활성, 또는 버튼 자체를 지워도) 렌더 결과만 보는 테스트로는
+/// 잡아낼 수 없다.
+fn extract_button_enabled(find_query: &str) -> bool {
+    !find_query.is_empty()
+}
+
 /// 추출된 행 텍스트로 뷰 모드 `Document`를 만든다.
 ///
 /// **왜 인메모리 `Source` + 동기 인덱스인가.** `Document`는 `Arc<Source>`와
@@ -1822,6 +1839,7 @@ fn build_extracted_doc(
         // 빈 경로를 보고 "다른 이름으로 저장"으로 폴백한다(그 지점 주석 참조).
         path: std::path::PathBuf::new(),
         path_label,
+        is_extracted: true,
         custom_sep_input,
         // 아래는 전부 초기값 — 추출본은 원본의 선택/정렬/편집 상태를 물려받지
         // 않는다(추출 순서가 곧 원본 순서이므로 정렬도 없다).
@@ -1864,9 +1882,18 @@ fn build_extracted_doc(
 ///   추출 직후 사용자가 보는 곳은 그쪽이고, 탭 라벨은 오래 남는 식별자다.
 ///
 /// 원본에 파일명이 없으면(추출본에서 다시 추출) `path_label`을 그대로 쓰되,
-/// 이미 접두사가 붙어 있으면 **다시 붙이지 않는다** — 추출을 반복할 때마다
-/// `"[hit] [hit] [hit] …"`로 자라면 24자 예산이 접두사로만 차서 정작 원본
-/// 파일명이 사라진다. 몇 번째 추출인지는 탭 라벨이 알려야 할 정보가 아니다.
+/// 원본이 **이미 추출본이면**(`src.is_extracted`) 접두사를 **다시 붙이지
+/// 않는다** — 추출을 반복할 때마다 `"[hit] [hit] [hit] …"`로 자라면 24자
+/// 예산이 접두사로만 차서 정작 원본 파일명이 사라진다. 몇 번째 추출인지는
+/// 탭 라벨이 알려야 할 정보가 아니다.
+///
+/// **라벨 텍스트가 아니라 `is_extracted` 플래그로 판단한다.** 과거에는
+/// `name.starts_with("[hit] ")`로 "이미 접두사가 붙었는가"를 추측했는데,
+/// 그러면 실제 파일 이름이 우연히 `"[hit] real.csv"`인 파일을 열어 추출할 때도
+/// "이미 접두사가 붙었다"고 오판해 접두사를 또 붙이지 않는다 — 그 추출 탭은
+/// 원본 파일 탭과 라벨이 완전히 같아져 구분할 수 없다. 플래그는 "추출로
+/// 만들어졌는가"라는 사실 그 자체를 담으므로 파일명이 우연히 무엇이든 흔들리지
+/// 않는다.
 fn extracted_label(src: &Document) -> String {
     const PREFIX: &str = "[hit] ";
     let name = src
@@ -1878,7 +1905,7 @@ fn extracted_label(src: &Document) -> String {
         .unwrap_or_else(|| src.path_label.clone());
     if name.is_empty() {
         "[hit]".to_owned()
-    } else if name.starts_with(PREFIX) {
+    } else if src.is_extracted {
         name
     } else {
         format!("{PREFIX}{name}")
@@ -2039,7 +2066,7 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
             }
             // 추출은 뷰/편집 모드 둘 다에서 동작한다(찾기와 같다) — 바꾸기처럼
             // `editing`으로 가두면 안 된다. 검색어가 비었을 때만 비활성.
-            ui.add_enabled_ui(!doc.find_query.is_empty(), |ui| {
+            ui.add_enabled_ui(extract_button_enabled(&doc.find_query), |ui| {
                 if ui.button("Extract Rows").clicked() {
                     action = Some(FindAction::Extract);
                 }
@@ -2084,6 +2111,22 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
         doc.show_find = false;
     }
     action
+}
+
+/// 저장 대상 경로를 파일 선택 창으로 새로 골라야 하는가. `save_as`가 참이거나
+/// (명시적 "Save As") 현재 경로가 비어 있으면(추출본처럼 디스크에 대응하는
+/// 파일이 없는 문서) 참이다.
+///
+/// **이 판정이 두 번 쓰인다는 것이 핵심이다.** ①어떤 경로에 쓸지 고르는
+/// 분기(파일 선택 창 vs 현재 경로)와 ②저장 성공 뒤 `doc.path`/`path_label`을
+/// 새 경로로 갱신할지의 분기가 **반드시 같은 값**이어야 한다. 둘이 어긋나면
+/// (예: ①만 폴백하고 ②는 `save_as`만 본 과거 버전) 파일 선택 창으로 실제로
+/// 저장은 되는데 탭은 여전히 "추출본"이라 우기게 되고, 그러면 `doc.path`가
+/// 계속 비어 있어 **다음 Ctrl+S마다 다시 파일 선택 창이 뜬다** — 사용자는
+/// 매번 파일명을 다시 입력해야 한다. 그래서 하나의 함수로 묶어 호출부 두 곳이
+/// 같은 값을 보게 한다.
+fn save_as_fallback(save_as: bool, cur_path_empty: bool) -> bool {
+    save_as || cur_path_empty
 }
 
 /// 저장 다이얼로그. 인코딩/BOM을 고르고 저장하거나 취소한다.
@@ -2163,9 +2206,11 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
     app.show_save_dialog = false;
 
     // 대상 경로 결정. save_as면 파일 선택 창, 아니면 현재 경로.
-    // 현재 경로가 비어 있으면(있을 수 없지만 방어) save_as로 폴백한다.
+    // 현재 경로가 비어 있으면(추출본처럼 디스크 파일이 없는 문서) save_as로
+    // 폴백한다 — 추출 직후 첫 저장이 지나가는 주 경로다(`save_as_fallback` 참조).
     let cur_path = app.doc().map(|d| d.path.clone()).unwrap_or_default();
-    let target = if app.save_as || cur_path.as_os_str().is_empty() {
+    let path_will_update = save_as_fallback(app.save_as, cur_path.as_os_str().is_empty());
+    let target = if path_will_update {
         let mut dlg = rfd::FileDialog::new();
         if let Some(dir) = cur_path.parent() {
             dlg = dlg.set_directory(dir);
@@ -2182,7 +2227,6 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
         cur_path
     };
 
-    let save_as = app.save_as;
     let opts = crate::save::SaveOptions {
         enc: app.save_enc,
         bom: app.save_bom,
@@ -2204,7 +2248,12 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
                 if let Some(e) = &mut doc.edit {
                     e.dirty = false;
                 }
-                if save_as {
+                // ①경로 폴백 여부와 ②경로 갱신 여부는 반드시 같은 판정이어야
+                // 한다(`save_as_fallback` 참조) — 그렇지 않으면 추출본을 파일
+                // 선택 창으로 저장해 놓고도 탭은 계속 "추출본"이라 우겨서,
+                // `doc.path`가 비어 있는 채로 남아 다음 저장마다 또 파일 선택
+                // 창이 뜬다.
+                if path_will_update {
                     doc.path_label = target.display().to_string();
                     doc.path = target.clone();
                 }
@@ -7179,8 +7228,9 @@ mod tests {
 
     /// 파일이 없는 추출본을 저장하면 `render_save_dialog`가 "덮어쓰기"가 아니라
     /// **"다른 이름으로 저장"으로 폴백**해야 한다(빈 경로에 write_file을 부르면
-    /// 실패한다). 그 판정식은 다이얼로그 클로저 밖의 순수한 한 줄이므로
-    /// 여기서 `path`만으로 직접 확인한다.
+    /// 실패한다). `save_as_fallback`이 그 판정식 자체이므로 그 함수를
+    /// 직접 호출해 검증한다 — 프로덕션 식을 여기서 다시 베껴 쓰면(과거처럼)
+    /// 실제 판정식을 뒤집어도 이 테스트는 계속 통과하는 착시가 생긴다.
     #[test]
     fn extracted_doc_saves_via_save_as_fallback() {
         let mut app = extract_test_app(b"name,city\nAlice,Seoul\n");
@@ -7188,9 +7238,26 @@ mod tests {
         app.extract_matching_rows();
         let cur_path = app.doc().unwrap().path.clone();
         assert!(
-            app.save_as || cur_path.as_os_str().is_empty(),
+            save_as_fallback(app.save_as, cur_path.as_os_str().is_empty()),
             "추출본은 save_as가 아니어도 경로가 비어 파일 선택 창으로 폴백한다"
         );
+    }
+
+    /// `save_as_fallback` 자체의 네 가지 조합. 특히 `save_as == false`이고
+    /// 경로가 빈 경우(추출본에 평범한 Ctrl+S) — 이 조합이 참이어야 폴백이
+    /// 일어난다. 이 케이스를 빠뜨리면 "경로 갱신도 save_as만 본다"는 예전
+    /// 버그(추출본을 Ctrl+S로 저장해도 탭이 계속 추출본이라 우기고, 그래서
+    /// 매 저장마다 파일 선택 창이 다시 뜨는 버그)를 이 함수 하나가 재도입해도
+    /// 아무 테스트도 잡아내지 못한다.
+    #[test]
+    fn save_as_fallback_covers_all_combinations() {
+        assert!(save_as_fallback(true, true), "save_as면 경로 유무와 무관하게 폴백");
+        assert!(save_as_fallback(true, false), "save_as면 경로 유무와 무관하게 폴백");
+        assert!(
+            save_as_fallback(false, true),
+            "save_as가 아니어도 경로가 비어 있으면 폴백해야 한다(추출본 Ctrl+S)"
+        );
+        assert!(!save_as_fallback(false, false), "경로가 있고 save_as도 아니면 그대로 덮어쓴다");
     }
 
     /// 저장(다른 이름으로) 후 `repoint_source_after_save`가 인메모리 소스를
@@ -7213,10 +7280,18 @@ mod tests {
             };
             let lines = doc.edit.as_ref().unwrap().lines.clone();
             crate::save::write_file(&target, &lines, &opts, None).unwrap();
-            // render_save_dialog의 save_as 성공 분기와 동일한 뒷정리.
+            // render_save_dialog의 성공 분기와 동일한 뒷정리. `path_will_update`는
+            // 그 분기가 실제로 쓰는 판정식(`save_as_fallback`)을 그대로 재현한다 —
+            // `save_as`만 보면 Important 1 버그(평범한 Ctrl+S가 경로를 갱신하지
+            // 않는 문제)를 이 테스트가 다시 못 잡아낸다.
+            let cur_path_empty = doc.path.as_os_str().is_empty();
+            let path_will_update = save_as_fallback(app.save_as, cur_path_empty);
+            let doc = app.doc_mut().unwrap();
             doc.edit.as_mut().unwrap().dirty = false;
-            doc.path_label = target.display().to_string();
-            doc.path = target.clone();
+            if path_will_update {
+                doc.path_label = target.display().to_string();
+                doc.path = target.clone();
+            }
             repoint_source_after_save(doc, &target, &ctx).unwrap();
             doc.indexer.take().unwrap().join().unwrap();
             exit_edit_mode(doc);
@@ -7228,6 +7303,56 @@ mod tests {
             "저장 후 그 탭은 저장된 파일을 본다"
         );
         assert_eq!(tab_label(doc), target.file_name().unwrap().to_str().unwrap());
+    }
+
+    /// Important 1의 정확한 회귀 시나리오: 추출 탭에서 `save_as == false`인
+    /// 채로(평범한 Ctrl+S) 저장한다. `cur_path`가 비어 있으므로
+    /// `save_as_fallback`이 폴백을 지시해야 하고, 저장 성공 뒤 `doc.path`가
+    /// 실제로 채워져야 한다 — 그래야 그 탭이 "파일"이 되어 **다음** Ctrl+S부터는
+    /// 파일 선택 창 없이 바로 덮어쓴다. 이 갱신이 빠지면 매 저장마다 사용자가
+    /// 파일명을 다시 입력해야 한다.
+    #[test]
+    fn extracted_doc_plain_save_converts_tab_to_file_tab() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\n");
+        app.doc_mut().unwrap().find_query = "Seoul".to_owned();
+        app.extract_matching_rows();
+        let ctx = egui::Context::default();
+        let target = temp(b"");
+        // 평범한 Save(Ctrl+S) 경로: save_as는 false다.
+        app.save_as = false;
+        {
+            let doc = app.doc_mut().unwrap();
+            assert!(doc.path.as_os_str().is_empty(), "사전 조건: 추출본은 경로가 비어 있다");
+            enter_edit_mode(doc);
+            let opts = crate::save::SaveOptions {
+                enc: doc.enc,
+                bom: false,
+                newline: crate::edit::Newline::Lf,
+            };
+            let lines = doc.edit.as_ref().unwrap().lines.clone();
+            crate::save::write_file(&target, &lines, &opts, None).unwrap();
+
+            let cur_path_empty = doc.path.as_os_str().is_empty();
+            let path_will_update = save_as_fallback(app.save_as, cur_path_empty);
+            assert!(path_will_update, "save_as가 false여도 경로가 비어 있으면 폴백해야 한다");
+
+            let doc = app.doc_mut().unwrap();
+            doc.edit.as_mut().unwrap().dirty = false;
+            if path_will_update {
+                doc.path_label = target.display().to_string();
+                doc.path = target.clone();
+            }
+            repoint_source_after_save(doc, &target, &ctx).unwrap();
+            doc.indexer.take().unwrap().join().unwrap();
+            exit_edit_mode(doc);
+        }
+        let doc = app.doc().unwrap();
+        assert_eq!(doc.path, target, "저장 후 탭의 경로가 실제 파일을 가리켜야 한다");
+        assert!(
+            !doc.path_label.starts_with("[hit]"),
+            "저장 후 탭 라벨은 더 이상 추출본을 주장하면 안 된다: {}",
+            doc.path_label
+        );
     }
 
     /// 추출은 편집 모드에서도 동작해야 한다(찾기와 같다). 편집 버퍼의 내용이
@@ -7311,11 +7436,39 @@ mod tests {
         );
     }
 
-    /// 찾기 패널이 실제로 `Extract` 인텐트를 낼 수 있는 상태인지 — 검색어가
-    /// 비어 있으면 버튼이 비활성이어야 한다. 패널을 실제로 그려 프레임이
-    /// 성립하는지도 함께 확인한다.
+    /// Minor 3 회귀: 실제 파일 이름이 이미 `"[hit] "`로 시작해도(우연의 일치),
+    /// 그 파일은 추출본이 아니므로 접두사가 **또 붙어야** 한다. 라벨 텍스트로
+    /// "이미 접두사가 붙었는가"를 추측하면(과거 버전) 이 경우 접두사를 생략해
+    /// 추출 탭이 원본 파일 탭과 라벨이 완전히 같아져 버린다.
     #[test]
-    fn extract_button_renders_in_find_panel() {
+    fn extract_from_a_file_literally_named_with_the_hit_prefix() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\n");
+        {
+            let doc = app.doc_mut().unwrap();
+            assert!(!doc.is_extracted, "사전 조건: 실제 파일을 연 탭은 추출본이 아니다");
+            doc.path = std::path::PathBuf::from("[hit] real.csv");
+            doc.path_label = doc.path.display().to_string();
+            doc.find_query = "Seoul".to_owned();
+        }
+        app.extract_matching_rows();
+        let new_doc = &app.docs[1];
+        assert_eq!(
+            new_doc.path_label, "[hit] [hit] real.csv",
+            "실제 파일명이 우연히 접두사로 시작해도 추출 시 접두사가 또 붙어야 \
+             원본 파일 탭과 라벨로 구분된다"
+        );
+        assert!(new_doc.is_extracted, "추출본은 is_extracted가 참이다");
+    }
+
+    /// **스모크 테스트일 뿐이다**: `render_find_panel`이 검색어가 비었을 때와
+    /// 있을 때 둘 다 패닉 없이 한 프레임을 그려낸다는 것만 확인한다(클릭하지
+    /// 않았으니 어느 쪽도 인텐트를 내지 않는 것은 당연하다). "Extract Rows"
+    /// 버튼이 실제로 존재하는지, 검색어 유무에 따라 활성/비활성이 바뀌는지는
+    /// 이 테스트로는 검증되지 않는다 — egui는 지워진 버튼이 있어도 `None`을
+    /// 그대로 돌려주므로 버튼 삭제를 잡아내지 못한다. 그 규칙은
+    /// `extract_button_enabled_only_when_query_present`가 순수 함수로 검증한다.
+    #[test]
+    fn find_panel_renders_without_panicking_for_empty_and_nonempty_query() {
         let mut app = find_test_doc(&["hit"]);
         app.doc_mut().unwrap().show_find = true;
         let ctx = egui::Context::default();
@@ -7332,15 +7485,34 @@ mod tests {
         });
     }
 
-    /// `apply_find_action`은 추출을 처리하지 않는다(탭을 건드릴 수 없으므로).
-    /// `update()`가 그 변형만 `extract_matching_rows`로 돌려보내는 것이 계약이다.
+    /// "Extract Rows" 버튼의 실제 활성/비활성 규칙: 검색어가 빈 문자열일 때만
+    /// 비활성이다. `render_find_panel`이 이 함수를 그대로 호출해 `add_enabled_ui`에
+    /// 넘기므로, 이 규칙이 바뀌면(예: 항상 활성으로 뒤집히면) 여기서 잡힌다 —
+    /// 렌더 결과(`Option<FindAction>`)만 보는 스모크 테스트로는 활성/비활성
+    /// 차이가 드러나지 않는다.
+    #[test]
+    fn extract_button_enabled_only_when_query_present() {
+        assert!(!extract_button_enabled(""), "검색어가 비었으면 비활성");
+        assert!(extract_button_enabled("hit"), "검색어가 있으면 활성");
+    }
+
+    /// `apply_find_action`은 추출을 처리하지 않는다(탭을 건드릴 수 없으므로) —
+    /// `&mut Document`만 받는 함수는 애초에 `App::docs`를 늘릴 수 없으므로
+    /// (타입 시그니처만으로 참인 것을 확인하는 셈이라) 그 대신 **문서 내부
+    /// 상태를 조용히 놔둔다**는 실제 계약을 확인한다: `find_status`나
+    /// `last_match`를 바꾸지 않는다. 다른 변형(`Next`/`ReplaceOne` 등)은 이
+    /// 필드들을 반드시 바꾸므로, `Extract` 분기가 빠지거나 다른 변형과
+    /// 합쳐지면(예: 실수로 `FindAction::Next`의 동작을 타면) 이 테스트가
+    /// 잡아낸다.
     #[test]
     fn apply_find_action_ignores_extract() {
         let mut app = find_test_doc(&["hit"]);
         let doc = app.doc_mut().unwrap();
         doc.find_query = "hit".to_owned();
+        doc.find_status = "untouched".to_owned();
         apply_find_action(doc, FindAction::Extract);
-        assert_eq!(app.docs.len(), 1, "탭이 늘지 않는다");
+        assert_eq!(doc.find_status, "untouched", "Extract는 find_status를 건드리지 않는다");
+        assert_eq!(doc.last_match, None, "Extract는 last_match를 채우지 않는다(검색을 하지 않는다)");
     }
 
     /// 찾기 상태는 **탭마다** 독립이어야 한다.
