@@ -528,19 +528,12 @@ impl eframe::App for App {
                     });
                 });
                 ui.menu_button("Edit", |ui| {
-                    ui.add_enabled_ui(can_undo, |ui| {
-                        if ui.button("Undo   Ctrl+Z").clicked() {
-                            undo_clicked = true;
-                            ui.close_menu();
-                        }
-                    });
-                });
-                ui.menu_button("Tools", |ui| {
-                    // 도구 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
+                    // 편집 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
                     let has_doc = self.doc.is_some();
                     ui.add_enabled_ui(has_doc, |ui| {
                         // 편집 모드 토글. 켜면 파일 전체를 인메모리 버퍼로 읽고,
                         // 끄면 버퍼를 버린다(dirty면 확인 후).
+                        // 편집의 진입점이므로 편집 메뉴 맨 위에 둔다.
                         let mut edit_on = self.doc.as_ref().map_or(false, |d| d.edit.is_some());
                         if ui.checkbox(&mut edit_on, "Edit Mode").clicked() {
                             if edit_on {
@@ -554,7 +547,19 @@ impl eframe::App for App {
                             }
                             ui.close_menu();
                         }
-                        ui.separator();
+                    });
+                    ui.separator();
+                    ui.add_enabled_ui(can_undo, |ui| {
+                        if ui.button("Undo   Ctrl+Z").clicked() {
+                            undo_clicked = true;
+                            ui.close_menu();
+                        }
+                    });
+                });
+                ui.menu_button("Tools", |ui| {
+                    // 도구 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
+                    let has_doc = self.doc.is_some();
+                    ui.add_enabled_ui(has_doc, |ui| {
                         if ui.button("Sort by Columns…").clicked() {
                             if let Some(doc) = &mut self.doc {
                                 // 표 모드 + 인덱싱 완료일 때만 실제로 연다.
