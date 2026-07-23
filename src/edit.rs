@@ -209,6 +209,51 @@ pub fn clear_cells(lines: &mut [String], r0: usize, c0: usize, r1: usize, c1: us
     }
 }
 
+/// 선택 사각 영역을 TSV(행=\n, 열=\t)로 직렬화한다.
+pub fn cells_to_tsv(lines: &[String], r0: usize, c0: usize, r1: usize, c1: usize, delim: u8) -> String {
+    let (r0, r1) = (r0.min(r1), r0.max(r1));
+    let (c0, c1) = (c0.min(c1), c0.max(c1));
+    let mut out = String::new();
+    for r in r0..=r1 {
+        if r > r0 {
+            out.push('\n');
+        }
+        if r >= lines.len() {
+            continue;
+        }
+        let fields = split_fields(&lines[r], delim);
+        for c in c0..=c1 {
+            if c > c0 {
+                out.push('\t');
+            }
+            if let Some(f) = fields.get(c) {
+                out.push_str(f);
+            }
+        }
+    }
+    out
+}
+
+/// TSV 클립보드를 (r0,c0)부터 셀 그리드로 덮어쓴다. 경계를 넘으면 행/열 확장.
+/// 붙여넣는 값은 set_cell과 동일하게 sanitize_cell_value를 거쳐 lines[i] 개행 불변식을 지킨다.
+pub fn paste_tsv(lines: &mut Vec<String>, r0: usize, c0: usize, tsv: &str, delim: u8) {
+    for (dr, row) in tsv.split('\n').enumerate() {
+        let r = r0 + dr;
+        while r >= lines.len() {
+            lines.push(String::new());
+        }
+        let mut fields = split_fields(&lines[r], delim);
+        for (dc, cell) in row.split('\t').enumerate() {
+            let c = c0 + dc;
+            if c >= fields.len() {
+                fields.resize(c + 1, String::new());
+            }
+            fields[c] = sanitize_cell_value(cell);
+        }
+        lines[r] = join_fields(&fields, delim);
+    }
+}
+
 pub fn insert_row(lines: &mut Vec<String>, at: usize, text: String) {
     let at = at.min(lines.len());
     lines.insert(at, text);
@@ -418,5 +463,38 @@ mod tests {
         let mut lines = v(&["only"]);
         remove_row(&mut lines, 0);
         assert_eq!(lines, v(&[""]));
+    }
+
+    #[test]
+    fn cells_to_tsv_basic() {
+        let lines = v(&["a,b,c", "d,e,f"]);
+        // 열 0~1, 행 0~1 → "a\tb\nd\te"
+        let s = cells_to_tsv(&lines, 0, 0, 1, 1, b',');
+        assert_eq!(s, "a\tb\nd\te");
+    }
+
+    #[test]
+    fn paste_tsv_overwrites_grid() {
+        let mut lines = v(&["a,b,c", "d,e,f"]);
+        // (0,1)부터 "X\tY\nZ\tW" 붙여넣기 → 행0 col1,2 = X,Y / 행1 col1,2 = Z,W
+        paste_tsv(&mut lines, 0, 1, "X\tY\nZ\tW", b',');
+        assert_eq!(lines, v(&["a,X,Y", "d,Z,W"]));
+    }
+
+    #[test]
+    fn paste_tsv_extends_rows_and_cols() {
+        // 파일 경계를 넘는 붙여넣기 → 행/열 확장.
+        let mut lines = v(&["a"]);
+        paste_tsv(&mut lines, 0, 0, "1\t2\n3\t4", b',');
+        assert_eq!(lines, v(&["1,2", "3,4"]));
+    }
+
+    #[test]
+    fn paste_tsv_sanitizes_carriage_return() {
+        // CRLF 클립보드: \n으로 split 후 남는 \r이 셀에 박히면 안 된다.
+        let mut lines = v(&["a,b"]);
+        paste_tsv(&mut lines, 0, 0, "X\r\nY", b',');
+        assert!(!lines.iter().any(|l| l.contains('\r')));
+        assert!(!lines.iter().any(|l| l.contains('\n')));
     }
 }
