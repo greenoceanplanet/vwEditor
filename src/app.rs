@@ -25,6 +25,9 @@ pub struct Document {
     pub sep: SeparatorMode,
     pub has_header: bool,
     pub indexer: Option<JoinHandle<()>>,
+    /// 실제 파일 경로. 저장(덮어쓰기)의 대상. `path_label`은 표시용 문자열이라
+    /// 되파싱하지 않고 별도로 보관한다.
+    pub path: std::path::PathBuf,
     pub path_label: String,
     /// 툴바 "직접 입력" 커스텀 구분자 텍스트박스의 현재 값(한 글자).
     pub custom_sep_input: String,
@@ -78,6 +81,18 @@ pub struct App {
     /// 우클릭 "붙여넣기"의 소스로 이 캐시를 쓴다. 복사 시 시스템 클립보드에도
     /// 같은 내용을 넣어 외부 앱으로의 복사는 정상 동작한다.
     pub clipboard_cache: String,
+    /// 저장하지 않은 변경이 있어 확인을 기다리는 동작. Some이면 확인 다이얼로그를
+    /// 띄우고, 사용자가 "계속"을 누르면 그 동작을 수행한다.
+    pub pending_action: Option<PendingAction>,
+}
+
+/// dirty 편집 버퍼를 잃을 수 있어 확인이 필요한 동작.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingAction {
+    /// 편집 모드 종료(버퍼 폐기).
+    ExitEditMode,
+    /// 다른 파일 열기(경로는 이미 고른 상태).
+    OpenFile(std::path::PathBuf),
 }
 
 impl Default for App {
@@ -94,6 +109,7 @@ impl Default for App {
             save_enc: crate::parse::Encoding::Utf8,
             save_bom: false,
             clipboard_cache: String::new(),
+            pending_action: None,
         }
     }
 }
@@ -102,6 +118,28 @@ impl Default for App {
 const PRIME_BYTES: usize = 64 * 1024;
 
 impl App {
+    /// 저장하지 않은 편집 내용이 있는지.
+    pub fn edit_dirty(&self) -> bool {
+        self.doc
+            .as_ref()
+            .and_then(|d| d.edit.as_ref())
+            .map_or(false, |e| e.dirty)
+    }
+
+    /// 저장 다이얼로그를 열 때 인코딩/BOM 기본값을 현재 문서 기준으로 맞춘다.
+    /// (원본과 같은 인코딩으로 저장하는 것이 기본 기대 동작.)
+    fn init_save_defaults(&mut self) {
+        if let Some(doc) = &self.doc {
+            self.save_enc = doc.enc;
+            // CP949는 BOM이 없다. 나머지는 UTF-16이면 BOM을 기본 켬(없으면
+            // 엔디안 판정이 불가능해 재열기가 깨진다).
+            self.save_bom = matches!(
+                doc.enc,
+                crate::parse::Encoding::Utf16Le | crate::parse::Encoding::Utf16Be
+            );
+        }
+    }
+
     /// 파일을 열고 앞부분으로 인코딩/구분자/헤더를 감지한 뒤 백그라운드 인덱싱을 시작한다.
     pub fn open_path(&mut self, path: &Path, ctx: &egui::Context) {
         self.error = None;
@@ -154,6 +192,7 @@ impl App {
             sep,
             has_header,
             indexer: Some(handle),
+            path: path.to_path_buf(),
             path_label: path.display().to_string(),
             custom_sep_input,
             selected_col: None,
@@ -184,9 +223,9 @@ fn sel_shade() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(80, 150, 230, 70)
 }
 
-/// 논리 행 번호(logical)에 해당하는 줄을 offset으로 조회해 디코딩·개행 제거한
-/// 문자열 하나를 돌려준다(구분자 분리 없음). 텍스트 모드 렌더와, 표 모드의
-/// 필드 분리(`parse_logical_line`)가 공유하는 디코딩 단계.
+/// 논리 행 번호(logical)에 해당하는 줄을 mmap offset으로 조회해 디코딩·개행
+/// 제거한 문자열 하나를 돌려준다(구분자 분리 없음). **뷰 전용 경로**로,
+/// 편집 버퍼를 보지 않는다 — 두 모드를 모두 다루는 것은 `logical_line`이다.
 /// 해당 논리 행이 인덱스에 없으면(범위 밖 등) `None`.
 fn decode_logical_line(doc: &Document, logical: usize) -> Option<String> {
     doc.index.line_range(logical).map(|(s, e)| {
@@ -194,12 +233,6 @@ fn decode_logical_line(doc: &Document, logical: usize) -> Option<String> {
             .trim_end_matches(['\r', '\n'])
             .to_owned()
     })
-}
-
-/// 논리 행을 디코딩한 뒤 구분자 `delim`으로 필드 분리한다. 표 모드(SeparatorMode::Char)
-/// 전용. 헤더 행, col_count 샘플링, 데이터 행 렌더링이 모두 이 함수를 공유한다.
-fn parse_logical_line(doc: &Document, logical: usize, delim: u8) -> Option<Vec<String>> {
-    decode_logical_line(doc, logical).map(|text| crate::parse::split_fields(&text, delim))
 }
 
 /// 편집 모드로 진입: 파일 전체를 현재 인코딩으로 줄 배열 로드.
@@ -241,7 +274,9 @@ pub fn logical_line(doc: &Document, logical: usize) -> Option<String> {
 }
 
 /// `logical_line`(편집 모드 대응) 경유로 디코딩한 뒤 구분자 `delim`으로 필드
-/// 분리한다. `render_table`이 헤더/col_count 샘플/데이터 셀에서 공유한다.
+/// 분리한다. 표 모드(SeparatorMode::Char) 전용. `render_table`의 헤더/col_count
+/// 샘플/데이터 셀과 `render_sort_dialog`의 컬럼 목록이 모두 이 함수를 공유한다 —
+/// 편집 모드에서도 화면과 정렬 대상이 같은 내용을 보게 하는 것이 핵심이다.
 fn parse_logical_line_edit(doc: &Document, logical: usize, delim: u8) -> Option<Vec<String>> {
     logical_line(doc, logical).map(|t| crate::parse::split_fields(&t, delim))
 }
@@ -270,20 +305,59 @@ impl eframe::App for App {
                 ui.menu_button("파일", |ui| {
                     if ui.button("열기…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            self.open_path(&path, ctx);
+                            // 저장하지 않은 변경이 있으면 확인 후에 연다.
+                            if self.edit_dirty() {
+                                self.pending_action = Some(PendingAction::OpenFile(path));
+                            } else {
+                                self.open_path(&path, ctx);
+                            }
                         }
                         ui.close_menu();
                     }
+                    // 저장 항목은 편집 모드일 때만 의미가 있다(뷰 모드는 버퍼가 없다).
+                    let editing = self.doc.as_ref().map_or(false, |d| d.edit.is_some());
+                    ui.add_enabled_ui(editing, |ui| {
+                        if ui.button("저장").clicked() {
+                            self.show_save_dialog = true;
+                            self.save_as = false;
+                            self.init_save_defaults();
+                            ui.close_menu();
+                        }
+                        if ui.button("다른 이름으로 저장…").clicked() {
+                            self.show_save_dialog = true;
+                            self.save_as = true;
+                            self.init_save_defaults();
+                            ui.close_menu();
+                        }
+                    });
                 });
                 ui.menu_button("도구", |ui| {
                     // 도구 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
                     let has_doc = self.doc.is_some();
                     ui.add_enabled_ui(has_doc, |ui| {
+                        // 편집 모드 토글. 켜면 파일 전체를 인메모리 버퍼로 읽고,
+                        // 끄면 버퍼를 버린다(dirty면 확인 후).
+                        let mut edit_on = self.doc.as_ref().map_or(false, |d| d.edit.is_some());
+                        if ui.checkbox(&mut edit_on, "편집 모드").clicked() {
+                            if edit_on {
+                                if let Some(doc) = &mut self.doc {
+                                    enter_edit_mode(doc);
+                                }
+                            } else if self.edit_dirty() {
+                                self.pending_action = Some(PendingAction::ExitEditMode);
+                            } else if let Some(doc) = &mut self.doc {
+                                exit_edit_mode(doc);
+                            }
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         if ui.button("다중 정렬…").clicked() {
                             if let Some(doc) = &mut self.doc {
                                 // 표 모드 + 인덱싱 완료일 때만 실제로 연다.
-                                let complete =
-                                    doc.index.status().phase == crate::index::Phase::Complete;
+                                // 편집 모드는 버퍼가 파일 전체를 이미 담고 있으므로
+                                // 인덱싱 진행 상태와 무관하게 정렬할 수 있다.
+                                let complete = doc.edit.is_some()
+                                    || doc.index.status().phase == crate::index::Phase::Complete;
                                 if matches!(doc.sep, SeparatorMode::Char(_)) && complete {
                                     if doc.sort_specs.is_empty() {
                                         let col = doc.selected_col.unwrap_or(0);
@@ -469,6 +543,15 @@ impl eframe::App for App {
                             }
                         }
                     }
+                    // 편집 모드 표시. 인덱싱 단계와 무관하게 항상 보여야 하므로
+                    // match 밖에 둔다. dirty면 붉은 "● 변경됨"을 덧붙인다.
+                    if let Some(e) = &doc.edit {
+                        ui.separator();
+                        ui.label(format!("편집 중 — {} 행", e.lines.len()));
+                        if e.dirty {
+                            ui.colored_label(egui::Color32::from_rgb(230, 120, 60), "● 변경됨");
+                        }
+                    }
                 } else {
                     ui.label("파일을 여세요");
                 }
@@ -503,6 +586,203 @@ impl eframe::App for App {
         if self.show_numbering_dialog {
             render_numbering_dialog(ctx, self);
         }
+
+        // 저장 다이얼로그.
+        if self.show_save_dialog {
+            render_save_dialog(ctx, self);
+        }
+
+        // 저장하지 않은 변경 확인 다이얼로그.
+        if self.pending_action.is_some() {
+            render_confirm_discard_dialog(ctx, self);
+        }
+
+        // Ctrl+S — 편집 모드에서 저장 다이얼로그 열기. 다른 다이얼로그가 떠
+        // 있으면 무시한다(중복 열기 방지).
+        if self.doc.as_ref().map_or(false, |d| d.edit.is_some())
+            && !self.show_save_dialog
+            && self.pending_action.is_none()
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
+            })
+        {
+            self.show_save_dialog = true;
+            self.save_as = false;
+            self.init_save_defaults();
+        }
+    }
+}
+
+/// 저장 다이얼로그. 인코딩/BOM을 고르고 저장하거나 취소한다.
+/// `app.save_as`가 참이면 rfd 파일 선택 창으로 경로를 새로 고른다.
+fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
+    // 편집 버퍼가 없으면(편집 모드 이탈 등) 다이얼로그를 닫는다.
+    if app.doc.as_ref().map_or(true, |d| d.edit.is_none()) {
+        app.show_save_dialog = false;
+        return;
+    }
+    let title = if app.save_as { "다른 이름으로 저장" } else { "저장" };
+    let cur_label = app
+        .doc
+        .as_ref()
+        .map(|d| d.path_label.clone())
+        .unwrap_or_default();
+
+    let mut open = true;
+    let mut do_save = false;
+    egui::Window::new(title)
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            if app.save_as {
+                ui.label("저장을 누르면 파일 위치를 고릅니다.");
+            } else {
+                ui.label(format!("덮어쓸 파일: {cur_label}"));
+            }
+            ui.separator();
+
+            let enc_label = match app.save_enc {
+                Encoding::Utf8 => "UTF-8",
+                Encoding::Cp949 => "CP949",
+                Encoding::Utf16Le => "UTF-16LE",
+                Encoding::Utf16Be => "UTF-16BE",
+            };
+            egui::ComboBox::from_label("인코딩")
+                .selected_text(enc_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut app.save_enc, Encoding::Utf8, "UTF-8");
+                    ui.selectable_value(&mut app.save_enc, Encoding::Cp949, "CP949");
+                    ui.selectable_value(&mut app.save_enc, Encoding::Utf16Le, "UTF-16LE");
+                    ui.selectable_value(&mut app.save_enc, Encoding::Utf16Be, "UTF-16BE");
+                });
+
+            // CP949는 BOM 개념이 없으므로 체크박스를 비활성 + 강제 해제.
+            let bom_allowed = app.save_enc != Encoding::Cp949;
+            if !bom_allowed {
+                app.save_bom = false;
+            }
+            ui.add_enabled_ui(bom_allowed, |ui| {
+                ui.checkbox(&mut app.save_bom, "BOM 포함");
+            });
+            if !bom_allowed {
+                ui.label("(CP949는 BOM이 없습니다)");
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("저장").clicked() {
+                    do_save = true;
+                }
+                if ui.button("취소").clicked() {
+                    app.show_save_dialog = false;
+                }
+            });
+        });
+    if !open {
+        app.show_save_dialog = false;
+    }
+
+    if !do_save {
+        return;
+    }
+    app.show_save_dialog = false;
+
+    // 대상 경로 결정. save_as면 파일 선택 창, 아니면 현재 경로.
+    // 현재 경로가 비어 있으면(있을 수 없지만 방어) save_as로 폴백한다.
+    let cur_path = app.doc.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+    let target = if app.save_as || cur_path.as_os_str().is_empty() {
+        let mut dlg = rfd::FileDialog::new();
+        if let Some(dir) = cur_path.parent() {
+            dlg = dlg.set_directory(dir);
+        }
+        if let Some(name) = cur_path.file_name().and_then(|n| n.to_str()) {
+            dlg = dlg.set_file_name(name);
+        }
+        match dlg.save_file() {
+            Some(p) => p,
+            // 취소 = 아무 일도 일어나지 않는다(버퍼는 그대로 dirty).
+            None => return,
+        }
+    } else {
+        cur_path
+    };
+
+    let save_as = app.save_as;
+    let opts = crate::save::SaveOptions {
+        enc: app.save_enc,
+        bom: app.save_bom,
+        newline: app
+            .doc
+            .as_ref()
+            .and_then(|d| d.edit.as_ref())
+            .map(|e| e.newline)
+            .unwrap_or(crate::edit::Newline::Lf),
+    };
+    let result = {
+        let Some(e) = app.doc.as_ref().and_then(|d| d.edit.as_ref()) else { return };
+        crate::save::write_file(&target, &e.lines, &opts, None)
+    };
+
+    match result {
+        Ok(()) => {
+            app.error = None;
+            if let Some(doc) = &mut app.doc {
+                if let Some(e) = &mut doc.edit {
+                    e.dirty = false;
+                }
+                if save_as {
+                    doc.path_label = target.display().to_string();
+                    doc.path = target;
+                }
+            }
+        }
+        Err(err) => {
+            // 실패하면 버퍼는 dirty인 채로 둔다(사용자가 다시 시도할 수 있게).
+            app.error = Some(format!("저장 실패: {err}"));
+        }
+    }
+}
+
+/// 저장하지 않은 변경을 버릴 수 있는 동작 전에 띄우는 확인 창.
+fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
+    let mut open = true;
+    let mut proceed = false;
+    let mut cancel = false;
+    egui::Window::new("저장하지 않은 변경")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label("저장하지 않은 변경이 있습니다. 계속하면 변경 내용을 잃습니다.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("계속").clicked() {
+                    proceed = true;
+                }
+                if ui.button("취소").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    // 창 X로 닫으면 취소와 같다(데이터를 잃지 않는 쪽이 기본).
+    if !open || cancel {
+        app.pending_action = None;
+        return;
+    }
+    if !proceed {
+        return;
+    }
+    match app.pending_action.take() {
+        Some(PendingAction::ExitEditMode) => {
+            if let Some(doc) = &mut app.doc {
+                exit_edit_mode(doc);
+            }
+        }
+        Some(PendingAction::OpenFile(p)) => {
+            app.open_path(&p, ctx);
+        }
+        None => {}
     }
 }
 
@@ -549,16 +829,18 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
     let data_start = if doc.has_header { 1 } else { 0 };
 
     // 컬럼 수: 헤더가 있으면 헤더 필드 수, 없으면 첫 데이터 행 필드 수로 근사.
+    // 편집 모드에서도 올바른 내용을 보도록 `parse_logical_line_edit`을 쓴다 —
+    // mmap 전용 `decode_logical_line` 경로는 편집 전 원본을 읽어 값이 낡는다.
     let col_count = {
         let probe = if doc.has_header { 0 } else { data_start };
-        parse_logical_line(doc, probe, delim)
+        parse_logical_line_edit(doc, probe, delim)
             .map(|f| f.len())
             .unwrap_or(1)
             .max(1)
     };
     // 헤더 이름(드롭다운 라벨용).
     let header_fields: Option<Vec<String>> = if doc.has_header {
-        parse_logical_line(doc, 0, delim)
+        parse_logical_line_edit(doc, 0, delim)
     } else {
         None
     };
@@ -721,16 +1003,49 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
 
     if do_sort && !doc.sort_specs.is_empty() {
         doc.show_sort_dialog = false;
-        doc.sort_job = Some(sort::spawn_multi_sort(
-            doc.source.clone(),
-            doc.index.clone(),
-            doc.enc,
-            delim,
-            doc.sort_specs.clone(),
-            data_start,
-            ctx.clone(),
-        ));
+        if doc.edit.is_some() {
+            // 편집 모드: 백그라운드 permutation 대신 lines를 물리적으로 재배치한다.
+            // 인메모리 정렬이라 동기 호출로 충분하다.
+            let specs = doc.sort_specs.clone();
+            apply_edit_sort(doc, &specs, delim, data_start);
+        } else {
+            doc.sort_job = Some(sort::spawn_multi_sort(
+                doc.source.clone(),
+                doc.index.clone(),
+                doc.enc,
+                delim,
+                doc.sort_specs.clone(),
+                data_start,
+                ctx.clone(),
+            ));
+        }
     }
+}
+
+/// 편집 모드 정렬: `sort_lines`로 순서를 구해 `lines`를 실제로 재배치한다.
+///
+/// 뷰 모드의 permutation 정렬과 달리 결과가 버퍼에 그대로 반영되므로
+/// `doc.sort`(SortState)는 **설정하지 않는다** — 유지할 permutation이 없고,
+/// 헤더 화살표/상태바가 있지도 않은 라이브 정렬을 주장하면 안 된다. 정렬 뒤
+/// 행을 삽입해도 재정렬되지 않고 삽입 위치에 그대로 남는다.
+///
+/// 셀 편집/선택 상태는 행이 움직이면 가리키는 대상이 달라지므로 초기화한다.
+fn apply_edit_sort(doc: &mut Document, specs: &[SortSpec], delim: u8, data_start: usize) {
+    let Some(e) = doc.edit.as_mut() else { return };
+    if specs.is_empty() || e.lines.len() <= data_start {
+        return;
+    }
+    let order = sort::sort_lines(&e.lines, specs, delim, data_start);
+    crate::edit::apply_permutation(&mut e.lines, &order, data_start);
+    e.dirty = true;
+    // 정렬로 행이 뒤섞였으니 행을 가리키던 상태는 무효.
+    doc.editing_cell = None;
+    doc.cell_edit_text.clear();
+    doc.cell_sel = None;
+    doc.cell_drag_active = false;
+    // 편집 모드 정렬은 permutation이 남지 않는다(이미 lines에 반영됨).
+    doc.sort = None;
+    doc.sort_job = None;
 }
 
 /// 툴바의 정렬 컨트롤. 컬럼이 선택돼 있고 인덱싱이 완료(Phase::Complete)일 때만
@@ -766,7 +1081,10 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
         return;
     }
 
-    let complete = doc.index.status().phase == Phase::Complete;
+    // 편집 모드는 버퍼가 파일 전체를 이미 담고 있으므로 인덱싱 진행 상태와
+    // 무관하게 정렬할 수 있다.
+    let editing = doc.edit.is_some();
+    let complete = editing || doc.index.status().phase == Phase::Complete;
     let selected = doc.selected_col;
 
     match selected {
@@ -817,7 +1135,8 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
         }
     });
 
-    // 정렬 해제 버튼은 정렬이 적용돼 있을 때만.
+    // 정렬 해제 버튼은 뷰 모드에서 permutation 정렬이 적용돼 있을 때만.
+    // (편집 모드 정렬은 lines에 이미 반영돼 되돌릴 permutation이 없다.)
     if doc.sort.is_some() && ui.button("정렬 해제").clicked() {
         doc.sort = None;
     }
@@ -826,23 +1145,29 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
         ui.label("(인덱싱 완료 후 정렬 가능)");
     }
 
-    // 정렬 버튼이 눌리면 백그라운드 작업을 띄운다.
+    // 정렬 버튼이 눌리면 — 편집 모드면 lines를 즉시 재배치하고,
+    // 뷰 모드면 백그라운드 permutation 작업을 띄운다.
     if let (Some((kind, dir)), Some(col)) = (do_sort, selected) {
         // 단일 문자 정렬은 대소문자 무시를 기본으로(사람 직관). 세밀 제어는
         // 다중 정렬 다이얼로그에서.
         let ci = kind == SortKind::Text;
-        doc.sort_job = Some(sort::spawn_sort(
-            doc.source.clone(),
-            doc.index.clone(),
-            doc.enc,
-            delim,
-            col,
-            data_start,
-            kind,
-            dir,
-            ci,
-            ctx.clone(),
-        ));
+        let spec = SortSpec { col, kind, dir, ci };
+        if editing {
+            apply_edit_sort(doc, &[spec], delim, data_start);
+        } else {
+            doc.sort_job = Some(sort::spawn_sort(
+                doc.source.clone(),
+                doc.index.clone(),
+                doc.enc,
+                delim,
+                col,
+                data_start,
+                kind,
+                dir,
+                ci,
+                ctx.clone(),
+            ));
+        }
     }
 }
 
@@ -2153,7 +2478,7 @@ mod tests {
         };
         let total_lines = doc.index.line_count();
         let header_fields: Option<Vec<String>> = if doc.has_header && total_lines > 0 {
-            parse_logical_line(doc, 0, delim)
+            parse_logical_line_edit(doc, 0, delim)
         } else {
             None
         };
@@ -2161,7 +2486,7 @@ mod tests {
         const COL_COUNT_SAMPLE_ROWS: usize = 10;
         let mut col_count = header_fields.as_ref().map(|h| h.len()).unwrap_or(0);
         for logical in data_start..data_start + COL_COUNT_SAMPLE_ROWS {
-            if let Some(fields) = parse_logical_line(doc, logical, delim) {
+            if let Some(fields) = parse_logical_line_edit(doc, logical, delim) {
                 col_count = col_count.max(fields.len());
             }
         }
@@ -2230,7 +2555,7 @@ mod tests {
     fn custom_separator_splits_fields() {
         // 커스텀 구분자(물결 ~)로 필드 분리가 되는지. detect는 표준 후보만 보므로
         // 이 파일은 None으로 열리지만, 사용자가 sep을 Char(b'~')로 바꾸면
-        // parse_logical_line이 ~로 분리해야 한다.
+        // parse_logical_line_edit이 ~로 분리해야 한다.
         let p = temp_ext(b"a~b~c\nd~e~f\n", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
@@ -2240,7 +2565,7 @@ mod tests {
         doc.sep = SeparatorMode::Char(b'~');
 
         assert_eq!(
-            parse_logical_line(doc, 0, b'~'),
+            parse_logical_line_edit(doc, 0, b'~'),
             Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
         );
         assert_eq!(compute_col_count(doc), 3);
@@ -2257,6 +2582,186 @@ mod tests {
         enter_edit_mode(doc);
         assert!(doc.edit.is_some());
         assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a,b", "1,2"]);
+    }
+
+    #[test]
+    fn open_path_stores_real_path() {
+        // 저장(덮어쓰기)이 표시 문자열을 되파싱하지 않고 쓸 수 있어야 한다.
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.path, p);
+        assert_eq!(doc.path_label, p.display().to_string());
+    }
+
+    #[test]
+    fn edit_dirty_reflects_buffer_state() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        // 파일만 열린 상태(뷰 모드)는 dirty가 아니다.
+        assert!(!app.edit_dirty());
+        {
+            let doc = app.doc.as_mut().unwrap();
+            doc.indexer.take().unwrap().join().unwrap();
+            enter_edit_mode(doc);
+        }
+        assert!(!app.edit_dirty(), "막 진입한 버퍼는 깨끗하다");
+        app.doc.as_mut().unwrap().edit.as_mut().unwrap().dirty = true;
+        assert!(app.edit_dirty());
+    }
+
+    /// 편집 모드 정렬 테스트용 Document를 만든다(인덱싱 완료 + 편집 모드 진입).
+    fn edit_doc(content: &[u8], has_header: bool) -> (App, u8) {
+        let p = temp(content);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc.as_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        doc.has_header = has_header;
+        enter_edit_mode(doc);
+        (app, b',')
+    }
+
+    #[test]
+    fn edit_sort_rearranges_lines_and_keeps_header() {
+        let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\nBob,2\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
+        apply_edit_sort(doc, &[spec], delim, 1);
+        let e = doc.edit.as_ref().unwrap();
+        assert_eq!(e.lines, v(&["name,n", "Alice,1", "Bob,2", "Charlie,3"]));
+        assert!(e.dirty, "정렬은 버퍼를 변경한다");
+    }
+
+    #[test]
+    fn edit_sort_does_not_set_view_sort_state() {
+        // 편집 모드 정렬은 lines에 이미 반영되므로 살아 있는 permutation이 없다.
+        // doc.sort를 세우면 헤더 화살표/상태바가 없는 정렬을 주장하고,
+        // render_table이 permutation으로 행을 한 번 더 매핑해 순서가 깨진다.
+        let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
+        apply_edit_sort(doc, &[spec], delim, 1);
+        assert!(doc.sort.is_none());
+        assert!(doc.sort_job.is_none());
+    }
+
+    #[test]
+    fn edit_sort_clears_row_pointing_state() {
+        // 행이 뒤섞이면 선택/편집 중 셀이 가리키던 행이 달라진다 → 초기화.
+        let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        doc.cell_sel = Some((1, 0, 1, 1));
+        doc.editing_cell = Some((1, 0));
+        doc.cell_edit_text = "x".into();
+        let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
+        apply_edit_sort(doc, &[spec], delim, 1);
+        assert!(doc.cell_sel.is_none());
+        assert!(doc.editing_cell.is_none());
+        assert!(doc.cell_edit_text.is_empty());
+    }
+
+    #[test]
+    fn insert_after_edit_sort_stays_where_inserted() {
+        // 정렬 뒤 행을 삽입하면 재정렬되지 않고 그 자리에 남아야 한다
+        // (permutation이 아니라 물리적 재배치이므로 자연히 그렇다).
+        let (mut app, delim) = edit_doc(b"name,n\nCharlie,3\nAlice,1\nBob,2\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
+        apply_edit_sort(doc, &[spec], delim, 1);
+        // "Bob,2"(index 2) 위에 zzz 행 삽입.
+        let e = doc.edit.as_mut().unwrap();
+        crate::edit::insert_row(&mut e.lines, 2, "zzz,9".into());
+        assert_eq!(
+            e.lines,
+            v(&["name,n", "Alice,1", "zzz,9", "Bob,2", "Charlie,3"]),
+            "삽입 행은 정렬 순서로 밀려나지 않는다"
+        );
+    }
+
+    #[test]
+    fn edit_sort_headerless_sorts_all_rows() {
+        let (mut app, delim) = edit_doc(b"3,c\n1,a\n2,b\n", false);
+        let doc = app.doc.as_mut().unwrap();
+        let spec = SortSpec { col: 0, kind: SortKind::Number, dir: SortDir::Asc, ci: false };
+        apply_edit_sort(doc, &[spec], delim, 0);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["1,a", "2,b", "3,c"]));
+    }
+
+    #[test]
+    fn edit_sort_multi_key() {
+        let (mut app, delim) = edit_doc(b"g,n\nb,2\na,2\nb,1\na,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let specs = vec![
+            SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true },
+            SortSpec { col: 1, kind: SortKind::Number, dir: SortDir::Desc, ci: false },
+        ];
+        apply_edit_sort(doc, &specs, delim, 1);
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines,
+            v(&["g,n", "a,2", "a,1", "b,2", "b,1"])
+        );
+    }
+
+    #[test]
+    fn edit_sort_noop_on_empty_specs_or_data() {
+        // 기준이 없거나 데이터 행이 없으면 아무것도 하지 않는다(dirty도 안 켠다).
+        let (mut app, delim) = edit_doc(b"name,n\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        apply_edit_sort(doc, &[], delim, 1);
+        assert!(!doc.edit.as_ref().unwrap().dirty);
+        let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
+        // 헤더만 있는 파일(데이터 행 0개).
+        apply_edit_sort(doc, &[spec], delim, 1);
+        assert!(!doc.edit.as_ref().unwrap().dirty);
+    }
+
+    #[test]
+    fn sort_dialog_column_labels_use_edit_buffer() {
+        // 브리프의 이월 결함: 다이얼로그가 mmap 전용 경로로 헤더를 읽으면
+        // 편집 모드에서 편집 전 값이 나온다. parse_logical_line_edit 경유여야 한다.
+        let (mut app, delim) = edit_doc(b"old,b\n1,2\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        crate::edit::set_cell(&mut doc.edit.as_mut().unwrap().lines, 0, 0, "new", delim);
+        assert_eq!(
+            parse_logical_line_edit(doc, 0, delim),
+            Some(v(&["new", "b"])),
+            "편집한 헤더 값이 보여야 함"
+        );
+    }
+
+    #[test]
+    fn save_roundtrip_cp949_from_edit_buffer() {
+        // 저장 다이얼로그가 부르는 조합(write_file + SaveOptions)이 편집 버퍼를
+        // CP949로 변환해 쓰고, 다시 열면 같은 내용이 나오는지.
+        let (mut app, _delim) = edit_doc("h,v\n가,1\n".as_bytes(), true);
+        let out = temp_ext(b"", "csv");
+        {
+            let e = app.doc.as_ref().unwrap().edit.as_ref().unwrap();
+            let opts = crate::save::SaveOptions {
+                enc: crate::parse::Encoding::Cp949,
+                bom: false,
+                newline: e.newline,
+            };
+            crate::save::write_file(&out, &e.lines, &opts, None).unwrap();
+        }
+        let bytes = std::fs::read(&out).unwrap();
+        // CP949 '가' = B0 A1
+        assert!(bytes.windows(2).any(|w| w == [0xB0, 0xA1]), "CP949로 인코딩됨");
+        // 다시 열어(CP949로) 같은 줄이 나오는지.
+        let ctx = egui::Context::default();
+        let mut app2 = App::default();
+        app2.open_path(&out, &ctx);
+        let doc2 = app2.doc.as_mut().unwrap();
+        doc2.indexer.take().unwrap().join().unwrap();
+        doc2.enc = crate::parse::Encoding::Cp949;
+        enter_edit_mode(doc2);
+        assert_eq!(doc2.edit.as_ref().unwrap().lines, v(&["h,v", "가,1"]));
     }
 
     #[test]
