@@ -2639,6 +2639,229 @@ git commit -m "fix: 컬럼 연산 성능(field_slice로 할당 제거) + Shift+�
 
 ---
 
+### Task 17: UI 정돈 — 폰트·테마·표 디자인
+
+> 사용자 보고: "ui가 너무 어색해서", "그냥 좀 아마추어 프로그램 된 것 같아",
+> "특히 폰트". 확정: 데이터 영역 고정폭 = **Cascadia Mono**, 테마 = **밝은 테마**.
+
+**Files:**
+- Modify: `src/main.rs`(폰트 설치), `src/app.rs`(테마·표 렌더)
+- Create: `src/theme.rs` (폰트/스타일 설정을 한 곳에)
+
+#### 진단 (현재 무엇이 잘못됐나)
+
+`src/main.rs`의 `install_korean_font`가 **맑은 고딕을 Proportional과 Monospace
+양쪽 맨 앞에** 넣는다. 그 결과:
+- 데이터 표와 텍스트 모드가 **가변폭**으로 그려진다 → 숫자 자릿수가 세로로 안 맞고,
+  메모장/EMEditor 같은 "데이터 도구" 인상이 전혀 안 난다. **이것이 어색함의 주원인.**
+- 맑은 고딕은 힌팅이 약해 작은 크기에서 흐릿하다.
+- UI 텍스트까지 15px 맑은 고딕이라 Windows 표준(Segoe UI 9pt)과 이질적이다.
+
+시스템에 설치 확인됨: `CascadiaMono.ttf`, `CascadiaCode.ttf`, `consola.ttf`,
+`malgun.ttf`, `gulim.ttc`.
+
+- [ ] **Step 1: src/theme.rs 신설 — 폰트 폴백 체인**
+
+`main.rs`의 `install_korean_font`를 대체한다. 핵심은 **역할별로 다른 폰트, 그리고
+한글은 폴백으로**:
+
+- `FontFamily::Monospace` = **Cascadia Mono → Consolas → 맑은 고딕(한글 폴백)**
+  순서. 영문·숫자는 Cascadia가, 한글은 맑은 고딕이 그린다.
+- `FontFamily::Proportional` = **Segoe UI → 맑은 고딕(한글 폴백)**.
+
+```rust
+use egui::{FontData, FontDefinitions, FontFamily};
+
+/// 폰트 후보를 순서대로 시도해 처음 읽히는 것을 등록하고 그 키를 돌려준다.
+/// 못 읽으면 None(해당 폰트는 건너뛴다 — 크래시 없음).
+fn load_font(fonts: &mut FontDefinitions, key: &str, paths: &[&str]) -> Option<String> {
+    let bytes = paths.iter().find_map(|p| std::fs::read(p).ok())?;
+    fonts
+        .font_data
+        .insert(key.to_owned(), FontData::from_owned(bytes));
+    Some(key.to_owned())
+}
+
+/// 데이터 영역은 고정폭(Cascadia Mono), UI는 Segoe UI, 한글은 맑은 고딕 폴백.
+/// 폰트 파일이 없으면 그 단계만 건너뛰고 egui 기본 폰트를 쓴다.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+
+    let mono = load_font(
+        &mut fonts,
+        "mono",
+        &[
+            r"C:\Windows\Fonts\CascadiaMono.ttf",
+            r"C:\Windows\Fonts\consola.ttf",
+        ],
+    );
+    let ui = load_font(
+        &mut fonts,
+        "ui",
+        &[
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\tahoma.ttf",
+        ],
+    );
+    // 한글 폴백(영문 폰트에 한글 글리프가 없으므로 뒤에 붙인다).
+    let kr = load_font(
+        &mut fonts,
+        "kr",
+        &[
+            r"C:\Windows\Fonts\malgun.ttf",
+            r"C:\Windows\Fonts\gulim.ttc",
+        ],
+    );
+
+    // Monospace: 고정폭 먼저, 한글은 뒤에서 폴백.
+    let m = fonts.families.entry(FontFamily::Monospace).or_default();
+    m.clear();
+    if let Some(k) = &mono { m.push(k.clone()); }
+    if let Some(k) = &kr { m.push(k.clone()); }
+    m.push("Hack".to_owned()); // egui 기본 monospace(최후 폴백)
+
+    // Proportional: UI 폰트 먼저, 한글 폴백.
+    let p = fonts.families.entry(FontFamily::Proportional).or_default();
+    p.clear();
+    if let Some(k) = &ui { p.push(k.clone()); }
+    if let Some(k) = &kr { p.push(k.clone()); }
+    p.push("Ubuntu-Light".to_owned()); // egui 기본 proportional(최후 폴백)
+
+    ctx.set_fonts(fonts);
+}
+```
+
+주의: egui 0.28의 기본 내장 폰트 키 이름(`"Hack"`, `"Ubuntu-Light"`)이 맞는지
+`FontDefinitions::default()`의 내용을 확인하고, 다르면 실제 키로 맞춘다. 최후 폴백이
+잘못된 키면 조용히 무시되므로 치명적이진 않지만 정확히 하는 게 좋다.
+
+- [ ] **Step 2: 텍스트 스타일 — 역할별 크기**
+
+Windows 표준에 맞춘다. 데이터는 고정폭, UI는 가변폭.
+
+```rust
+pub fn install_text_styles(ctx: &egui::Context) {
+    use egui::{FontId, TextStyle};
+    ctx.style_mut(|s| {
+        s.text_styles.insert(TextStyle::Body,     FontId::new(13.0, FontFamily::Monospace));
+        s.text_styles.insert(TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace));
+        s.text_styles.insert(TextStyle::Button,   FontId::new(13.0, FontFamily::Proportional));
+        s.text_styles.insert(TextStyle::Heading,  FontId::new(15.0, FontFamily::Proportional));
+        s.text_styles.insert(TextStyle::Small,    FontId::new(11.0, FontFamily::Proportional));
+    });
+}
+```
+
+`Body`를 Monospace로 두는 이유: 표 셀과 텍스트 모드 줄이 `Label`(=Body)로 그려지므로
+이게 데이터 폰트를 결정한다. 버튼/메뉴는 `Button` 스타일이라 가변폭으로 남는다.
+**구현 시 실제 렌더 코드가 어떤 TextStyle을 쓰는지 확인하고 맞출 것** — 표 셀이
+Body가 아닌 다른 스타일을 탄다면 그 스타일을 Monospace로 지정해야 한다.
+
+- [ ] **Step 3: 밝은 테마 — Windows 앱풍 Visuals**
+
+egui 기본은 둥근 모서리 + 어두운 회색이라 "게임 툴" 느낌이 난다. 각지고 밝게 바꾼다.
+
+```rust
+pub fn install_visuals(ctx: &egui::Context) {
+    let mut v = egui::Visuals::light();
+    // 모서리를 거의 각지게(Windows 앱은 둥글지 않다).
+    let r = egui::Rounding::same(2.0);
+    v.widgets.noninteractive.rounding = r;
+    v.widgets.inactive.rounding = r;
+    v.widgets.hovered.rounding = r;
+    v.widgets.active.rounding = r;
+    v.window_rounding = egui::Rounding::same(4.0);
+    // 선택 강조는 Windows 파랑 계열로 통일.
+    v.selection.bg_fill = egui::Color32::from_rgb(0, 120, 215);
+    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    // 패널 배경은 순백보다 아주 살짝 회색이 눈이 편하다.
+    v.panel_fill = egui::Color32::from_gray(246);
+    ctx.set_visuals(v);
+
+    ctx.style_mut(|s| {
+        // 간격을 Windows 앱 수준으로 정돈(기본은 다소 헐렁하다).
+        s.spacing.item_spacing = egui::vec2(6.0, 4.0);
+        s.spacing.button_padding = egui::vec2(8.0, 3.0);
+        s.spacing.menu_margin = egui::Margin::same(4.0);
+    });
+}
+```
+
+- [ ] **Step 4: 표 디자인 — 격자선·헤더 구분**
+
+현재 표는 줄무늬(striped)만 있고 셀 경계선이 없어 엑셀/EMEditor와 인상이 다르다.
+`render_table`에서:
+- 셀마다 오른쪽·아래 **얇은 격자선**을 painter로 긋는다(연한 회색, 예:
+  `Color32::from_gray(220)`).
+- **헤더 행**은 배경을 약간 진하게(`from_gray(238)`) + 하단에 진한 경계선.
+- 라인번호 컬럼도 배경을 살짝 구분해 데이터와 분리한다.
+- 행 높이(`ROW_HEIGHT`)와 셀 좌우 여백을 폰트 크기에 맞게 재조정한다(고정폭 13px
+  기준으로 현재 22.0이 적절한지 확인, 필요하면 조정).
+
+격자선은 **보이는 행에만** 그려지므로(가상 스크롤) 대용량에서도 비용이 없다.
+
+- [ ] **Step 5: 모든 UI 문자열을 영어로**
+
+사용자 요청: "메뉴는 모두 영어로 해." 상용 에디터(EMEditor/VS Code/Notepad++)가
+영어 UI인 것과 맞춘다. **UI에 보이는 모든 한글 문자열을 영어로 바꾼다** — 메뉴뿐
+아니라 툴바 라벨, 다이얼로그 제목/버튼, 상태바 메시지, 컨텍스트 메뉴, 에러 메시지까지.
+
+주요 대응(일관성을 위해 Windows/VS Code 관례를 따른다):
+
+| 한글 | 영어 |
+|---|---|
+| 파일 / 도구 / 편집 | File / Tools / Edit |
+| 열기… / 저장 / 다른 이름으로 저장… | Open… / Save / Save As… |
+| 편집 모드 | Edit Mode |
+| 실행 취소 | Undo |
+| 다중 정렬… / 행·열 번호… | Sort by Columns… / Row & Column Numbers… |
+| 구분자 / 인코딩 / 헤더 | Delimiter / Encoding / Header |
+| 구분 안 함(텍스트) | None (plain text) |
+| 콤마 / 탭 / 파이프 / 세미콜론 / 직접 | Comma / Tab / Pipe / Semicolon / Custom |
+| 문자↑ 문자↓ 숫자↑ 숫자↓ | Text ↑ / Text ↓ / Number ↑ / Number ↓ |
+| 정렬 해제 / 정렬 중 | Clear Sort / Sorting… |
+| 복사 / 잘라내기 / 붙여넣기 | Copy / Cut / Paste |
+| 셀 내용 지우기 | Clear Contents |
+| 위에 행 삽입 / 아래에 행 삽입 / 행 삭제 | Insert Row Above / Insert Row Below / Delete Rows |
+| 전체 선택 | Select All |
+| 오름차순 / 내림차순 | Ascending / Descending |
+| 대소문자 무시 | Ignore case |
+| 기준 추가 / 순위 | Add criterion / Priority |
+| 저장 / 취소 / 닫기 / 계속 | Save / Cancel / Close / Continue |
+| BOM 포함 | Include BOM |
+| 인덱싱 중… / 완료 — N 행 | Indexing… / Ready — N rows |
+| 중단 / 이어서 읽기 | Stop / Resume |
+| 편집 중 / ● 변경됨 | Editing / ● Modified |
+| 파일을 여세요 | No file open |
+| 파일 열기 실패 | Failed to open file |
+| 저장하지 않은 변경이 있습니다 | You have unsaved changes |
+
+코드 주석은 한글 그대로 둔다(프로젝트 관례). **바뀌는 것은 사용자에게 보이는
+문자열뿐이다.** 문자열을 바꿔도 로직은 그대로여야 하며, 기존 테스트가 UI 문자열을
+검사하고 있다면 함께 갱신한다.
+
+- [ ] **Step 6: main.rs 정리**
+
+`install_korean_font`를 제거하고 `theme::install_fonts` / `install_text_styles` /
+`install_visuals` 호출로 대체한다. `mod theme;` 추가.
+
+창 제목도 정리: `"textViewer"` → 열린 파일이 있으면 `"<파일명> — textViewer"`
+형태로(상용 에디터 관례). eframe의 `ViewportCommand::Title`로 갱신한다.
+
+- [ ] **Step 7: 빌드 + 전체 테스트**
+
+Run: `cargo test && cargo build --release`
+Expected: 전체 PASS(테마/문자열 변경은 로직에 영향 없음), 경고 baseline 유지.
+
+- [ ] **Step 8: 커밋**
+
+```bash
+git add src/theme.rs src/main.rs src/app.rs
+git commit -m "feat: UI 정돈 - 고정폭 폰트·밝은 테마·표 격자선·영어 UI"
+```
+
+---
+
 ### Task 11: .readme 정리 + 최종 검증
 
 **Files:**
