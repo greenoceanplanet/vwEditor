@@ -1,10 +1,20 @@
 use crate::index::LineIndex;
 use crate::indexer;
 use crate::parse::{self, Encoding, SeparatorMode};
+use crate::sort::{self, SortDir, SortKind};
 use crate::source::{self, Source};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+
+/// 현재 적용된 정렬 상태. permutation[i] = 정렬 순서 i번째로 보여줄 원본 데이터
+/// 행의 논리 행번호. col/kind/dir은 헤더 화살표/버튼 상태 표시에 쓴다.
+pub struct SortState {
+    pub permutation: Vec<u32>,
+    pub col: usize,
+    pub kind: SortKind,
+    pub dir: SortDir,
+}
 
 pub struct Document {
     pub source: Arc<Source>,
@@ -16,6 +26,12 @@ pub struct Document {
     pub path_label: String,
     /// 툴바 "직접 입력" 커스텀 구분자 텍스트박스의 현재 값(한 글자).
     pub custom_sep_input: String,
+    /// 헤더 클릭으로 선택된 컬럼(표 모드에서만). 정렬 대상.
+    pub selected_col: Option<usize>,
+    /// 현재 적용된 정렬. None이면 원본 순서.
+    pub sort: Option<SortState>,
+    /// 진행 중인 백그라운드 정렬 작업. 완료되면 sort로 옮기고 None이 된다.
+    pub sort_job: Option<sort::SortJob>,
 }
 
 #[derive(Default)]
@@ -82,6 +98,9 @@ impl App {
             indexer: Some(handle),
             path_label: path.display().to_string(),
             custom_sep_input,
+            selected_col: None,
+            sort: None,
+            sort_job: None,
         });
     }
 }
@@ -149,6 +168,7 @@ impl eframe::App for App {
                         }
                         SeparatorMode::Char(b) => format!("직접: 0x{b:02X}"),
                     };
+                    let sep_before = doc.sep;
                     egui::ComboBox::from_label("구분자")
                         .selected_text(sep_label)
                         .show_ui(ui, |ui| {
@@ -175,7 +195,14 @@ impl eframe::App for App {
                             doc.sep = SeparatorMode::None;
                         }
                     }
+                    // 구분자가 바뀌면 컬럼 경계가 달라지므로 선택/정렬을 무효화한다.
+                    if doc.sep != sep_before {
+                        doc.sort = None;
+                        doc.sort_job = None;
+                        doc.selected_col = None;
+                    }
                     // 인코딩 드롭다운
+                    let enc_before = doc.enc;
                     let enc_label = format!("{:?}", doc.enc);
                     egui::ComboBox::from_label("인코딩")
                         .selected_text(enc_label)
@@ -185,10 +212,28 @@ impl eframe::App for App {
                             ui.selectable_value(&mut doc.enc, crate::parse::Encoding::Utf16Le, "UTF-16LE");
                             ui.selectable_value(&mut doc.enc, crate::parse::Encoding::Utf16Be, "UTF-16BE");
                         });
+                    // 인코딩/구분자가 바뀌면 파싱 기준이 달라지므로 정렬을 무효화한다.
+                    if doc.enc != enc_before {
+                        doc.sort = None;
+                        doc.sort_job = None;
+                    }
                     // 헤더 체크박스는 표 모드에서만 의미가 있다.
                     if matches!(doc.sep, SeparatorMode::Char(_)) {
+                        let hdr_before = doc.has_header;
                         ui.checkbox(&mut doc.has_header, "헤더");
+                        // 헤더 유무가 바뀌면 data_start가 달라져 permutation이 어긋나므로 무효화.
+                        if doc.has_header != hdr_before {
+                            doc.sort = None;
+                            doc.sort_job = None;
+                        }
                     }
+
+                    // 정렬 컨트롤: 표 모드 + 컬럼 선택 + 인덱싱 완료일 때만 활성.
+                    if matches!(doc.sep, SeparatorMode::Char(_)) {
+                        ui.separator();
+                        render_sort_controls(ui, doc, ctx);
+                    }
+
                     ui.separator();
                     ui.label(&doc.path_label);
                 }
@@ -227,6 +272,9 @@ impl eframe::App for App {
                                 // 재개 = 처음부터 다시 병렬 스캔. spawn_indexer가
                                 // 프라이밍→병렬을 새로 수행하며 인덱스를 덮어쓴다.
                                 // 기존 핸들은 이미 종료됨.
+                                // 재스캔으로 행 구성이 바뀔 수 있으므로 정렬 무효화.
+                                doc.sort = None;
+                                doc.sort_job = None;
                                 let handle = crate::indexer::spawn_indexer(
                                     doc.source.clone(),
                                     doc.index.clone(),
@@ -238,6 +286,19 @@ impl eframe::App for App {
                         }
                         Phase::Complete => {
                             ui.label(format!("완료 — {} 행", doc.index.line_count()));
+                            // 정렬이 적용돼 있으면 어떤 기준인지 표시.
+                            if let Some(s) = &doc.sort {
+                                let kind = match s.kind {
+                                    SortKind::Text => "문자",
+                                    SortKind::Number => "숫자",
+                                };
+                                let dir = match s.dir {
+                                    SortDir::Asc => "오름차순",
+                                    SortDir::Desc => "내림차순",
+                                };
+                                ui.separator();
+                                ui.label(format!("{}번 컬럼 {kind} {dir} 정렬됨", s.col + 1));
+                            }
                         }
                     }
                 } else {
@@ -248,17 +309,109 @@ impl eframe::App for App {
 
         // 본문: 구분 모드에 따라 표 뷰 / 텍스트 뷰로 분기.
         egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(doc) = &self.doc else { return };
+            let Some(doc) = &mut self.doc else { return };
             match doc.sep {
                 SeparatorMode::Char(delim) => render_table(ui, doc, delim),
-                SeparatorMode::None => render_text(ui, doc),
+                SeparatorMode::None => render_text(ui, &*doc),
             }
         });
     }
 }
 
+/// 툴바의 정렬 컨트롤. 컬럼이 선택돼 있고 인덱싱이 완료(Phase::Complete)일 때만
+/// 정렬 버튼이 활성화된다. 정렬은 백그라운드 스레드에서 수행되며, 진행 중에는
+/// progress bar가 표시되고 완료되면 permutation을 doc.sort로 옮긴다.
+fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Context) {
+    use crate::index::Phase;
+
+    // 진행 중인 정렬 작업이 끝났는지 먼저 폴링해 결과를 수거.
+    if let Some(job) = &mut doc.sort_job {
+        if let Some(perm) = job.take_result() {
+            doc.sort = Some(SortState {
+                permutation: perm,
+                col: job.col,
+                kind: job.kind,
+                dir: job.dir,
+            });
+            doc.sort_job = None;
+        }
+    }
+
+    // 정렬 진행 중이면 progress bar만 표시하고 버튼은 숨긴다.
+    if let Some(job) = &doc.sort_job {
+        let p = job.progress();
+        ui.label("정렬 중");
+        ui.add(
+            egui::ProgressBar::new(p)
+                .desired_width(160.0)
+                .text(format!("{:.0}%", p * 100.0)),
+        );
+        return;
+    }
+
+    let complete = doc.index.status().phase == Phase::Complete;
+    let selected = doc.selected_col;
+
+    match selected {
+        Some(col) => ui.label(format!("정렬: {}번 컬럼", col + 1)),
+        None => ui.label("정렬: (헤더 클릭해 컬럼 선택)"),
+    };
+
+    let delim = match doc.sep {
+        SeparatorMode::Char(d) => d,
+        SeparatorMode::None => return,
+    };
+    let data_start = if doc.has_header { 1 } else { 0 };
+
+    // 컬럼 미선택 또는 인덱싱 미완료면 버튼 비활성.
+    let can_sort = selected.is_some() && complete;
+
+    let mut do_sort: Option<(SortKind, SortDir)> = None;
+    ui.add_enabled_ui(can_sort, |ui| {
+        if ui.button("문자↑").clicked() {
+            do_sort = Some((SortKind::Text, SortDir::Asc));
+        }
+        if ui.button("문자↓").clicked() {
+            do_sort = Some((SortKind::Text, SortDir::Desc));
+        }
+        if ui.button("숫자↑").clicked() {
+            do_sort = Some((SortKind::Number, SortDir::Asc));
+        }
+        if ui.button("숫자↓").clicked() {
+            do_sort = Some((SortKind::Number, SortDir::Desc));
+        }
+    });
+
+    // 정렬 해제 버튼은 정렬이 적용돼 있을 때만.
+    if doc.sort.is_some() && ui.button("정렬 해제").clicked() {
+        doc.sort = None;
+    }
+
+    if !complete && selected.is_some() {
+        ui.label("(인덱싱 완료 후 정렬 가능)");
+    }
+
+    // 정렬 버튼이 눌리면 백그라운드 작업을 띄운다.
+    if let (Some((kind, dir)), Some(col)) = (do_sort, selected) {
+        doc.sort_job = Some(sort::spawn_sort(
+            doc.source.clone(),
+            doc.index.clone(),
+            doc.enc,
+            delim,
+            col,
+            data_start,
+            kind,
+            dir,
+            ctx.clone(),
+        ));
+    }
+}
+
 /// 표 모드 렌더: 라인번호 + 구분자로 분리한 필드 컬럼들.
-fn render_table(ui: &mut egui::Ui, doc: &Document, delim: u8) {
+/// 헤더 클릭으로 컬럼을 선택하고, 정렬이 적용돼 있으면 permutation 순서로 렌더.
+fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8) {
+    use std::cell::Cell;
+
     // 헤더 행 데이터(있으면 첫 줄)와 데이터 시작 행 결정
     let total_lines = doc.index.line_count();
     let header_fields: Option<Vec<String>> = if doc.has_header && total_lines > 0 {
@@ -269,6 +422,16 @@ fn render_table(ui: &mut egui::Ui, doc: &Document, delim: u8) {
 
     let data_start = if doc.has_header { 1 } else { 0 };
     let data_rows = total_lines.saturating_sub(data_start);
+
+    // 클로저에서 doc를 불변으로만 빌리기 위해, 렌더에 필요한 상태를 미리 뽑는다.
+    let selected_col = doc.selected_col;
+    // 정렬된 컬럼과 방향(헤더 화살표 표시용).
+    let sorted_col_dir: Option<(usize, SortDir)> =
+        doc.sort.as_ref().map(|s| (s.col, s.dir));
+    // permutation은 참조로만 사용(클론 방지). 정렬 시 행 순서 매핑에 씀.
+    let permutation: Option<&[u32]> = doc.sort.as_ref().map(|s| s.permutation.as_slice());
+    // 헤더 클릭으로 새로 선택된 컬럼을 클로저 밖으로 전달하는 통로.
+    let clicked_col: Cell<Option<usize>> = Cell::new(None);
 
     // col_count는 헤더 필드 수와, 앞부분 데이터 행 몇 개를 샘플링한 필드 수의
     // 최댓값으로 정한다. 헤더가 없는 파일(header_fields == None)에서 1로
@@ -306,27 +469,71 @@ fn render_table(ui: &mut egui::Ui, doc: &Document, delim: u8) {
             });
             for c in 0..col_count {
                 header.col(|ui| {
-                    let text = if let Some(h) = &header_fields {
+                    let selected = selected_col == Some(c);
+                    // 셀 전체 영역을 클릭 대상으로 만든다(글자뿐 아니라 헤더 칸
+                    // 어디를 눌러도 선택되도록). 먼저 셀의 남은 사각형 전체에
+                    // 클릭 sense 응답을 만든다.
+                    let cell_rect = ui.max_rect();
+                    let resp = ui.interact(
+                        cell_rect,
+                        ui.id().with(("hdr", c)),
+                        egui::Sense::click(),
+                    );
+                    // 선택된 컬럼은 헤더 칸 전체에 밝은 파란 음영.
+                    if selected {
+                        ui.painter().rect_filled(
+                            cell_rect,
+                            0.0,
+                            egui::Color32::from_rgb(60, 110, 180),
+                        );
+                    }
+                    // 헤더 텍스트: "번호 이름" + 정렬 화살표.
+                    let base = if let Some(h) = &header_fields {
                         format!("{} {}", c + 1, h.get(c).cloned().unwrap_or_default())
                     } else {
                         format!("{}", c + 1)
                     };
-                    ui.add(egui::Label::new(egui::RichText::new(text).strong()).truncate());
+                    let arrow = match sorted_col_dir {
+                        Some((sc, SortDir::Asc)) if sc == c => " ↑",
+                        Some((sc, SortDir::Desc)) if sc == c => " ↓",
+                        _ => "",
+                    };
+                    let rich = egui::RichText::new(format!("{base}{arrow}")).strong();
+                    ui.add(egui::Label::new(rich).truncate());
+                    if resp.clicked() {
+                        clicked_col.set(Some(c));
+                    }
                 });
             }
         })
         .body(|body| {
             body.rows(ROW_HEIGHT, data_rows, |mut row| {
-                let logical = row.index() + data_start;
-                let line_no = row.index() + 1;
-                // 라인번호 컬럼 — 한 줄 고정(긴 값으로 인한 wrap 방지)
+                let view_row = row.index();
+                let line_no = view_row + 1;
+                // 정렬이 적용돼 있으면 permutation으로 원본 논리 행번호를 얻는다.
+                // 없으면 원본 순서(data_start + view_row).
+                let logical = match permutation {
+                    Some(perm) => perm.get(view_row).map(|&r| r as usize),
+                    None => Some(data_start + view_row),
+                };
+                // 라인번호 컬럼 — 화면 순번(정렬 후 1..N). 원본 행번호가 아니라
+                // 보이는 순서를 매겨 스크롤 위치 감각을 유지한다.
                 row.col(|ui| {
                     ui.add(egui::Label::new(format!("{line_no}")).truncate());
                 });
-                // 데이터 컬럼들 — 이 행만 offset으로 조회·디코딩·파싱
-                let fields = parse_logical_line(doc, logical, delim).unwrap_or_default();
+                let fields = logical
+                    .and_then(|l| parse_logical_line(doc, l, delim))
+                    .unwrap_or_default();
                 for c in 0..col_count {
                     row.col(|ui| {
+                        // 선택된 컬럼은 셀 배경에 밝은 파란 음영(줄무늬 위에 반투명).
+                        if selected_col == Some(c) {
+                            ui.painter().rect_filled(
+                                ui.max_rect(),
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(80, 150, 230, 70),
+                            );
+                        }
                         ui.add(
                             egui::Label::new(fields.get(c).cloned().unwrap_or_default())
                                 .truncate(),
@@ -335,6 +542,15 @@ fn render_table(ui: &mut egui::Ui, doc: &Document, delim: u8) {
                 }
             });
         });
+
+    // 클로저 종료 후 헤더 클릭 결과를 반영(같은 컬럼 재클릭이면 선택 해제 토글).
+    if let Some(c) = clicked_col.get() {
+        doc.selected_col = if doc.selected_col == Some(c) {
+            None
+        } else {
+            Some(c)
+        };
+    }
 }
 
 /// 텍스트 모드 렌더: 라인번호 + 줄 전체(구분 안 함). 긴 줄은 truncate하고

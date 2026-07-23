@@ -170,6 +170,46 @@ pub fn split_fields(line: &str, delim: u8) -> Vec<String> {
     fields
 }
 
+/// 한 줄의 raw 바이트에서 `col`번째 필드의 byte 범위 `[start, end)`를 찾아 그
+/// 슬라이스를 반환한다. **String/Vec 할당이 전혀 없다** — 정렬 키 추출처럼
+/// 수억 행을 도는 hot path 전용. 해당 컬럼이 없으면 None.
+///
+/// 규칙(split_fields와 동일 정신, 단일바이트 구분자 전용):
+/// - `delim`(콤마/탭/파이프/세미콜론/커스텀 한 글자)로 필드를 나눈다.
+/// - 큰따옴표(`"`)로 감싼 필드 안의 구분자는 무시한다(따옴표는 결과 슬라이스에
+///   그대로 포함 — 정렬 비교에는 무해하고, 할당 없이 슬라이스를 돌려주기 위함).
+/// - 개행 문자는 호출측이 미리 제거(trim)했다고 가정한다.
+///
+/// 주의: 이 함수는 **바이트 단위**로 동작하므로 구분자가 단일 ASCII 바이트인
+/// 인코딩(UTF-8/CP949)에서 정확하다. UTF-16은 구분자가 2바이트라 호출측이
+/// 별도 경로(String 기반)로 처리해야 한다.
+pub fn field_slice(line: &[u8], delim: u8, col: usize) -> Option<&[u8]> {
+    let mut idx = 0usize; // 현재 몇 번째 필드인지
+    let mut field_start = 0usize;
+    let mut in_quotes = false;
+    let mut i = 0usize;
+    while i < line.len() {
+        let b = line[i];
+        if b == b'"' {
+            // 따옴표 토글. (RFC 4180의 "" 이스케이프는 정렬 비교에 영향이
+            // 미미하므로 단순 토글로 둔다.)
+            in_quotes = !in_quotes;
+        } else if b == delim && !in_quotes {
+            if idx == col {
+                return Some(&line[field_start..i]);
+            }
+            idx += 1;
+            field_start = i + 1;
+        }
+        i += 1;
+    }
+    // 마지막 필드(구분자 뒤 끝까지).
+    if idx == col {
+        return Some(&line[field_start..]);
+    }
+    None
+}
+
 /// 첫 줄이 헤더인지 추정.
 /// - 첫 줄 전부 비수치 && 아래 줄들에 수치 필드 존재 → 헤더
 /// - 애매하면(첫 줄과 아래 타입이 유사) → 안전하게 true(헤더 ON)
@@ -320,6 +360,37 @@ mod tests {
     #[test]
     fn split_basic_fields() {
         assert_eq!(split_fields("a,b,c", b','), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn field_slice_basic() {
+        assert_eq!(field_slice(b"a,b,c", b',', 0), Some(&b"a"[..]));
+        assert_eq!(field_slice(b"a,b,c", b',', 1), Some(&b"b"[..]));
+        assert_eq!(field_slice(b"a,b,c", b',', 2), Some(&b"c"[..]));
+        assert_eq!(field_slice(b"a,b,c", b',', 3), None);
+    }
+
+    #[test]
+    fn field_slice_empty_fields() {
+        assert_eq!(field_slice(b"a,,c", b',', 1), Some(&b""[..]));
+        assert_eq!(field_slice(b",x", b',', 0), Some(&b""[..]));
+    }
+
+    #[test]
+    fn field_slice_quoted_delimiter_ignored() {
+        // "a,b" 안의 콤마는 무시되어 한 필드. col 0 = 따옴표 포함 슬라이스, col 1 = c
+        assert_eq!(field_slice(b"\"a,b\",c", b',', 0), Some(&b"\"a,b\""[..]));
+        assert_eq!(field_slice(b"\"a,b\",c", b',', 1), Some(&b"c"[..]));
+    }
+
+    #[test]
+    fn field_slice_tab_delim() {
+        assert_eq!(field_slice(b"x\ty\tz", b'\t', 2), Some(&b"z"[..]));
+    }
+
+    #[test]
+    fn field_slice_last_field_to_end() {
+        assert_eq!(field_slice(b"a,bcd", b',', 1), Some(&b"bcd"[..]));
     }
 
     #[test]
