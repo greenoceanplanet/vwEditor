@@ -174,10 +174,18 @@ pub fn split_fields(line: &str, delim: u8) -> Vec<String> {
 /// 슬라이스를 반환한다. **String/Vec 할당이 전혀 없다** — 정렬 키 추출처럼
 /// 수억 행을 도는 hot path 전용. 해당 컬럼이 없으면 None.
 ///
-/// 규칙(split_fields와 동일 정신, 단일바이트 구분자 전용):
+/// 규칙(**필드 경계는 `split_fields`(csv_core)와 정확히 일치**, 단일바이트
+/// 구분자 전용):
 /// - `delim`(콤마/탭/파이프/세미콜론/커스텀 한 글자)로 필드를 나눈다.
-/// - 큰따옴표(`"`)로 감싼 필드 안의 구분자는 무시한다(따옴표는 결과 슬라이스에
-///   그대로 포함 — 정렬 비교에는 무해하고, 할당 없이 슬라이스를 돌려주기 위함).
+/// - 큰따옴표(`"`)는 **필드의 첫 바이트일 때만** 인용을 연다. 인용 안의
+///   구분자는 무시하고, 인용 안의 `""`는 이스케이프된 따옴표라 인용을 닫지
+///   않는다. 홀로 있는 `"`가 인용을 닫으며, 그 뒤부터는 다시 구분자가 살아난다
+///   (csv_core: `"a"b,c` → `["ab", "c"]`).
+/// - 필드 중간에 나온 `"`는 **리터럴 문자**일 뿐이라 구분자를 가리지 않는다
+///   (csv_core: `a",b` → `["a\"", "b"]`). 예전 구현은 모든 `"`를 토글해
+///   이 경우 필드를 하나로 붙여 버렸다 — 정렬 키가 어긋나던 원인이다.
+/// - 따옴표는 결과 슬라이스에 **그대로 포함**된다(할당 없이 슬라이스를
+///   돌려주기 위함). 값이 필요하면 호출측이 인용을 벗긴다.
 /// - 개행 문자는 호출측이 미리 제거(trim)했다고 가정한다.
 ///
 /// 주의: 이 함수는 **바이트 단위**로 동작하므로 구분자가 단일 ASCII 바이트인
@@ -186,20 +194,31 @@ pub fn split_fields(line: &str, delim: u8) -> Vec<String> {
 pub fn field_slice(line: &[u8], delim: u8, col: usize) -> Option<&[u8]> {
     let mut idx = 0usize; // 현재 몇 번째 필드인지
     let mut field_start = 0usize;
-    let mut in_quotes = false;
-    let mut i = 0usize;
+    // 인용은 "필드의 첫 바이트가 `\"`"일 때만 열린다. 필드 중간의 `"`는 리터럴.
+    let mut in_quotes = !line.is_empty() && line[0] == b'"';
+    let mut i = if in_quotes { 1 } else { 0 };
     while i < line.len() {
         let b = line[i];
-        if b == b'"' {
-            // 따옴표 토글. (RFC 4180의 "" 이스케이프는 정렬 비교에 영향이
-            // 미미하므로 단순 토글로 둔다.)
-            in_quotes = !in_quotes;
-        } else if b == delim && !in_quotes {
+        if in_quotes {
+            if b == b'"' {
+                if line.get(i + 1) == Some(&b'"') {
+                    i += 2; // "" 는 이스케이프 — 인용 유지
+                    continue;
+                }
+                in_quotes = false; // 닫는 따옴표
+            }
+        } else if b == delim {
             if idx == col {
                 return Some(&line[field_start..i]);
             }
             idx += 1;
             field_start = i + 1;
+            // 다음 필드가 `"`로 시작하면 거기서 인용이 열린다.
+            if line.get(field_start) == Some(&b'"') {
+                in_quotes = true;
+                i = field_start + 1;
+                continue;
+            }
         }
         i += 1;
     }
@@ -419,6 +438,59 @@ mod tests {
     #[test]
     fn field_slice_last_field_to_end() {
         assert_eq!(field_slice(b"a,bcd", b',', 1), Some(&b"bcd"[..]));
+    }
+
+    #[test]
+    fn field_slice_quote_mid_field_is_literal() {
+        // 필드 중간의 `"`는 리터럴 — 구분자를 가리면 안 된다.
+        // csv_core: `a",b` → ["a\"", "b"]
+        assert_eq!(field_slice(b"a\",b", b',', 0), Some(&b"a\""[..]));
+        assert_eq!(field_slice(b"a\",b", b',', 1), Some(&b"b"[..]));
+    }
+
+    #[test]
+    fn field_slice_delimiter_alive_after_closing_quote() {
+        // 인용을 닫은 뒤에는 구분자가 다시 살아난다. csv_core: `"a"b,c` → ["ab","c"]
+        assert_eq!(field_slice(b"\"a\"b,c", b',', 0), Some(&b"\"a\"b"[..]));
+        assert_eq!(field_slice(b"\"a\"b,c", b',', 1), Some(&b"c"[..]));
+    }
+
+    #[test]
+    fn field_slice_escaped_quote_keeps_quoting() {
+        // `""`는 이스케이프라 인용을 닫지 않는다 → 안의 콤마는 여전히 무시.
+        assert_eq!(
+            field_slice(b"\"a\"\",b\",c", b',', 0),
+            Some(&b"\"a\"\",b\""[..])
+        );
+        assert_eq!(field_slice(b"\"a\"\",b\",c", b',', 1), Some(&b"c"[..]));
+    }
+
+    /// `{a, ", ,}` 알파벳 길이 0~6의 모든 문자열에 대해 `field_slice`가 나누는
+    /// **필드 개수와 경계**가 `split_fields`(csv_core)와 일치하는지 전수 검사.
+    /// (값 자체는 인용이 벗겨지지 않으므로 개수만 비교한다 — 값 동치는
+    /// `edit::tests::cells_to_tsv_matches_split_fields_exhaustively`가 본다.)
+    #[test]
+    fn field_slice_field_count_matches_split_fields_exhaustively() {
+        const ALPHABET: [char; 3] = ['a', '"', ','];
+        for len in 0..=6usize {
+            for n in 0..ALPHABET.len().pow(len as u32) {
+                let mut n = n;
+                let mut s = String::new();
+                for _ in 0..len {
+                    s.push(ALPHABET[n % ALPHABET.len()]);
+                    n /= ALPHABET.len();
+                }
+                let want = split_fields(&s, b',');
+                let bytes = s.as_bytes();
+                let mut got = 0usize;
+                while field_slice(bytes, b',', got).is_some() {
+                    got += 1;
+                    assert!(got < 32, "무한루프 방지");
+                }
+                // split_fields는 빈 입력에도 [""] 한 개를 돌려준다(field_slice도 동일).
+                assert_eq!(got, want.len(), "input {s:?}");
+            }
+        }
     }
 
     #[test]

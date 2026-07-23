@@ -60,6 +60,43 @@ pub struct Document {
     /// 필요하다 — egui의 primary_down은 전역 상태라 누름이 어디서 시작됐는지
     /// 알 수 없고, is_pointer_button_down_on()은 우클릭에도 참이다.
     pub text_drag_active: bool,
+    /// 행 수가 너무 많아 사용자 확인을 기다리는 컬럼 연산.
+    /// Some이면 확인 다이얼로그를 띄우고, "계속"이면 그대로 실행한다.
+    /// (`BIG_COLUMN_OP_ROWS` 참조.)
+    pub pending_column_op: Option<PendingColumnOp>,
+}
+
+/// 확인 없이 바로 수행할 컬럼 연산의 최대 행 수. 이보다 크면 사용자에게 묻는다.
+/// 수백만 행 컬럼을 복사하면 클립보드 문자열이 수백 MB가 되고, 컬럼이 선택된
+/// 상태의 "행 삭제"는 클릭 한 번에 전 데이터 행을 지운다 — 둘 다 실수로
+/// 벌어지면 되돌리기 부담이 크므로 한 번 묻는다.
+pub const BIG_COLUMN_OP_ROWS: usize = 1_000_000;
+
+/// 행 수가 임계치를 넘어 확인을 기다리는 컬럼 연산. 다이얼로그에서 "계속"을
+/// 누르면 같은 동작을 `confirmed = true`로 다시 태운다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingColumnOp {
+    act: CellMenuAction,
+    /// `Event::Paste`가 준 시스템 클립보드 문자열(있으면). 확인 뒤에도 같은
+    /// 내용을 붙여야 하므로 함께 보관한다 — 그 이벤트는 이미 소비됐다.
+    paste_text: Option<String>,
+    /// 대상 행 수(안내 문구용).
+    rows: usize,
+}
+
+/// 이 동작이 "큰 컬럼 연산" 확인 대상인지. 대상 행 수가 임계치를 넘을 때만
+/// 묻는다. 행 삽입은 한 줄짜리라 범위와 무관하게 항상 즉시 수행한다.
+fn needs_big_op_confirm(act: CellMenuAction, rows: usize) -> bool {
+    if rows <= BIG_COLUMN_OP_ROWS {
+        return false;
+    }
+    matches!(
+        act,
+        CellMenuAction::Copy
+            | CellMenuAction::Cut
+            | CellMenuAction::Clear
+            | CellMenuAction::DeleteRows
+    )
 }
 
 pub struct App {
@@ -210,6 +247,7 @@ impl App {
             text_sel: None,
             text_caret: crate::edit::TextPos { line: 0, col: 0 },
             text_drag_active: false,
+            pending_column_op: None,
         });
     }
 }
@@ -260,6 +298,7 @@ pub fn enter_edit_mode(doc: &mut Document) {
     doc.text_sel = None;
     doc.text_caret = crate::edit::TextPos { line: 0, col: 0 };
     doc.text_drag_active = false;
+    doc.pending_column_op = None;
 }
 
 /// 저장 직후 문서의 뷰 소스(mmap)를 방금 쓴 파일로 다시 겨눈다.
@@ -313,6 +352,8 @@ pub fn exit_edit_mode(doc: &mut Document) {
     doc.cell_drag_active = false;
     doc.text_sel = None;
     doc.text_drag_active = false;
+    // 편집 버퍼가 사라지면 대기 중인 컬럼 연산도 무의미하다.
+    doc.pending_column_op = None;
 }
 
 /// logical 논리 행의 텍스트. 편집 모드면 EditBuffer에서, 아니면 mmap 디코딩.
@@ -689,6 +730,15 @@ impl eframe::App for App {
             render_confirm_discard_dialog(ctx, self);
         }
 
+        // 대상 행이 아주 많은 컬럼 연산 확인 다이얼로그.
+        if self
+            .doc
+            .as_ref()
+            .map_or(false, |d| d.pending_column_op.is_some())
+        {
+            render_confirm_big_column_op_dialog(ctx, self);
+        }
+
         // Ctrl+S — 편집 모드에서 저장 다이얼로그 열기. 다른 다이얼로그가 떠
         // 있으면 무시한다(중복 열기 방지).
         if self.doc.as_ref().map_or(false, |d| d.edit.is_some())
@@ -943,6 +993,84 @@ fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
         }
         None => {}
     }
+}
+
+/// 대상 행 수가 많은 컬럼 연산 전에 띄우는 확인 창
+/// (`render_confirm_discard_dialog`와 같은 패턴 — 인텐트를 보관해 두었다가
+/// "계속"에서 같은 경로를 `confirmed = true`로 다시 태운다).
+///
+/// `delim`이 필요하므로 표 모드(`SeparatorMode::Char`)에서만 의미가 있다.
+/// 텍스트 모드에는 컬럼 개념이 없어 애초에 대기 연산이 생기지 않는다.
+fn render_confirm_big_column_op_dialog(ctx: &egui::Context, app: &mut App) {
+    let Some(doc) = &app.doc else { return };
+    let Some(pending) = doc.pending_column_op.clone() else { return };
+    let SeparatorMode::Char(delim) = doc.sep else {
+        // 구분자가 없으면 컬럼 연산 자체가 성립하지 않는다 — 조용히 취소.
+        if let Some(doc) = &mut app.doc {
+            doc.pending_column_op = None;
+        }
+        return;
+    };
+    let what = match pending.act {
+        CellMenuAction::Copy => "복사",
+        CellMenuAction::Cut => "잘라내기",
+        CellMenuAction::Clear => "셀 내용 지우기",
+        CellMenuAction::DeleteRows => "행 삭제",
+        CellMenuAction::Paste => "붙여넣기",
+        CellMenuAction::InsertRowAbove | CellMenuAction::InsertRowBelow => "행 삽입",
+    };
+    let rows = pending.rows;
+
+    let mut open = true;
+    let mut proceed = false;
+    let mut cancel = false;
+    egui::Window::new("많은 행에 대한 작업")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(format!("{rows}행에 대해 '{what}'를 실행합니다."));
+            ui.label("행이 많아 시간이 오래 걸리고 메모리를 많이 쓸 수 있습니다.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("계속").clicked() {
+                    proceed = true;
+                }
+                if ui.button("취소").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    // 창 X로 닫으면 취소와 같다(아무것도 하지 않는 쪽이 기본).
+    if !open || cancel {
+        if let Some(doc) = &mut app.doc {
+            doc.pending_column_op = None;
+        }
+        return;
+    }
+    if !proceed {
+        return;
+    }
+    // 확인됨 — 대기 상태를 먼저 비우고(무한 재확인 방지) 같은 경로를 다시 탄다.
+    let clipboard = &mut app.clipboard_cache;
+    let Some(doc) = &mut app.doc else { return };
+    doc.pending_column_op = None;
+    // `apply_cell_menu_action_confirmed`는 `&mut egui::Ui`를 요구한다. 이 시점은
+    // CentralPanel 밖이므로, 그리지 않는 임시 Area의 Ui를 하나 만들어 넘긴다
+    // (동작이 실제로 쓰는 것은 `ui.output_mut`(클립보드)뿐이다).
+    egui::Area::new(egui::Id::new("big_column_op_apply"))
+        .fixed_pos(egui::pos2(-10000.0, -10000.0))
+        .show(ctx, |ui| {
+            apply_cell_menu_action_confirmed(
+                ui,
+                doc,
+                delim,
+                clipboard,
+                pending.act,
+                pending.paste_text.as_deref(),
+                true,
+            );
+        });
 }
 
 /// 행/열 번호 시작값(0 또는 1) 설정 다이얼로그.
@@ -1338,7 +1466,7 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
 /// 우클릭 컨텍스트 메뉴에서 고른 동작. 클로저 안에서는 doc을 가변으로 빌릴 수
 /// 없으므로 "무엇을 눌렀는지"만 기록해 두고, 테이블 클로저가 끝난 뒤 적용한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CellMenuAction {
+pub enum CellMenuAction {
     Copy,
     Cut,
     Paste,
@@ -1384,6 +1512,33 @@ fn effective_cell_rect(
     }
     let col = selected_col?;
     column_as_rect(col, data_start, line_count)
+}
+
+/// Shift+클릭으로 선택을 확장할 때의 새 사각 선택. **앵커는 유지하고 끝점만**
+/// 옮긴다(Windows 표준 동작).
+///
+/// `prev`는 정규화 전 원본 `cell_sel`이다 — 앞 두 값이 앵커(먼저 누른 지점),
+/// 뒤 두 값이 끝점이다. 그래서 정규화하지 않고 앞 두 값을 그대로 앵커로 쓴다.
+/// 이전 선택이 없으면 클릭 지점을 앵커로 삼아 단일 셀 선택으로 시작한다
+/// (평소 클릭과 같은 결과 — Shift를 눌렀지만 확장할 기준이 없기 때문).
+fn shift_extend(
+    prev: Option<(usize, usize, usize, usize)>,
+    row: usize,
+    col: usize,
+) -> (usize, usize, usize, usize) {
+    match prev {
+        Some((ar, ac, _, _)) => (ar, ac, row, col),
+        None => (row, col, row, col),
+    }
+}
+
+/// 텍스트 모드 Shift+클릭의 앵커. 기존 선택이 있으면 그 앵커(`text_sel.0`)를,
+/// 없으면 현재 캐럿을 앵커로 삼는다. 표 모드 `shift_extend`와 같은 규율이다.
+fn shift_extend_text(
+    prev_sel: Option<(crate::edit::TextPos, crate::edit::TextPos)>,
+    caret: crate::edit::TextPos,
+) -> crate::edit::TextPos {
+    prev_sel.map(|(a, _)| a).unwrap_or(caret)
 }
 
 /// (row, col)이 정규화 전 선택 사각형 안에 들어가는지.
@@ -1448,6 +1603,8 @@ fn render_table(
     // 드래그 시작 셀(논리 행, 열). 드래그 중 확장 끝점.
     let drag_anchor: Cell<Option<(usize, usize)>> = Cell::new(None);
     let drag_head: Cell<Option<(usize, usize)>> = Cell::new(None);
+    // Shift+클릭으로 확장할 끝점. 앵커는 **잡지 않는다**(기존 앵커 유지).
+    let shift_click: Cell<Option<(usize, usize)>> = Cell::new(None);
     // 이번 프레임에 "셀 위에서" 좌클릭 누름이 진행 중인지. doc.cell_drag_active를
     // 클로저 밖에서 켜기 위한 통로(클로저는 doc을 불변으로만 빌린다).
     let cell_press: Cell<bool> = Cell::new(false);
@@ -1463,6 +1620,8 @@ fn render_table(
     let menu_action: Cell<Option<CellMenuAction>> = Cell::new(None);
     // 좌클릭 버튼이 눌린 상태인지(드래그 확장 판정용). 프레임당 한 번만 읽는다.
     let primary_down = ui.input(|i| i.pointer.primary_down());
+    // Shift 눌림. Shift+클릭은 앵커를 새로 잡지 않고 끝점만 옮긴다.
+    let shift_down = ui.input(|i| i.modifiers.shift);
     // 이전 프레임까지 이어져 온 "셀에서 시작된 드래그" 상태. 버튼이 떼어진
     // 프레임부터는 무조건 꺼진 것으로 본다.
     let drag_active = doc.cell_drag_active && primary_down;
@@ -1674,9 +1833,18 @@ fn render_table(
                         // 프레임 앵커/끝점이 시작 셀로 되돌아가 확장이 깨진다.
                         // 누르는 첫 프레임부터 앵커를 잡아야(clicked()는 release
                         // 에서만 켜진다) 아래 확장 분기가 옛 선택을 끌고 가지 않는다.
+                        // Shift+클릭(Windows 표준): 앵커는 그대로 두고 끝점만
+                        // 이 셀로 옮긴다. 그래서 `drag_anchor`를 **잡지 않는**
+                        // 별도 분기다 — 앵커를 잡으면 범위가 이 셀 하나로
+                        // 무너진다. 드래그 래치(`cell_press`)는 그대로 두어
+                        // Shift+누른 채 끌면 계속 확장된다.
                         if resp.clicked() || (pressed_here && !drag_active) {
-                            drag_anchor.set(Some((lrow, c)));
-                            drag_head.set(Some((lrow, c)));
+                            if shift_down {
+                                shift_click.set(Some((lrow, c)));
+                            } else {
+                                drag_anchor.set(Some((lrow, c)));
+                                drag_head.set(Some((lrow, c)));
+                            }
                         }
                         // 드래그 중 끝점 확장. 드래그 이벤트는 최초로 눌린 셀만
                         // 받으므로(egui가 포인터를 그 위젯에 캡처), 다른 행/열로
@@ -1780,10 +1948,13 @@ fn render_table(
     doc.cell_drag_active =
         next_cell_drag_active(doc.cell_drag_active, primary_down, cell_press.get());
 
-    // 3) 드래그/클릭 선택 갱신. 앵커가 새로 잡히면 앵커+끝점을 함께 설정하고,
-    // 이전 프레임에 시작된 드래그가 이어지는 중이면(셀에서 시작 + 버튼 눌림)
-    // 앵커는 유지한 채 끝점만 확장한다.
-    if let Some((ar, ac)) = drag_anchor.get() {
+    // 3) 드래그/클릭 선택 갱신. Shift+클릭이 먼저다 — 앵커를 유지한 채 끝점만
+    // 옮기므로 아래 앵커 분기(단일 셀로 붕괴)를 타면 안 된다. 그다음이
+    // 앵커가 새로 잡힌 경우(평소 클릭/드래그 시작), 마지막이 이어지는 드래그
+    // (앵커 유지 + 끝점 확장)다.
+    if let Some((lrow, c)) = shift_click.get() {
+        doc.cell_sel = Some(shift_extend(doc.cell_sel, lrow, c));
+    } else if let Some((ar, ac)) = drag_anchor.get() {
         let (hr, hc) = drag_head.get().unwrap_or((ar, ac));
         doc.cell_sel = Some((ar, ac, hr, hc));
     } else if drag_active {
@@ -1930,6 +2101,20 @@ fn apply_cell_menu_action(
     act: CellMenuAction,
     paste_text: Option<&str>,
 ) {
+    apply_cell_menu_action_confirmed(ui, doc, delim, clipboard, act, paste_text, false)
+}
+
+/// `apply_cell_menu_action`의 본체. `confirmed`가 참이면 "큰 컬럼 연산" 확인을
+/// 건너뛴다(사용자가 이미 다이얼로그에서 계속을 눌렀다).
+fn apply_cell_menu_action_confirmed(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    delim: u8,
+    clipboard: &mut String,
+    act: CellMenuAction,
+    paste_text: Option<&str>,
+    confirmed: bool,
+) {
     let data_start = if doc.has_header { 1 } else { 0 };
     let line_count = doc.edit.as_ref().map_or(0, |e| e.lines.len());
     let Some((r0, c0, r1, c1)) =
@@ -1937,6 +2122,17 @@ fn apply_cell_menu_action(
     else {
         return;
     };
+    // 대상 행이 너무 많으면(컬럼 전체 선택 등) 한 번 묻는다. 확인 대기 중에는
+    // 아직 아무것도 바꾸지 않는다 — 되돌리기 스택도 건드리지 않는다.
+    let rows = r1.saturating_sub(r0) + 1;
+    if !confirmed && needs_big_op_confirm(act, rows) {
+        doc.pending_column_op = Some(PendingColumnOp {
+            act,
+            paste_text: paste_text.map(|s| s.to_owned()),
+            rows,
+        });
+        return;
+    }
     let Some(e) = doc.edit.as_mut() else { return };
 
     match act {
@@ -2327,6 +2523,8 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
     // 클릭/드래그로 잡은 위치. anchor는 누름 시작, head는 확장 끝점.
     let drag_anchor: Cell<Option<crate::edit::TextPos>> = Cell::new(None);
     let drag_head: Cell<Option<crate::edit::TextPos>> = Cell::new(None);
+    // Shift+클릭으로 확장할 캐럿 위치. 앵커는 **잡지 않는다**(기존 앵커 유지).
+    let shift_click: Cell<Option<crate::edit::TextPos>> = Cell::new(None);
     // 이번 프레임에 "텍스트 줄 위에서" 좌클릭 누름이 진행 중인지.
     let line_press: Cell<bool> = Cell::new(false);
     // 우클릭 대상 줄 위치 + 고른 메뉴 동작.
@@ -2334,6 +2532,8 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
     let menu_action: Cell<Option<TextMenuAction>> = Cell::new(None);
 
     let primary_down = ui.input(|i| i.pointer.primary_down());
+    // Shift 눌림. 표 모드와 같은 규율 — Shift+클릭은 앵커를 새로 잡지 않는다.
+    let shift_down = ui.input(|i| i.modifiers.shift);
     // 이전 프레임부터 이어져 온 "줄에서 시작된 드래그". 버튼을 떼면 꺼진다.
     // (`next_cell_drag_active`와 같은 전이 규칙을 그대로 쓴다 — 표/텍스트 모드가
     // 다른 것은 무엇을 눌렀는지뿐이고, 래치 논리는 동일하다.)
@@ -2485,9 +2685,16 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                         // 새 앵커 = 이번 프레임에 이 줄에서 누름이 시작됐다.
                         // 드래그가 이어지는 동안(drag_active)에는 앵커를 다시
                         // 잡지 않아야 확장이 깨지지 않는다.
+                        // Shift+클릭(Windows 표준): 기존 앵커를 유지한 채
+                        // 캐럿만 이 위치로. 표 모드와 같은 이유로 앵커를
+                        // 잡는 분기와 **분리**한다.
                         if resp.clicked() || (pressed_here && !drag_active) {
-                            drag_anchor.set(Some(p));
-                            drag_head.set(Some(p));
+                            if shift_down {
+                                shift_click.set(Some(p));
+                            } else {
+                                drag_anchor.set(Some(p));
+                                drag_head.set(Some(p));
+                            }
                         }
                     }
                     // 드래그 중 확장: 포인터가 이 줄 위 + 줄에서 시작된 드래그.
@@ -2555,8 +2762,13 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
     doc.text_drag_active =
         next_cell_drag_active(doc.text_drag_active, primary_down, line_press.get());
 
-    // 2) 마우스 선택/캐럿 갱신.
-    if let Some(anchor) = drag_anchor.get() {
+    // 2) 마우스 선택/캐럿 갱신. Shift+클릭이 먼저다 — 앵커를 유지한 채 캐럿만
+    //    옮기므로 아래 "새 앵커" 분기(선택 해제)를 타면 안 된다.
+    if let Some(head) = shift_click.get() {
+        let anchor = shift_extend_text(doc.text_sel, doc.text_caret);
+        doc.text_caret = head;
+        doc.text_sel = if anchor == head { None } else { Some((anchor, head)) };
+    } else if let Some(anchor) = drag_anchor.get() {
         let head = drag_head.get().unwrap_or(anchor);
         doc.text_caret = head;
         doc.text_sel = if anchor == head { None } else { Some((anchor, head)) };
@@ -3468,6 +3680,48 @@ mod tests {
     }
 
     #[test]
+    fn shift_click_keeps_anchor_extends_head() {
+        // 기존 선택 (2,1)-(2,1)에서 (5,3)을 shift+클릭 → (2,1)-(5,3)
+        let prev = Some((2usize, 1usize, 2usize, 1usize));
+        assert_eq!(shift_extend(prev, 5, 3), (2, 1, 5, 3));
+    }
+
+    #[test]
+    fn shift_click_without_previous_selection_starts_there() {
+        // 이전 선택이 없으면 그 셀 단일 선택으로 시작.
+        assert_eq!(shift_extend(None, 4, 2), (4, 2, 4, 2));
+    }
+
+    #[test]
+    fn shift_click_keeps_original_anchor_on_repeat() {
+        // 이미 확장된 선택에서 다시 shift+클릭하면 **최초 앵커**가 유지된다
+        // (끝점만 계속 움직인다 — Windows 표준).
+        let mut sel = shift_extend(Some((2, 1, 2, 1)), 5, 3);
+        sel = shift_extend(Some(sel), 8, 0);
+        assert_eq!(sel, (2, 1, 8, 0));
+        sel = shift_extend(Some(sel), 1, 1);
+        assert_eq!(sel, (2, 1, 1, 1), "앵커 위로 올라가도 앵커는 그대로");
+    }
+
+    #[test]
+    fn shift_click_uses_unnormalized_anchor() {
+        // cell_sel은 정규화 전 원본이라 앞 두 값이 앵커다. 역방향 선택에서
+        // shift+클릭하면 정규화된 좌상단이 아니라 **원래 앵커**가 유지돼야 한다.
+        let prev = Some((5usize, 4usize, 2usize, 1usize)); // 앵커 (5,4)
+        assert_eq!(shift_extend(prev, 7, 6), (5, 4, 7, 6));
+    }
+
+    #[test]
+    fn shift_click_text_anchor_from_selection_or_caret() {
+        let a = tp(1, 2);
+        let b = tp(4, 0);
+        // 선택이 있으면 그 앵커(첫 값)를 쓴다.
+        assert_eq!(shift_extend_text(Some((a, b)), tp(9, 9)), a);
+        // 선택이 없으면 현재 캐럿이 앵커.
+        assert_eq!(shift_extend_text(None, tp(3, 3)), tp(3, 3));
+    }
+
+    #[test]
     fn cell_drag_active_latches_only_on_cell_press() {
         // 버튼을 뗀 프레임은 무조건 해제.
         assert!(!next_cell_drag_active(true, false, false));
@@ -3891,6 +4145,72 @@ mod tests {
             });
         });
         out.expect("CentralPanel 클로저가 한 번은 실행된다")
+    }
+
+    #[test]
+    fn big_op_confirm_only_for_destructive_and_large() {
+        let big = BIG_COLUMN_OP_ROWS + 1;
+        // 임계치 이하는 묻지 않는다.
+        assert!(!needs_big_op_confirm(CellMenuAction::Copy, BIG_COLUMN_OP_ROWS));
+        assert!(!needs_big_op_confirm(CellMenuAction::DeleteRows, 10));
+        // 임계치를 넘으면 복사/잘라내기/지우기/행삭제는 묻는다.
+        assert!(needs_big_op_confirm(CellMenuAction::Copy, big));
+        assert!(needs_big_op_confirm(CellMenuAction::Cut, big));
+        assert!(needs_big_op_confirm(CellMenuAction::Clear, big));
+        assert!(needs_big_op_confirm(CellMenuAction::DeleteRows, big));
+        // 행 삽입은 한 줄짜리라 범위와 무관하게 묻지 않는다.
+        assert!(!needs_big_op_confirm(CellMenuAction::InsertRowAbove, big));
+        assert!(!needs_big_op_confirm(CellMenuAction::InsertRowBelow, big));
+        // 붙여넣기는 클립보드 크기에 좌우되고 선택 범위 전체를 덮지 않는다.
+        assert!(!needs_big_op_confirm(CellMenuAction::Paste, big));
+    }
+
+    #[test]
+    fn small_column_op_runs_without_confirm() {
+        // 임계치 아래(3행)면 확인 없이 즉시 수행되고 대기 상태도 남지 않는다.
+        let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        doc.cell_sel = None;
+        doc.selected_col = Some(1);
+        let mut clip = String::new();
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::Clear, None)
+        });
+        assert!(doc.pending_column_op.is_none(), "확인 대기 없음");
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", "a,", "b,"]));
+    }
+
+    /// 확인 대기 중에는 **아무것도 바꾸지 않아야** 한다 — 버퍼도, dirty도,
+    /// 되돌리기 스택도. 대기만 걸고 즉시 돌아온다.
+    #[test]
+    fn big_column_op_defers_without_mutating() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        doc.cell_sel = Some((1, 0, BIG_COLUMN_OP_ROWS + 5, 1));
+        let mut clip = String::new();
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::Clear, None)
+        });
+        assert!(doc.pending_column_op.is_some(), "확인 대기가 걸려야 한다");
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig, "버퍼 불변");
+        assert!(!doc.edit.as_ref().unwrap().dirty, "dirty 표시 없음");
+        assert!(doc.edit.as_ref().unwrap().undo.is_empty(), "undo 단계 없음");
+
+        // 확인하면(confirmed = true) 실제로 수행된다.
+        with_ui(|ui| {
+            apply_cell_menu_action_confirmed(
+                ui,
+                doc,
+                delim,
+                &mut clip,
+                CellMenuAction::Clear,
+                None,
+                true,
+            )
+        });
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", ",", ","]));
+        assert!(doc.edit.as_ref().unwrap().dirty);
     }
 
     #[test]

@@ -231,12 +231,26 @@ fn sanitize_cell_value(value: &str) -> String {
 }
 
 /// 사각 영역 [r0..=r1] x [c0..=c1]의 각 셀을 빈 값으로 만든다.
+///
+/// 성능 주의: 컬럼 선택은 데이터 전 구간(수억 행)을 범위로 만들 수 있다. 값을
+/// 비우려면 줄을 재조립해야 하므로 `split_fields`+`join_fields`가 필요하지만,
+/// **바꿀 게 없는 행은 통째로 건너뛴다** — 대상 필드가 이미 전부 비어 있으면
+/// `field_slice`(할당 없음)만으로 판정하고 재조립을 생략한다.
 pub fn clear_cells(lines: &mut [String], r0: usize, c0: usize, r1: usize, c1: usize, delim: u8) {
     let (r0, r1) = (r0.min(r1), r0.max(r1));
     let (c0, c1) = (c0.min(c1), c0.max(c1));
     for r in r0..=r1 {
         if r >= lines.len() {
             break;
+        }
+        // 이미 전부 비어 있으면 재조립(할당) 자체를 건너뛴다.
+        let already_empty = {
+            let bytes = lines[r].as_bytes();
+            (c0..=c1)
+                .all(|c| crate::parse::field_slice(bytes, delim, c).map_or(true, |f| f.is_empty()))
+        };
+        if already_empty {
+            continue;
         }
         let mut fields = split_fields(&lines[r], delim);
         let hi = c1.min(fields.len().saturating_sub(1));
@@ -250,10 +264,18 @@ pub fn clear_cells(lines: &mut [String], r0: usize, c0: usize, r1: usize, c1: us
 }
 
 /// 선택 사각 영역을 TSV(행=\n, 열=\t)로 직렬화한다.
+///
+/// 성능 주의: 컬럼 선택(헤더 클릭)은 데이터 전 구간을 범위로 만든다 —
+/// 3억 행이면 이 루프가 3억 번 돈다. 그래서 행마다 `split_fields`로
+/// **모든** 필드를 `String`으로 만들지 않고(리더 생성 + Vec 2개 + 필드 수만큼
+/// String 할당), 필요한 컬럼만 `parse::field_slice`로 **할당 없이** 잘라 온다.
+/// `field_slice`는 raw 슬라이스(따옴표 포함)를 주므로 `unquote_field`로
+/// `split_fields`와 같은 값이 되도록 인용을 벗긴다.
 pub fn cells_to_tsv(lines: &[String], r0: usize, c0: usize, r1: usize, c1: usize, delim: u8) -> String {
     let (r0, r1) = (r0.min(r1), r0.max(r1));
     let (c0, c1) = (c0.min(c1), c0.max(c1));
-    let mut out = String::new();
+    // 결과 크기를 대략 예측해 재할당을 줄인다(행당 평균 16바이트 가정).
+    let mut out = String::with_capacity((r1.saturating_sub(r0) + 1).saturating_mul(16));
     for r in r0..=r1 {
         if r > r0 {
             out.push('\n');
@@ -261,17 +283,61 @@ pub fn cells_to_tsv(lines: &[String], r0: usize, c0: usize, r1: usize, c1: usize
         if r >= lines.len() {
             continue;
         }
-        let fields = split_fields(&lines[r], delim);
+        let bytes = lines[r].as_bytes();
         for c in c0..=c1 {
             if c > c0 {
                 out.push('\t');
             }
-            if let Some(f) = fields.get(c) {
-                out.push_str(f);
+            // 할당 없이 해당 필드 슬라이스만. 따옴표로 감싼 값은 그대로
+            // 포함되므로 여기서 벗겨 준다(split_fields와 결과를 맞추기 위함).
+            if let Some(f) = crate::parse::field_slice(bytes, delim, c) {
+                push_unquoted(&mut out, f);
             }
         }
     }
     out
+}
+
+/// `field_slice`가 돌려준 raw 필드에서 CSV 인용을 벗겨 `out`에 덧붙인다.
+///
+/// **csv_core(= `split_fields`)의 동작을 그대로 재현한다.** 브리프가 제안한
+/// "앞뒤가 `"`면 벗기고 내부 `""`를 하나로" 규칙은 실제 csv_core와 다음
+/// 입력들에서 어긋나므로 채택하지 않았다(모두 실측):
+///   `"`      → csv_core `""`,      단순규칙 `"\""`   (len<2라 안 벗김)
+///   `"ab`    → csv_core `"ab"`,    단순규칙 `"\"ab"` (끝이 따옴표가 아님)
+///   `"a"b"`  → csv_core `"ab\""`,  단순규칙 `"a\"b"` (중간 따옴표에서 인용 종료)
+///   `"a"b`   → csv_core `"ab"`,    단순규칙 그대로
+/// 실제 규칙은 상태기계다:
+///   - 필드가 `"`로 시작하지 않으면 **전부 그대로**(내부 `"`도 리터럴).
+///   - `"`로 시작하면 인용 상태로 진입하고 그 여는 따옴표는 버린다.
+///     인용 안에서 `""`는 `"` 하나로, 홀로 있는 `"`는 인용을 **닫는다**.
+///     인용을 닫은 뒤의 바이트는 다시 리터럴이다(닫는 따옴표 자체는 버려짐).
+/// 할당은 하지 않는다 — 바이트 구간을 그대로 `out`에 복사한다.
+fn push_unquoted(out: &mut String, f: &[u8]) {
+    if !f.starts_with(b"\"") {
+        out.push_str(&String::from_utf8_lossy(f));
+        return;
+    }
+    let mut i = 1usize; // 여는 따옴표는 버린다
+    let mut in_quotes = true;
+    let mut seg_start = i;
+    while i < f.len() {
+        if in_quotes && f[i] == b'"' {
+            // 여기까지의 구간을 흘려보내고 따옴표를 처리한다.
+            out.push_str(&String::from_utf8_lossy(&f[seg_start..i]));
+            if f.get(i + 1) == Some(&b'"') {
+                out.push('"'); // "" → " (인용 유지)
+                i += 2;
+            } else {
+                in_quotes = false; // 인용 종료(닫는 따옴표는 버림)
+                i += 1;
+            }
+            seg_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&String::from_utf8_lossy(&f[seg_start..]));
 }
 
 /// TSV 클립보드를 (r0,c0)부터 셀 그리드로 덮어쓴다. 경계를 넘으면 행/열 확장.
@@ -715,6 +781,30 @@ mod tests {
         assert_eq!(lines, v(&[",,c", ",,f", "g,h,i"]));
     }
 
+    /// 이미 비어 있는 대상 행은 재조립을 건너뛴다 — 그 결과 줄이 **바이트
+    /// 단위로 그대로** 남아야 한다. app.rs의 Cut/Clear no-op undo 판정
+    /// (`edit_op_differs_from_current`)이 "안 바뀜"을 정확히 보려면 이 성질이
+    /// 필요하다. 특히 재조립(split+join)은 인용을 정규화해 버려서 값이
+    /// 같더라도 줄 텍스트가 달라질 수 있다.
+    #[test]
+    fn clear_cells_skips_already_empty_rows_byte_exactly() {
+        // col 1이 이미 비어 있고, col 0은 재조립되면 표현이 달라질 수 있는 값.
+        let mut lines = v(&["\"a\"b,,c", ",,", "x,y,z"]);
+        let before = lines.clone();
+        clear_cells(&mut lines, 0, 1, 1, 1, b',');
+        assert_eq!(lines[0], before[0], "이미 빈 행은 손대지 않는다");
+        assert_eq!(lines[1], before[1], "이미 빈 행은 손대지 않는다");
+        assert_eq!(lines[2], before[2], "범위 밖 행은 그대로");
+    }
+
+    #[test]
+    fn clear_cells_still_clears_non_empty() {
+        // 건너뛰기 최적화가 실제로 지워야 할 행까지 건너뛰면 안 된다.
+        let mut lines = v(&["a,b,c", "d,,f", "g,h,i"]);
+        clear_cells(&mut lines, 0, 1, 2, 1, b',');
+        assert_eq!(lines, v(&["a,,c", "d,,f", "g,,i"]));
+    }
+
     #[test]
     fn insert_and_remove_row() {
         let mut lines = v(&["a", "b"]);
@@ -738,6 +828,113 @@ mod tests {
         // 열 0~1, 행 0~1 → "a\tb\nd\te"
         let s = cells_to_tsv(&lines, 0, 0, 1, 1, b',');
         assert_eq!(s, "a\tb\nd\te");
+    }
+
+    #[test]
+    fn cells_to_tsv_single_column_matches_split_fields() {
+        // 최적화 경로(단일 컬럼)와 일반 경로가 같은 결과를 내야 한다.
+        let lines = v(&["a,b,c", "d,e,f", "\"x,y\",z,w"]);
+        for col in 0..3 {
+            let fast = cells_to_tsv(&lines, 0, col, 2, col, b',');
+            // 일반 경로를 직접 재현(참조 구현).
+            let mut want = String::new();
+            for (i, l) in lines.iter().enumerate() {
+                if i > 0 {
+                    want.push('\n');
+                }
+                let f = crate::parse::split_fields(l, b',');
+                want.push_str(f.get(col).map(|s| s.as_str()).unwrap_or(""));
+            }
+            assert_eq!(fast, want, "col {col}");
+        }
+    }
+
+    /// `unquote_field`가 `split_fields`의 인용 해제 의미를 정확히 재현하는지.
+    /// 감싸는 따옴표 제거 + 내부 `""` → `"` 복원, 인용이 아닌 값은 그대로.
+    #[test]
+    fn cells_to_tsv_matches_split_fields_on_tricky_quoting() {
+        let lines = v(&[
+            "\"a\"\"b\",z",       // 내부 이스케이프된 따옴표
+            "\"\",z",             // 빈 인용 필드
+            ",z",                 // 빈 필드(인용 아님)
+            "\"only\",z",         // 평범한 인용
+            "\"\"\"\",z",         // 인용 안의 따옴표 하나
+        ]);
+        for col in 0..2 {
+            let fast = cells_to_tsv(&lines, 0, col, lines.len() - 1, col, b',');
+            let mut want = String::new();
+            for (i, l) in lines.iter().enumerate() {
+                if i > 0 {
+                    want.push('\n');
+                }
+                let f = crate::parse::split_fields(l, b',');
+                want.push_str(f.get(col).map(|s| s.as_str()).unwrap_or(""));
+            }
+            assert_eq!(fast, want, "col {col}");
+        }
+    }
+
+    /// `{a, ", ,}` 알파벳으로 만든 길이 0~5의 **모든** 문자열에 대해
+    /// `cells_to_tsv`(field_slice + 인용 해제)가 `split_fields` 경로와
+    /// 완전히 같은 값을 내는지 전수 검사한다. 브리프의 단순 인용 해제
+    /// 규칙이 어긋났던 케이스(`"`, `"ab`, `"a"b"` 등)가 모두 여기 포함된다.
+    #[test]
+    fn cells_to_tsv_matches_split_fields_exhaustively() {
+        const ALPHABET: [char; 3] = ['a', '"', ','];
+        let mut checked = 0usize;
+        for len in 0..=5usize {
+            let total = ALPHABET.len().pow(len as u32);
+            for n in 0..total {
+                let mut n = n;
+                let mut s = String::new();
+                for _ in 0..len {
+                    s.push(ALPHABET[n % ALPHABET.len()]);
+                    n /= ALPHABET.len();
+                }
+                let lines = vec![s.clone()];
+                let want = crate::parse::split_fields(&s, b',');
+                for col in 0..want.len() {
+                    let got = cells_to_tsv(&lines, 0, col, 0, col, b',');
+                    assert_eq!(got, want[col], "input {s:?} col {col}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 500, "전수 검사가 실제로 돌았는지 확인");
+    }
+
+    /// 대용량 컬럼 복사 벤치. 무시 상태이며 필요할 때만 돌린다:
+    ///   cargo test --release bench_column_copy -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_column_copy() {
+        use std::time::Instant;
+        let rows = 2_000_000;
+        let lines: Vec<String> = (0..rows).map(|i| format!("{i},bbb,ccc,ddd")).collect();
+        let t = Instant::now();
+        let s = cells_to_tsv(&lines, 0, 1, rows - 1, 1, b',');
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("컬럼 복사 {rows}행: {ms:.0}ms, 결과 {}바이트", s.len());
+    }
+
+    /// 대용량 컬럼 지우기 벤치(clear_cells). 이미 비어 있는 행은 재조립을
+    /// 건너뛴다는 것을 확인하기 위해 "이미 빈 컬럼" 케이스를 함께 잰다.
+    ///   cargo test --release bench_column_clear -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_column_clear() {
+        use std::time::Instant;
+        let rows = 2_000_000;
+        let mut lines: Vec<String> = (0..rows).map(|i| format!("{i},bbb,ccc,ddd")).collect();
+        let t = Instant::now();
+        clear_cells(&mut lines, 0, 1, rows - 1, 1, b',');
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("컬럼 지우기(값 있음) {rows}행: {ms:.0}ms");
+        // 두 번째 호출: 이미 전부 비어 있으므로 재조립을 건너뛰어야 한다.
+        let t = Instant::now();
+        clear_cells(&mut lines, 0, 1, rows - 1, 1, b',');
+        let ms2 = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("컬럼 지우기(이미 빔) {rows}행: {ms2:.0}ms");
     }
 
     #[test]
