@@ -268,6 +268,25 @@ pub fn remove_row(lines: &mut Vec<String>, at: usize) {
     }
 }
 
+/// order(원본 논리 행번호 배열) 순서로 데이터 행을 재배치한다. data_start 이전
+/// 행(헤더)은 그대로 앞에 유지한다. order는 데이터 행만 커버한다.
+pub fn apply_permutation(lines: &mut Vec<String>, order: &[u32], data_start: usize) {
+    if data_start > lines.len() {
+        return;
+    }
+    let header: Vec<String> = lines[..data_start].to_vec();
+    let mut reordered: Vec<String> = Vec::with_capacity(order.len());
+    for &idx in order {
+        let i = idx as usize;
+        if i < lines.len() {
+            reordered.push(lines[i].clone());
+        }
+    }
+    let mut out = header;
+    out.append(&mut reordered);
+    *lines = out;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +515,20 @@ mod tests {
         paste_tsv(&mut lines, 0, 0, "X\r\nY", b',');
         assert!(!lines.iter().any(|l| l.contains('\r')));
         assert!(!lines.iter().any(|l| l.contains('\n')));
+    }
+
+    #[test]
+    fn apply_permutation_reorders_data_rows() {
+        // order = [2,1] (논리 행번호), data_start=1 → 헤더 유지, 데이터 재배치.
+        let mut lines = v(&["name", "banana", "apple"]);
+        apply_permutation(&mut lines, &[2, 1], 1);
+        assert_eq!(lines, v(&["name", "apple", "banana"]));
+    }
+
+    #[test]
+    fn apply_permutation_no_header() {
+        let mut lines = v(&["b", "a", "c"]);
+        apply_permutation(&mut lines, &[1, 0, 2], 0);
+        assert_eq!(lines, v(&["a", "b", "c"]));
     }
 }

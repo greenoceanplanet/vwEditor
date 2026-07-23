@@ -60,7 +60,7 @@ const NUM_INVALID: Key = Key::MAX;
 /// `ci`(case-insensitive)면 ASCII 대문자(A-Z)를 소문자로 접어 대소문자를 같게
 /// 취급한다. 비-ASCII(한글 등 UTF-8 멀티바이트)는 그대로 두므로, ASCII 대소문자
 /// 구분만 무시하는 실용적 동작(대부분의 실데이터 요구를 충족).
-fn text_key(field: &[u8], ci: bool) -> Key {
+pub(crate) fn text_key(field: &[u8], ci: bool) -> Key {
     let mut buf = [0u8; PREFIX_LEN];
     let n = field.len().min(PREFIX_LEN);
     buf[..n].copy_from_slice(&field[..n]);
@@ -88,7 +88,7 @@ fn f64_sortable(v: f64) -> u64 {
 
 /// 숫자 필드 바이트 → 키. 파싱 성공하면 정렬가능 u64, 실패(비수치/빈값)면
 /// NUM_INVALID(최댓값, 맨 뒤).
-fn number_key(field: &[u8]) -> Key {
+pub(crate) fn number_key(field: &[u8]) -> Key {
     // 앞뒤 공백 제거 후 f64 파싱. field는 raw 바이트라 str로 본 뒤 파싱.
     let s = match std::str::from_utf8(field) {
         Ok(s) => s.trim(),
@@ -397,7 +397,7 @@ pub fn extract_and_sort(
 ///
 /// 다중 정렬은 tie-break 원본 재접근 없이 앞 8바이트 prefix로만 비교한다(설계상
 /// 단순화). truncated는 여기서 쓰지 않는다.
-fn col_key(field: Option<&[u8]>, spec: SortSpec) -> u64 {
+pub(crate) fn col_key(field: Option<&[u8]>, spec: SortSpec) -> u64 {
     let raw = match spec.kind {
         SortKind::Text => match field {
             Some(f) => text_key(f, spec.ci),
@@ -587,6 +587,31 @@ fn make_key(field: &[u8], kind: SortKind, ci: bool) -> (Key, bool) {
         SortKind::Text => (text_key(field, ci), field.len() > PREFIX_LEN),
         SortKind::Number => (number_key(field), false),
     }
+}
+
+/// 인메모리 줄 배열을 다중 기준으로 정렬해 데이터 행(data_start..)의 permutation을
+/// 반환한다. permutation[i] = 정렬 순서 i번째로 올 원본 논리 행번호.
+/// mmap 경로(extract_and_multi_sort)와 동일한 키 인코딩을 쓴다.
+pub fn sort_lines(lines: &[String], specs: &[SortSpec], delim: u8, data_start: usize) -> Vec<u32> {
+    if lines.len() <= data_start || specs.is_empty() {
+        return Vec::new();
+    }
+    let data_rows = lines.len() - data_start;
+    let mut keyed: Vec<([u64; MAX_KEYS], u32)> = (0..data_rows)
+        .into_par_iter()
+        .map(|i| {
+            let logical = data_start + i;
+            let line = lines[logical].as_bytes();
+            let mut keys = [0u64; MAX_KEYS];
+            for (slot, spec) in keys.iter_mut().zip(specs.iter()) {
+                let field = parse::field_slice(line, delim, spec.col);
+                *slot = col_key(field, *spec);
+            }
+            (keys, logical as u32)
+        })
+        .collect();
+    keyed.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    keyed.into_iter().map(|(_, idx)| idx).collect()
 }
 
 /// 뒤쪽 CR/LF만 제거한 슬라이스.
@@ -973,5 +998,51 @@ mod tests {
         let specs = [spec_ci(0, SortKind::Text, SortDir::Asc, true)];
         let perm = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, None);
         assert_eq!(perm, vec![1, 0]);
+    }
+
+    // ---- 인메모리 정렬(sort_lines) ----
+
+    #[test]
+    fn sort_lines_text_ascending() {
+        let lines = vec![
+            "banana".to_string(),
+            "apple".to_string(),
+            "cherry".to_string(),
+        ];
+        let specs = [spec(0, SortKind::Text, SortDir::Asc)];
+        let order = sort_lines(&lines, &specs, b',', 0);
+        assert_eq!(order, vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn sort_lines_multi_matches_mmap_path() {
+        // 인메모리 정렬이 mmap 경로(extract_and_multi_sort)와 같은 결과.
+        let content = b"B,30\nA,20\nB,10\nA,40\n";
+        let (src, idx) = open_indexed(content);
+        let specs = [
+            spec(0, SortKind::Text, SortDir::Asc),
+            spec(1, SortKind::Number, SortDir::Asc),
+        ];
+        let mmap_order = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, None);
+        let lines: Vec<String> = "B,30\nA,20\nB,10\nA,40"
+            .split('\n')
+            .map(|s| s.to_string())
+            .collect();
+        let mem_order = sort_lines(&lines, &specs, b',', 0);
+        assert_eq!(mmap_order, mem_order);
+    }
+
+    #[test]
+    fn sort_lines_respects_data_start() {
+        // data_start=1이면 헤더(0행) 제외, 데이터만 정렬한 논리 행번호 반환.
+        let lines = vec![
+            "name".to_string(),
+            "banana".to_string(),
+            "apple".to_string(),
+        ];
+        let specs = [spec(0, SortKind::Text, SortDir::Asc)];
+        let order = sort_lines(&lines, &specs, b',', 1);
+        // apple(2), banana(1) → [2,1]
+        assert_eq!(order, vec![2, 1]);
     }
 }
