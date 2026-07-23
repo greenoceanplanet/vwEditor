@@ -16,6 +16,9 @@
 - 저장은 임시 파일(`<대상>.tmp`)에 다 쓴 뒤 `std::fs::rename`으로 교체. 실패 시 임시 파일 삭제, 원본 보존.
 - 인메모리 정렬은 기존 sort.rs의 키 인코딩(text_key/number_key/col_key 정신)을 재사용하되, mmap/offset 대신 `&[String]`에서 직접 필드를 뽑는다.
 - 편집 모드에서 정렬은 `lines`를 실제 재배치한다(헤더 행 lines[0]은 has_header면 제외·맨 앞 고정). permutation 뷰 매핑은 뷰 전용 모드에서만.
+- 파싱 오류 행 정의(사용자 확정): `FieldCount`(필드 수가 기대치와 다름) / `UnbalancedQuote`
+  (따옴표 개수 홀수) / `DecodeError`(대체문자 U+FFFD 포함). **빈 행은 오류가 아니다.**
+  검사 시점 = 파일 열 때 자동(인덱싱 완료 후 백그라운드). 오류 창은 목록 + 클릭 시 그 행으로 이동.
 - 커밋 메시지 말미: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
 - Windows 환경, 로컬 작업만(origin push는 명시 지시 없이는 안 함).
 
@@ -1608,6 +1611,432 @@ git commit -m "feat: 편집 모드 정렬 재배치 + 메뉴·저장 다이얼�
 
 ---
 
+### Task 12: 파싱 오류 행 검출 (순수 로직)
+
+> 사용자 추가 요구: "파싱하다가 전체 규칙과 어긋나는 행이 있으면 오류 행들 리스트
+> 반환해서 보고. 별도 창에서 관리." 검사 시점 = 파일 열 때 자동.
+
+**Files:**
+- Create: `src/validate.rs`
+- Modify: `src/main.rs` (`mod validate;`)
+- Test: `src/validate.rs`
+
+**Interfaces:**
+- Consumes: `crate::parse::{Encoding, decode_line, split_fields}`, `crate::source::Source`, `crate::index::LineIndex`.
+- Produces:
+  - `pub enum RowIssue { FieldCount { got: usize, expected: usize }, UnbalancedQuote, DecodeError }`
+  - `pub struct RowError { pub logical: usize, pub issue: RowIssue, pub preview: String }`
+  - `pub fn check_line(line: &str, delim: u8, expected_cols: usize) -> Option<RowIssue>` — 한 줄 검사(순수).
+  - `pub fn scan_errors(source, index, enc, delim, expected_cols, data_start, limit, progress) -> Vec<RowError>` — 전체 스캔(병렬).
+
+**오류 정의(확정):**
+- `FieldCount`: 필드 수가 expected_cols와 다름(부족/초과 모두).
+- `UnbalancedQuote`: 큰따옴표(`"`) 개수가 홀수 → 열리고 안 닫힘.
+- `DecodeError`: 디코딩 결과에 대체문자(U+FFFD, `\u{FFFD}`)가 포함됨.
+- 빈 행은 오류로 보지 않는다(사용자 결정).
+- `preview`: 해당 줄의 앞부분(최대 120자, 넘으면 `…` 붙임) — 오류 창 목록 표시용.
+- `limit`: 오류가 아주 많은 파일에서 메모리 폭발을 막는 상한(초과분은 버림). 호출측이
+  버려진 개수를 알 수 있도록 상한 도달 시에도 스캔은 계속하되 수집만 멈춘다.
+
+- [ ] **Step 1: main.rs 모듈 선언**
+
+`src/main.rs`의 `mod` 목록에 추가:
+
+```rust
+mod validate;
+```
+
+- [ ] **Step 2: 실패 테스트 작성**
+
+`src/validate.rs`를 만들고:
+
+```rust
+use crate::index::LineIndex;
+use crate::parse::{decode_line, split_fields, Encoding};
+use crate::source::Source;
+use rayon::prelude::*;
+use std::sync::Arc;
+
+/// 한 행이 전체 규칙과 어긋나는 유형.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowIssue {
+    /// 필드 수가 기대치와 다름.
+    FieldCount { got: usize, expected: usize },
+    /// 큰따옴표가 열리고 닫히지 않음(개수 홀수).
+    UnbalancedQuote,
+    /// 현재 인코딩으로 디코딩 실패(대체문자 U+FFFD 발생).
+    DecodeError,
+}
+
+/// 오류가 발견된 한 행.
+#[derive(Debug, Clone)]
+pub struct RowError {
+    pub logical: usize,
+    pub issue: RowIssue,
+    /// 목록 표시용 줄 앞부분(최대 PREVIEW_CHARS자).
+    pub preview: String,
+}
+
+/// 오류 창 목록에 보여줄 줄 미리보기 최대 길이(문자).
+const PREVIEW_CHARS: usize = 120;
+
+/// 한 줄을 검사해 첫 번째로 발견된 문제를 돌려준다. 문제 없으면 None.
+/// 검사 순서: 디코드 실패 → 따옴표 불균형 → 필드 수.
+/// 빈 줄은 오류로 보지 않는다.
+pub fn check_line(line: &str, delim: u8, expected_cols: usize) -> Option<RowIssue> {
+    todo!()
+}
+
+/// 줄에서 목록 표시용 미리보기를 만든다(최대 PREVIEW_CHARS자, 넘으면 … 부착).
+pub fn preview_of(line: &str) -> String {
+    todo!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ok_line_has_no_issue() {
+        assert_eq!(check_line("a,b,c", b',', 3), None);
+    }
+
+    #[test]
+    fn field_count_too_few() {
+        assert_eq!(
+            check_line("a,b", b',', 3),
+            Some(RowIssue::FieldCount { got: 2, expected: 3 })
+        );
+    }
+
+    #[test]
+    fn field_count_too_many() {
+        assert_eq!(
+            check_line("a,b,c,d", b',', 3),
+            Some(RowIssue::FieldCount { got: 4, expected: 3 })
+        );
+    }
+
+    #[test]
+    fn unbalanced_quote_detected() {
+        // 따옴표가 홀수 개 → 열리고 안 닫힘.
+        assert_eq!(check_line("a,\"b,c", b',', 3), Some(RowIssue::UnbalancedQuote));
+    }
+
+    #[test]
+    fn balanced_quote_is_ok() {
+        // "b,c" 는 한 필드 → 총 2필드. expected 2면 정상.
+        assert_eq!(check_line("a,\"b,c\"", b',', 2), None);
+    }
+
+    #[test]
+    fn decode_error_detected() {
+        // 대체문자가 들어 있으면 디코드 실패로 본다.
+        let line = "a,\u{FFFD},c";
+        assert_eq!(check_line(line, b',', 3), Some(RowIssue::DecodeError));
+    }
+
+    #[test]
+    fn empty_line_is_not_an_error() {
+        // 빈 줄은 오류로 보지 않는다(사용자 결정).
+        assert_eq!(check_line("", b',', 3), None);
+    }
+
+    #[test]
+    fn preview_truncates_long_line() {
+        let long: String = "x".repeat(300);
+        let p = preview_of(&long);
+        assert!(p.chars().count() <= PREVIEW_CHARS + 1); // + '…'
+        assert!(p.ends_with('…'));
+    }
+
+    #[test]
+    fn preview_keeps_short_line() {
+        assert_eq!(preview_of("abc"), "abc");
+    }
+}
+```
+
+- [ ] **Step 3: 실패 확인**
+
+Run: `cargo test validate::tests`
+Expected: FAIL — `todo!()` 패닉.
+
+- [ ] **Step 4: check_line / preview_of 구현**
+
+```rust
+pub fn check_line(line: &str, delim: u8, expected_cols: usize) -> Option<RowIssue> {
+    // 빈 줄은 오류 아님.
+    if line.is_empty() {
+        return None;
+    }
+    // 1) 디코드 실패(대체문자).
+    if line.contains('\u{FFFD}') {
+        return Some(RowIssue::DecodeError);
+    }
+    // 2) 따옴표 불균형(개수 홀수).
+    if line.bytes().filter(|&b| b == b'"').count() % 2 != 0 {
+        return Some(RowIssue::UnbalancedQuote);
+    }
+    // 3) 필드 수 불일치.
+    let got = split_fields(line, delim).len();
+    if got != expected_cols {
+        return Some(RowIssue::FieldCount { got, expected: expected_cols });
+    }
+    None
+}
+
+pub fn preview_of(line: &str) -> String {
+    let mut out: String = line.chars().take(PREVIEW_CHARS).collect();
+    if line.chars().count() > PREVIEW_CHARS {
+        out.push('…');
+    }
+    out
+}
+```
+
+- [ ] **Step 5: 테스트 통과 확인**
+
+Run: `cargo test validate::tests`
+Expected: PASS (9 tests).
+
+- [ ] **Step 6: scan_errors 테스트 추가**
+
+`src/validate.rs` tests에 추가:
+
+```rust
+    /// 파일을 열어 인덱싱 완료까지 기다린 (Source, LineIndex)를 만든다.
+    fn open_indexed(content: &[u8]) -> (Arc<Source>, LineIndex) {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!("tv_val_{}_{}.csv", std::process::id(), id));
+        std::fs::File::create(&p).unwrap().write_all(content).unwrap();
+        let src = Arc::new(crate::source::open(&p).unwrap());
+        let idx = LineIndex::new(src.len());
+        let ctx = egui::Context::default();
+        crate::indexer::spawn_indexer(src.clone(), idx.clone(), Encoding::Utf8, ctx)
+            .join()
+            .unwrap();
+        (src, idx)
+    }
+
+    #[test]
+    fn scan_finds_bad_rows_with_logical_numbers() {
+        // 0: 헤더 a,b,c / 1: 정상 / 2: 필드 2개(부족) / 3: 정상
+        let (src, idx) = open_indexed(b"a,b,c\n1,2,3\n4,5\n6,7,8\n");
+        let errs = scan_errors(&src, &idx, Encoding::Utf8, b',', 3, 1, 100, None);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].logical, 2);
+        assert_eq!(errs[0].issue, RowIssue::FieldCount { got: 2, expected: 3 });
+        assert_eq!(errs[0].preview, "4,5");
+    }
+
+    #[test]
+    fn scan_respects_data_start_skipping_header() {
+        // 헤더 자체가 필드 수가 달라도 data_start=1이면 검사 대상 아님.
+        let (src, idx) = open_indexed(b"only_one_col\n1,2,3\n");
+        let errs = scan_errors(&src, &idx, Encoding::Utf8, b',', 3, 1, 100, None);
+        assert!(errs.is_empty(), "헤더 행은 검사에서 제외");
+    }
+
+    #[test]
+    fn scan_results_sorted_by_logical() {
+        // 오류가 여러 개면 논리 행번호 오름차순으로 정렬돼 나와야 한다.
+        let (src, idx) = open_indexed(b"a,b\n1\n2,3\n4\n5\n");
+        let errs = scan_errors(&src, &idx, Encoding::Utf8, b',', 2, 1, 100, None);
+        let nums: Vec<usize> = errs.iter().map(|e| e.logical).collect();
+        assert_eq!(nums, vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn scan_limit_caps_collected_errors() {
+        // limit=2면 오류가 3개여도 2개만 수집.
+        let (src, idx) = open_indexed(b"a,b\n1\n2\n3\n");
+        let errs = scan_errors(&src, &idx, Encoding::Utf8, b',', 2, 1, 2, None);
+        assert_eq!(errs.len(), 2);
+    }
+```
+
+- [ ] **Step 7: scan_errors 구현**
+
+```rust
+/// 데이터 행 전체를 병렬 스캔해 규칙에 어긋난 행을 모은다.
+/// - `expected_cols`: 기대 컬럼 수(보통 헤더 필드 수 또는 다수 행의 필드 수).
+/// - `data_start`: 검사 시작 논리 행(헤더 있으면 1).
+/// - `limit`: 수집 상한(초과분은 버림).
+/// - 결과는 논리 행번호 오름차순.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_errors(
+    source: &Arc<Source>,
+    index: &LineIndex,
+    enc: Encoding,
+    delim: u8,
+    expected_cols: usize,
+    data_start: usize,
+    limit: usize,
+    progress: Option<&(dyn Fn(usize) + Sync)>,
+) -> Vec<RowError> {
+    let total = index.line_count();
+    if total <= data_start {
+        return Vec::new();
+    }
+    let (offsets, total_bytes) = index.snapshot();
+    let offsets: &[u64] = &offsets;
+    let bytes = source.as_bytes();
+    let data_rows = total - data_start;
+
+    const CHUNK: usize = 64 * 1024;
+    let mut found: Vec<RowError> = (0..data_rows)
+        .into_par_iter()
+        .chunks(CHUNK)
+        .flat_map(|chunk| {
+            let mut local = Vec::new();
+            for i in chunk {
+                let logical = data_start + i;
+                let Some((s, e)) = LineIndex::range_in(offsets, total_bytes, logical) else {
+                    continue;
+                };
+                let raw = &bytes[s as usize..e as usize];
+                let text = decode_line(raw, enc);
+                let line = text.trim_end_matches(['\r', '\n']);
+                if let Some(issue) = check_line(line, delim, expected_cols) {
+                    local.push(RowError { logical, issue, preview: preview_of(line) });
+                }
+            }
+            if let Some(p) = progress {
+                p(CHUNK.min(local.len().max(1)));
+            }
+            local
+        })
+        .collect();
+
+    found.sort_unstable_by_key(|e| e.logical);
+    found.truncate(limit);
+    found
+}
+```
+
+- [ ] **Step 8: 전체 테스트 통과 확인**
+
+Run: `cargo test validate::tests`
+Expected: PASS (13 tests).
+
+- [ ] **Step 9: 커밋**
+
+```bash
+git add src/validate.rs src/main.rs
+git commit -m "feat: 파싱 오류 행 검출 - 필드수/따옴표/디코드 검사 + 병렬 스캔"
+```
+
+---
+
+### Task 13: 오류 행 창 UI + 파일 열 때 자동 검사
+
+**Files:**
+- Modify: `src/app.rs`
+
+**Interfaces:**
+- Consumes: `crate::validate::{RowError, RowIssue, scan_errors}`.
+- Produces: 파일 열기 시 백그라운드 자동 검사, 도구 메뉴 "오류 행…" 창, 목록 클릭 시 해당 행으로 스크롤.
+
+**Note:** GUI 배선. 순수 로직은 Task 12에서 테스트됨. 컴파일 + 수동 확인.
+
+- [ ] **Step 1: Document/App에 오류 상태 추가**
+
+`Document`에 추가:
+
+```rust
+    /// 파싱 오류 행 목록(파일 열 때 자동 검사 결과).
+    pub row_errors: Vec<crate::validate::RowError>,
+    /// 오류 검사가 진행 중인지(백그라운드).
+    pub error_scan: Option<std::thread::JoinHandle<Vec<crate::validate::RowError>>>,
+```
+
+`open_path`의 Document 리터럴에 `row_errors: Vec::new(), error_scan: None,` 추가.
+
+`App`에 추가:
+
+```rust
+    /// 오류 행 창 표시 여부.
+    pub show_errors_window: bool,
+    /// 오류 목록에서 선택해 이동을 요청한 논리 행(다음 프레임에 스크롤).
+    pub scroll_to_row: Option<usize>,
+```
+
+`Default`에 `show_errors_window: false, scroll_to_row: None,` 추가.
+
+- [ ] **Step 2: 파일 열 때 자동 검사 시작**
+
+`open_path`에서 인덱서를 띄운 뒤, 표 모드(`SeparatorMode::Char`)일 때만 오류 검사를 백그라운드로 시작한다. 인덱싱이 끝나야 전체 행을 볼 수 있으므로, 검사 스레드는 내부에서 인덱서 완료를 기다리거나(간단히는 인덱싱 완료 후 시작), `update()`에서 `Phase::Complete`가 되는 최초 시점에 시작한다.
+
+**권장 구현(단순·정확):** `update()`에서 매 프레임 확인 — 표 모드이고, `Phase::Complete`이고, `row_errors`가 비어 있고, `error_scan`이 None이며, 아직 검사한 적 없으면(별도 플래그 `error_scan_done: bool`) 검사 스레드를 띄운다. 완료되면 결과를 `row_errors`로 옮기고 플래그를 세운다.
+
+`Document`에 `pub error_scan_done: bool` 추가(초기 false). 구분자/인코딩/헤더가 바뀌면 `row_errors.clear(); error_scan_done = false;`로 재검사를 유도한다(기존 정렬 무효화 지점과 같은 곳).
+
+`expected_cols`는 렌더의 `col_count` 계산과 동일한 방식(헤더 필드 수 또는 앞 데이터 행 샘플 최댓값)을 쓴다. `limit`은 상수 `const MAX_ROW_ERRORS: usize = 10_000;`.
+
+- [ ] **Step 3: 도구 메뉴 + 상태바 표시**
+
+- 도구 메뉴에 "오류 행…" 항목 추가 → `show_errors_window = true`. 표 모드일 때만 활성.
+- 상태바에 오류 개수 표시: 오류가 있으면 빨간색으로 `⚠ 오류 행 N개`, 클릭하면 창 열기. 검사 중이면 "오류 검사 중…".
+
+- [ ] **Step 4: 오류 행 창 구현**
+
+`render_errors_window(ctx, app)` 신설:
+
+```rust
+/// 파싱 오류 행 목록 창. 항목을 클릭하면 본문이 해당 행으로 이동한다.
+fn render_errors_window(ctx: &egui::Context, app: &mut App) { /* 아래 요구대로 구현 */ }
+```
+
+요구:
+- `egui::Window::new("오류 행")`, open 토글, resizable.
+- 상단에 요약: `총 N개` + 유형별 개수(필드 수 / 따옴표 / 디코드).
+- 목록은 `egui::ScrollArea` + 각 행 = `[행번호] [유형] [미리보기]`. 행번호는 `app.row_base` 반영.
+  유형 라벨: FieldCount → `필드 {got}개 (기대 {expected})`, UnbalancedQuote → `따옴표 불균형`,
+  DecodeError → `디코딩 실패`.
+- 항목 클릭 시 `app.scroll_to_row = Some(logical)` 설정.
+- 오류가 없으면 "오류 없음" 표시.
+
+`update()` 끝에 렌더 호출 추가:
+
+```rust
+        if self.show_errors_window {
+            render_errors_window(ctx, self);
+        }
+```
+
+- [ ] **Step 5: 클릭 시 해당 행으로 스크롤**
+
+`render_table`에 `scroll_to_row: Option<usize>`를 전달해, Some이면 그 행이 보이도록 스크롤한다. egui_extras `TableBuilder`의 `scroll_to_row(index, align)`을 쓴다(뷰 행 인덱스 기준이므로 논리 행 → 뷰 행 변환 필요: 편집 모드/무정렬이면 `logical - data_start`, permutation 정렬 중이면 `permutation`에서 해당 논리 행의 위치를 찾아 그 인덱스).
+
+스크롤 후 `app.scroll_to_row = None`으로 소비한다.
+
+- [ ] **Step 6: 컴파일 + 전체 테스트**
+
+Run: `cargo build && cargo test`
+Expected: 컴파일 성공, 전체 PASS.
+
+- [ ] **Step 7: 수동 GUI 확인**
+
+일부러 망가진 CSV를 만들어 확인:
+1. 필드 수가 다른 행, 따옴표 안 닫힌 행이 섞인 파일을 연다.
+2. 상태바에 `⚠ 오류 행 N개`가 뜬다.
+3. 도구 → 오류 행… → 목록에 행번호/유형/미리보기가 보인다.
+4. 항목 클릭 → 본문이 그 행으로 스크롤된다.
+
+- [ ] **Step 8: 커밋**
+
+```bash
+git add src/app.rs
+git commit -m "feat: 오류 행 창 - 파일 열 때 자동 검사, 목록·클릭 이동"
+```
+
+---
+
 ### Task 11: .readme 정리 + 최종 검증
 
 **Files:**
@@ -1616,6 +2045,13 @@ git commit -m "feat: 편집 모드 정렬 재배치 + 메뉴·저장 다이얼�
 - [ ] **Step 1: .readme 문서 작성**
 
 `.readme/20260723_편집모드와_저장.md`에 이번 작업을 정리(형식: 한 줄 요약 / 기능 / 설계 / 파일 구조 / 테스트 / 다음 단계). 참고: 기존 `.readme/20260723_*.md` 형식.
+
+반드시 포함할 내용:
+- 편집 모드(전부 RAM 로드, `Vec<String>` 줄 배열), 텍스트 자유 편집 / 셀 편집 두 모드
+- 드래그 선택·통삭제·통붙여넣기·우클릭 메뉴
+- 편집 모드 정렬 = lines 실제 재배치(permutation 아님), 뷰 전용은 기존 permutation 유지
+- 저장/다른 이름으로 저장 + 인코딩 변환(UTF-8/CP949/UTF-16LE·BE, BOM), 임시파일 원자적 rename
+- **파싱 오류 행 검출**(필드 수/따옴표/디코드, 파일 열 때 자동) + 오류 행 창(목록·클릭 이동)
 
 - [ ] **Step 2: 최종 전체 검증**
 
