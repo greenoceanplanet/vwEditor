@@ -94,6 +94,25 @@ fn tab_bar_locked(pending_action: &Option<PendingAction>, show_save_dialog: bool
     pending_action.is_some() || show_save_dialog
 }
 
+/// 드롭된 경로 중 실제로 열 것만 골라낸다. 디렉터리는 건너뛴다 — `open_path`가
+/// 그대로 받으면 열기에 실패해 `self.error`만 채우고 아무것도 하지 않으므로,
+/// 드롭 여러 개 중 폴더 하나 때문에 에러 문구가 그걸로 덮이는 걸 미리 막는다.
+/// 순서는 드롭된 순서 그대로 유지한다(마지막 파일의 탭이 활성화되는 게
+/// 자연스러운 동작이므로 순서가 곧 결과에 드러난다).
+fn droppable_paths(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    paths.into_iter().filter(|p| !p.is_dir()).collect()
+}
+
+/// 드롭 오버레이에 띄울 안내 문구. 1개면 단수, 그 외(0 포함하나 오버레이는
+/// n>0일 때만 그려지므로 실질적으로 2개 이상)는 개수를 밝힌다.
+fn drop_hint_text(n: usize) -> String {
+    if n == 1 {
+        "Drop to open".to_owned()
+    } else {
+        format!("Drop to open {n} files")
+    }
+}
+
 /// 이 동작이 "큰 컬럼 연산" 확인 대상인지. 대상 행 수가 임계치를 넘을 때만
 /// 묻는다. 행 삽입은 한 줄짜리라 범위와 무관하게 항상 즉시 수행한다.
 fn needs_big_op_confirm(act: CellMenuAction, rows: usize) -> bool {
@@ -544,6 +563,74 @@ impl eframe::App for App {
                 self.pending_action = Some(PendingAction::CloseApp);
             }
             // dirty가 아니면 그대로 닫히게 둔다.
+        }
+
+        // 탐색기에서 끌어다 놓은 파일들. raw.dropped_files는 드롭된 프레임에만
+        // 채워지고 다음 프레임엔 비므로, 매 프레임 확인해서 비어 있지 않을
+        // 때만 처리한다.
+        //
+        // 확인/저장 다이얼로그가 떠 있는 동안은 무시한다(`tab_bar_locked`) —
+        // `open_path`는 새 탭을 추가할 때 `active`도 그 탭으로 옮기는데,
+        // `show_save_dialog`가 떠 있을 때 `active`가 바뀌면 저장 다이얼로그가
+        // 엉뚱한 문서를 저장하게 된다. `CloseTab(i)`가 대기 중일 때도, 탭이
+        // 뒤에 추가되는 것 자체는 인덱스 i를 흔들지 않지만(push는 앞쪽을
+        // 건드리지 않는다) 대기 중인 다이얼로그 아래서 탭 집합이 바뀌는 것은
+        // Task A가 막은 것과 같은 종류의 위험이라 함께 잠근다.
+        let locked = tab_bar_locked(&self.pending_action, self.show_save_dialog);
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            if locked {
+                self.error = Some("Close the open dialog before opening files.".to_owned());
+            } else {
+                // 여러 개면 순서대로 연다 — open_path가 매번 탭을 추가하고
+                // 활성화하므로 마지막 파일의 탭이 자연스럽게 활성 탭이 된다.
+                //
+                // 여기서 새 스레드를 만들지 않는다. open_path가 하는 일(파일
+                // 열기 + 앞 64KB로 인코딩/구분자/헤더 감지)은 메인 스레드에서
+                // 파일당 수 밀리초고, 그 직후 spawn_indexer가 문서마다 독립된
+                // 백그라운드 스레드를 띄운다(그 인덱서 자체가 내부적으로
+                // rayon으로 병렬 스캔한다). 그러므로 이 루프를 순차로 돌리는
+                // 것만으로 드롭된 파일들의 인덱싱은 이미 전부 동시에 진행된다
+                // — std::thread::spawn/rayon/채널을 여기 추가로 넣는 것은
+                // 불필요한 중복이다.
+                for p in droppable_paths(dropped) {
+                    self.open_path(&p, ctx);
+                }
+            }
+        }
+
+        // 파일을 창 위로 끌고 오는 중(아직 놓지 않음)이면 "놓으면 열린다"를
+        // 알린다. 잠겨 있을 때는 드롭 자체를 무시하므로 오버레이도 띄우지
+        // 않는다 — 놓아도 아무 일이 안 일어나는데 "여기 놓으세요"라고 하면
+        // 오히려 혼란스럽다. 대신 다른 문구로 "지금은 안 된다"를 알린다.
+        let hovering = ctx.input(|i| i.raw.hovered_files.len());
+        if hovering > 0 {
+            let msg = if locked {
+                "Finish the current dialog first".to_owned()
+            } else {
+                drop_hint_text(hovering)
+            };
+            // layer_painter는 그리기만 하고 입력을 가로채지 않으므로, 드롭
+            // 판정이나 그 아래 UI의 호버링에 영향을 주지 않는다.
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            let screen = ctx.screen_rect();
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                msg,
+                egui::FontId::proportional(24.0),
+                egui::Color32::WHITE,
+            );
         }
 
         // 탭 바 클로저 안에서도 self를 가변 대여할 수 없으므로, 메뉴바의
@@ -3525,6 +3612,68 @@ mod tests {
         app.open_path(std::path::Path::new("nope_xyz.csv"), &ctx);
         assert_eq!(app.docs.len(), 1, "실패한 열기는 기존 탭을 건드리지 않는다");
         assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn droppable_paths_skips_directories() {
+        let file = temp(b"a,b\n1,2\n");
+        let dir = std::env::temp_dir().join(format!("tv_app_dropdir_{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let result = droppable_paths(vec![dir.clone(), file.clone()]);
+        assert_eq!(result, vec![file], "디렉터리는 걸러지고 파일만 남는다");
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn droppable_paths_keeps_order() {
+        let p1 = temp(b"1");
+        let p2 = temp(b"2");
+        let p3 = temp(b"3");
+        let result = droppable_paths(vec![p1.clone(), p2.clone(), p3.clone()]);
+        assert_eq!(result, vec![p1, p2, p3], "드롭 순서가 그대로 보존되어야 한다");
+    }
+
+    #[test]
+    fn dropping_multiple_files_opens_one_tab_each() {
+        let p1 = temp(b"a,b\n1,2\n");
+        let p2 = temp(b"c,d\n3,4\n");
+        let p3 = temp(b"e,f\n5,6\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        // 드롭 처리 루프가 하는 일과 동일: 순서대로 open_path를 호출한다.
+        for p in [&p1, &p2, &p3] {
+            app.open_path(p, &ctx);
+        }
+        assert_eq!(app.docs.len(), 3);
+        assert_eq!(app.active, 2, "마지막으로 연 파일의 탭이 활성화되어야 한다");
+        assert_eq!(app.docs[0].path, p1);
+        assert_eq!(app.docs[1].path, p2);
+        assert_eq!(app.docs[2].path, p3);
+    }
+
+    #[test]
+    fn drop_message_singular_and_plural() {
+        assert_eq!(drop_hint_text(1), "Drop to open");
+        assert_eq!(drop_hint_text(3), "Drop to open 3 files");
+    }
+
+    #[test]
+    fn drop_ignored_while_dialog_open() {
+        // 저장 다이얼로그가 떠 있는 상태(탭 바 잠금)를 재현한다. 이미 있는
+        // tab_switch_blocked_while_save_dialog_open은 "탭 바가 잠기는가"를
+        // 검증하고, 여기서는 그 잠금이 실제로 "드롭이 탭을 추가하지 못하게"
+        // 막는지를 확인한다 — update() 안의 드롭 처리 진입 조건과 동일하게
+        // tab_bar_locked()를 게이트로 써서 open_path 호출 자체를 건너뛴다.
+        let mut app = App {
+            show_save_dialog: true,
+            ..App::default()
+        };
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        if !tab_bar_locked(&app.pending_action, app.show_save_dialog) {
+            app.open_path(&p, &ctx);
+        }
+        assert_eq!(app.docs.len(), 0, "잠겨 있으면 드롭이 탭을 추가하지 않는다");
     }
 
     /// 탭 3개를 열어 둔 App을 만든다. 각 파일 내용은 서로 달라 path로 구분 가능.
