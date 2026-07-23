@@ -1084,8 +1084,14 @@ impl eframe::App for App {
                 find_action = render_find_panel(ctx, doc);
             }
         }
-        if let (Some(act), Some(doc)) = (find_action, self.docs.get_mut(self.active)) {
-            apply_find_action(doc, act);
+        // 추출만 `App`(탭 목록 + active)을 건드리므로 따로 태운다. 나머지는
+        // 활성 `Document` 하나로 끝난다.
+        if let Some(act) = find_action {
+            if act == FindAction::Extract {
+                self.extract_matching_rows();
+            } else if let Some(doc) = self.docs.get_mut(self.active) {
+                apply_find_action(doc, act);
+            }
         }
 
         // 본문: 구분 모드에 따라 표 뷰 / 텍스트 뷰로 분기.
@@ -1349,6 +1355,10 @@ enum FindAction {
     Prev,
     ReplaceOne,
     ReplaceAll,
+    /// 검색어가 든 행만 모아 새 탭으로 추출. 다른 동작과 달리 `Document` 하나로
+    /// 끝나지 않고 `App`(탭 목록)을 건드리므로 `apply_find_action`이 아니라
+    /// `App::extract_matching_rows`가 처리한다.
+    Extract,
 }
 
 /// 문서의 논리 행 수(두 모드 공통). 편집 모드면 버퍼 길이, 아니면 인덱스가
@@ -1527,6 +1537,11 @@ fn apply_find_action(doc: &mut Document, act: FindAction) {
         }
         FindAction::ReplaceOne => replace_one(doc),
         FindAction::ReplaceAll => replace_all_in_doc(doc),
+        // 추출은 탭을 추가하므로 `Document` 하나로는 수행할 수 없다.
+        // 호출부(`update()`)가 이 변형만 `App::extract_matching_rows`로
+        // 돌려보내므로 여기까지 오지 않는다 — 와도 조용히 무시한다
+        // (뷰 모드에서 바꾸기를 무시하는 것과 같은 방어).
+        FindAction::Extract => {}
     }
 }
 
@@ -1695,6 +1710,282 @@ fn replace_all_in_doc(doc: &mut Document) {
     };
 }
 
+// ---------------------------------------------------------------------------
+// 찾기 결과 행 추출 (Extract Rows)
+// ---------------------------------------------------------------------------
+
+/// 추출이 훑을 구간과 결과 맨 앞에 붙일 헤더 행의 유무.
+///
+/// 표 모드에서 `has_header`면 0번 행은 헤더다. 헤더는 **검색 대상에서 뺀다** —
+/// 헤더에 검색어가 우연히 들어 있다고 "그 행이 매치됐다"고 추출하면, 데이터가
+/// 하나도 안 맞는데 결과가 1행짜리로 나오는 거짓 성공이 된다. 대신 결과 맨
+/// 앞에는 **무조건** 붙인다(컬럼 이름이 없으면 새 탭이 읽을 수 없는 표가 된다).
+///
+/// 텍스트 모드거나 `has_header`가 false면 헤더 개념이 없으므로 0행부터 훑고
+/// 아무것도 앞에 붙이지 않는다.
+///
+/// `update()`와 테스트가 이 함수 하나를 공유해야 한다 — 판단식을 양쪽에 따로
+/// 적으면(`plan_dropped_files` 주석 참조) 실제 규칙을 뒤집어도 테스트는 자기
+/// 사본만 보고 통과한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExtractPlan {
+    /// 훑기 시작할 논리 행(헤더가 있으면 1).
+    scan_from: usize,
+    /// 결과 맨 앞에 헤더 행(논리 0)을 붙일지.
+    prepend_header: bool,
+}
+
+fn extract_plan(has_header: bool, sep: SeparatorMode) -> ExtractPlan {
+    // 헤더는 표 모드에서만 의미가 있다. 텍스트 모드는 `has_header`가 false로
+    // 오게 되어 있지만(`open_path`의 감지), 편집 중 구분자를 바꾸는 경로가
+    // 있으므로 여기서도 모드를 함께 본다.
+    let header = has_header && matches!(sep, SeparatorMode::Char(_));
+    ExtractPlan {
+        scan_from: if header { 1 } else { 0 },
+        prepend_header: header,
+    }
+}
+
+/// 추출을 지금 수행해도 되는가. 탭을 추가하고 `active`를 바꾸는 동작이므로
+/// 탭 바가 잠겨 있으면(저장 다이얼로그·확인 창) 막는다 — 잠금 중에 `active`가
+/// 움직이면 그 다이얼로그가 엉뚱한 문서를 겨눈다(`tab_bar_locked` 주석 참조).
+/// 드롭 처리가 `plan_dropped_files`로 하는 것과 같은 규율로, 실제 가드와
+/// 테스트가 **이 함수 하나**를 공유한다.
+fn extract_allowed(app: &App) -> bool {
+    !tab_bar_locked(&app.pending_action, app.show_save_dialog)
+}
+
+/// 잠겨 있어 추출을 막았을 때 상태 문구. `plan_dropped_files`의 안내와 같은 결.
+const EXTRACT_LOCKED_STATUS: &str = "Close the open dialog first";
+
+/// 추출된 행 텍스트로 뷰 모드 `Document`를 만든다.
+///
+/// **왜 인메모리 `Source` + 동기 인덱스인가.** `Document`는 `Arc<Source>`와
+/// `LineIndex`를 전제로 만들어져 있고, 표 렌더·정렬·찾기·편집 모드 진입이 전부
+/// 그 둘을 통해 돈다. 추출본을 "편집 버퍼만 있는 반쪽 문서"로 만들면 편집 모드를
+/// 끄는 순간 뷰 경로(`decode_logical_line`)가 빈 소스를 읽어 화면이 비어 버린다.
+/// 그래서 추출 결과를 원본과 **같은 인코딩**으로 인코딩해 `Source::from_bytes`로
+/// 감싸고, 그 바이트 위에 인덱스를 채워 정상적인 뷰 모드 문서를 만든다.
+///
+/// **인덱스는 백그라운드 없이 동기로 채운다.** 바이트가 이미 램에 다 있으므로
+/// 스레드를 띄울 이유가 없고(진행률을 보여줄 대상도 없다), 무엇보다 `indexer`
+/// 핸들이 None인 채로 `Phase::Complete`가 되어야 상태바가 "인덱싱 중"으로
+/// 남지 않는다. offset은 인덱서와 **같은 규칙**으로 만든다:
+/// 첫 줄 시작(0)은 내용이 있을 때만, 개행 **다음** 위치가 새 줄 시작이며
+/// 파일 끝 개행 뒤의 빈 줄은 세지 않는다(`indexer::scan_segment` 주석 참조).
+/// 우리가 만든 바이트는 "행마다 개행 하나로 끝나는" 형태라 이 규칙대로면
+/// 정확히 `lines.len()`개의 offset이 나온다.
+fn build_extracted_doc(
+    lines: &[String],
+    enc: Encoding,
+    sep: SeparatorMode,
+    has_header: bool,
+    newline: crate::edit::Newline,
+    path_label: String,
+) -> Document {
+    let nl = match newline {
+        crate::edit::Newline::Lf => "\n",
+        crate::edit::Newline::CrLf => "\r\n",
+    };
+    let nl_bytes = crate::save::encode_bytes(nl, enc);
+    let mut bytes: Vec<u8> = Vec::new();
+    // 줄 시작 offset을 바이트를 쌓으면서 그 자리에서 기록한다 — 다 만든 뒤
+    // 다시 스캔하면 UTF-16에서 개행 패턴을 또 찾아야 하고, 그 계산이 여기
+    // 인코딩 로직과 어긋나면 행이 밀린다. 쌓는 쪽이 곧 진실이다.
+    let mut offsets: Vec<u64> = Vec::with_capacity(lines.len());
+    for line in lines {
+        offsets.push(bytes.len() as u64);
+        bytes.extend_from_slice(&crate::save::encode_bytes(line, enc));
+        bytes.extend_from_slice(&nl_bytes);
+    }
+    let total = bytes.len() as u64;
+    let src = Arc::new(Source::from_bytes(bytes));
+    let index = LineIndex::new(total);
+    index.replace_offsets(offsets);
+    index.set_bytes_done(total);
+    index.set_phase(Phase::Complete);
+
+    let custom_sep_input = match sep {
+        SeparatorMode::Char(b) if b.is_ascii_graphic() => (b as char).to_string(),
+        _ => String::new(),
+    };
+
+    Document {
+        source: src,
+        index,
+        enc,
+        sep,
+        has_header,
+        // 동기로 다 채웠으므로 붙일 인덱서 스레드가 없다.
+        indexer: None,
+        // 디스크에 대응하는 파일이 없다. 저장하면 `render_save_dialog`가
+        // 빈 경로를 보고 "다른 이름으로 저장"으로 폴백한다(그 지점 주석 참조).
+        path: std::path::PathBuf::new(),
+        path_label,
+        custom_sep_input,
+        // 아래는 전부 초기값 — 추출본은 원본의 선택/정렬/편집 상태를 물려받지
+        // 않는다(추출 순서가 곧 원본 순서이므로 정렬도 없다).
+        selected_col: None,
+        sort: None,
+        sort_job: None,
+        show_sort_dialog: false,
+        sort_specs: Vec::new(),
+        edit: None,
+        editing_cell: None,
+        cell_edit_text: String::new(),
+        cell_sel: None,
+        cell_drag_active: false,
+        text_sel: None,
+        text_caret: crate::edit::TextPos { line: 0, col: 0 },
+        text_drag_active: false,
+        pending_column_op: None,
+        // 찾기 패널은 새 탭에서 닫힌 채 시작한다(검색어도 물려받지 않는다 —
+        // 추출본은 이미 그 검색어로 걸러진 결과라 다시 찾을 이유가 적다).
+        show_find: false,
+        find_query: String::new(),
+        replace_text: String::new(),
+        find_opts: crate::find::FindOptions::default(),
+        last_match: None,
+        find_status: String::new(),
+        find_focus_pending: false,
+        pending_scroll_row: None,
+    }
+}
+
+/// 추출본 탭의 표시 이름. `path`가 비어 있으므로 `tab_label`은 이 문자열을
+/// 그대로 쓰고 24자에서 자른다 — 그래서 **앞부분에 구분되는 정보**를 둔다.
+///
+/// `"[hit] 원본파일명"` 형식을 골랐다. 이유:
+/// - 접두사가 6자로 짧아 24자 예산 대부분이 원본 파일명에 간다. 브리프의 다른
+///   후보 `"Extracted: <파일명> (<N> rows)"`는 접두사만 11자에 뒤의 행 수는
+///   잘려 아예 보이지 않으므로, 탭에서 원본을 구분할 수 없게 된다.
+/// - `[` 로 시작해 파일 탭들 사이에서 "파일이 아닌 탭"임이 한눈에 보인다.
+/// - 행 수는 탭이 아니라 `find_status`("N rows extracted")에 남긴다 —
+///   추출 직후 사용자가 보는 곳은 그쪽이고, 탭 라벨은 오래 남는 식별자다.
+///
+/// 원본에 파일명이 없으면(추출본에서 다시 추출) `path_label`을 그대로 쓰되,
+/// 이미 접두사가 붙어 있으면 **다시 붙이지 않는다** — 추출을 반복할 때마다
+/// `"[hit] [hit] [hit] …"`로 자라면 24자 예산이 접두사로만 차서 정작 원본
+/// 파일명이 사라진다. 몇 번째 추출인지는 탭 라벨이 알려야 할 정보가 아니다.
+fn extracted_label(src: &Document) -> String {
+    const PREFIX: &str = "[hit] ";
+    let name = src
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| src.path_label.clone());
+    if name.is_empty() {
+        "[hit]".to_owned()
+    } else if name.starts_with(PREFIX) {
+        name
+    } else {
+        format!("{PREFIX}{name}")
+    }
+}
+
+impl App {
+    /// 활성 문서에서 현재 검색어가 든 행만 모아 **새 탭**으로 연다.
+    /// 원본 문서는 읽기만 한다(선택/편집 상태를 포함해 아무것도 바꾸지 않되,
+    /// 결과 안내인 `find_status`만 갱신한다).
+    ///
+    /// **큰 문서 확인 다이얼로그를 붙이지 않은 이유.** `BIG_COLUMN_OP_ROWS`
+    /// 확인은 "클릭 한 번에 전 데이터 행이 지워지거나 수백 MB 클립보드가 생기는"
+    /// 되돌리기 어려운 컬럼 연산을 위한 것이다. 추출은 `replace_all_in_doc`이
+    /// 같은 판단을 내린 것과 같은 이유로 그 대상이 아니다 — (a) 사용자가 검색어를
+    /// 직접 타이핑하고 버튼을 누른 **명시적** 동작이고, (b) 원본을 전혀 바꾸지
+    /// 않으므로 "되돌리기"라는 개념 자체가 필요 없다(잘못 눌렀으면 탭을 닫으면
+    /// 끝이다). 남는 비용은 전 행 스캔 시간과 결과 바이트인데, 전자는 정렬 등
+    /// 다른 전 행 연산이 이미 확인 없이 하는 일과 같은 급이고 후자는 **매치된
+    /// 행만큼**이라 매치가 적으면 문서가 아무리 커도 메모리가 늘지 않는다.
+    /// 그래서 여기에 세 번째 확인 단계를 새로 만들지 않는다.
+    ///
+    /// 백그라운드 스레드도 만들지 않는다(브리프 D-6) — 이 코드베이스에서
+    /// 백그라운드로 도는 것은 인덱서와 정렬 잡뿐이고 둘 다 전용 메커니즘이 있다.
+    fn extract_matching_rows(&mut self) {
+        // 탭이 늘고 active가 바뀌는 동작이므로 잠금을 먼저 본다.
+        if !extract_allowed(self) {
+            if let Some(doc) = self.doc_mut() {
+                doc.find_status = EXTRACT_LOCKED_STATUS.to_owned();
+            }
+            return;
+        }
+        let Some(doc) = self.docs.get(self.active) else { return };
+        if doc.find_query.is_empty() {
+            if let Some(doc) = self.doc_mut() {
+                doc.find_status = "Enter text to find".to_owned();
+            }
+            return;
+        }
+        let plan = extract_plan(doc.has_header, doc.sep);
+        let total = doc_line_count(doc);
+        // `matching_lines`는 항상 0부터 훑으므로, 헤더를 검색 대상에서 빼려면
+        // 결과에서 거르는 게 아니라 **훑는 구간 자체**를 옮겨야 한다(그래야
+        // 헤더의 매치가 애초에 만들어지지 않는다). 구간을 옮기는 방법은
+        // `get_line`에서 `scan_from`을 더해 주고 돌려받은 행번호에서 다시
+        // 빼는 것 — 순수 함수 쪽에 "어디부터 훑을지"를 알리지 않아도 된다.
+        let hits: Vec<usize> = crate::find::matching_lines(
+            total.saturating_sub(plan.scan_from),
+            &doc.find_query,
+            &doc.find_opts,
+            |i| logical_line(doc, i + plan.scan_from),
+        )
+        .into_iter()
+        .map(|i| i + plan.scan_from)
+        .collect();
+
+        if hits.is_empty() {
+            // 0행이면 탭을 만들지 않는다 — 빈 탭이 열리면 짜증난다.
+            if let Some(doc) = self.doc_mut() {
+                doc.find_status = "Not found".to_owned();
+            }
+            return;
+        }
+
+        let mut lines: Vec<String> = Vec::with_capacity(hits.len() + 1);
+        if plan.prepend_header {
+            // 헤더 행이 아직 인덱싱되지 않아 읽히지 않으면 빈 줄이라도 넣는다 —
+            // 헤더 자리가 비면 이후 모든 데이터 행이 한 칸씩 올라와 컬럼 이름이
+            // 첫 데이터 행이 되어 버린다(행 수가 어긋나는 것보다 나쁘다).
+            lines.push(logical_line(doc, 0).unwrap_or_default());
+        }
+        // `matching_lines`가 이미 읽어 낸 행을 여기서 **다시** 읽는다. 두 번째
+        // 읽기가 실패하는 경우(`None`)는 `unwrap_or_default`로 빈 줄을 넣어
+        // 행 수를 지킨다 — `filter_map`으로 조용히 버리면 안내 문구가 말하는
+        // 행 수("N rows extracted")와 실제 추출본 행 수가 어긋난다.
+        // (두 읽기 사이에 인덱스가 줄어들 일은 없으므로 실질적으로 일어나지
+        //  않지만, 두 값이 같은 근거로 움직이게 묶어 둔다.)
+        lines.extend(hits.iter().map(|&i| logical_line(doc, i).unwrap_or_default()));
+
+        let newline = doc
+            .edit
+            .as_ref()
+            .map(|e| e.newline)
+            .unwrap_or(crate::edit::Newline::Lf);
+        let new_doc = build_extracted_doc(
+            &lines,
+            doc.enc,
+            doc.sep,
+            plan.prepend_header,
+            newline,
+            extracted_label(doc),
+        );
+        let n = hits.len();
+
+        // 안내 문구는 **원본 탭**에 남긴다. 곧 활성 탭이 새 탭으로 바뀌지만,
+        // 사용자가 원본으로 돌아왔을 때 방금 무슨 일이 있었는지 남아 있어야 한다.
+        if let Some(doc) = self.doc_mut() {
+            doc.find_status = if n == 1 {
+                "1 row extracted".to_owned()
+            } else {
+                format!("{n} rows extracted")
+            };
+        }
+        self.add_document(new_doc);
+    }
+}
+
 /// 찾기 입력란의 고정 `Id`. `update()`의 Escape 게이트(Minor 7 참조)가 "지금
 /// 포커스가 찾기 입력란 자신에 있는가"를 판정하려면 그 위젯의 Id가
 /// 필요한데, 위젯을 그리는 `render_find_panel`과 게이트를 보는 `update()`가
@@ -1746,6 +2037,13 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
             if ui.button("Find Prev").clicked() {
                 action = Some(FindAction::Prev);
             }
+            // 추출은 뷰/편집 모드 둘 다에서 동작한다(찾기와 같다) — 바꾸기처럼
+            // `editing`으로 가두면 안 된다. 검색어가 비었을 때만 비활성.
+            ui.add_enabled_ui(!doc.find_query.is_empty(), |ui| {
+                if ui.button("Extract Rows").clicked() {
+                    action = Some(FindAction::Extract);
+                }
+            });
             ui.separator();
             ui.add_enabled_ui(editing, |ui| {
                 ui.label(crate::theme::chrome_text("Replace:"));
@@ -6619,6 +6917,430 @@ mod tests {
             find_top < find_bottom,
             "찾기 패널이 실제로 높이를 차지해야 한다 (top={find_top}, bottom={find_bottom})"
         );
+    }
+
+    // ---- 찾기 결과 행 추출 (Extract Rows) ----
+
+    /// 추출 테스트용 **뷰 모드** 표 문서. 실제 파일을 CSV로 열고 인덱싱을
+    /// 끝까지 돌린다 — 추출은 뷰 모드에서도 동작해야 하고(브리프 D-5),
+    /// 뷰 경로(`decode_logical_line`)를 지나야 인코딩 처리가 실제로 검증된다.
+    fn extract_test_app(content: &[u8]) -> App {
+        let p = temp(content);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        app.doc_mut().unwrap().indexer.take().unwrap().join().unwrap();
+        app
+    }
+
+    /// 추출본을 `logical_line`으로 처음부터 끝까지 읽어 낸다.
+    fn read_all(doc: &Document) -> Vec<String> {
+        (0..doc_line_count(doc))
+            .map(|i| logical_line(doc, i).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn extract_plan_skips_header_and_prepends_it() {
+        assert_eq!(
+            extract_plan(true, SeparatorMode::Char(b',')),
+            ExtractPlan { scan_from: 1, prepend_header: true }
+        );
+        assert_eq!(
+            extract_plan(false, SeparatorMode::Char(b',')),
+            ExtractPlan { scan_from: 0, prepend_header: false }
+        );
+        // 텍스트 모드는 헤더 개념이 없다.
+        assert_eq!(
+            extract_plan(true, SeparatorMode::None),
+            ExtractPlan { scan_from: 0, prepend_header: false }
+        );
+    }
+
+    #[test]
+    fn extract_includes_header_and_matching_rows() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\nCarol,Seoul\n");
+        assert!(app.doc().unwrap().has_header, "사전 조건: 헤더가 감지된다");
+        app.doc_mut().unwrap().find_query = "Seoul".to_owned();
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), 2);
+        let new_doc = &app.docs[1];
+        assert_eq!(
+            read_all(new_doc),
+            v(&["name,city", "Alice,Seoul", "Carol,Seoul"]),
+            "첫 행이 원본 헤더, 나머지가 매치된 데이터 행"
+        );
+        assert!(new_doc.has_header, "헤더를 붙였으므로 추출본도 헤더를 갖는다");
+    }
+
+    /// 검색어가 헤더에만 있으면 추출 결과는 0행이고 탭이 만들어지지 않는다 —
+    /// 헤더가 검색 대상에 들어가면 데이터가 하나도 안 맞는데도 헤더 한 줄짜리
+    /// 탭이 열리는 거짓 성공이 된다.
+    #[test]
+    fn extract_does_not_search_the_header_row() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\n");
+        app.doc_mut().unwrap().find_query = "city".to_owned();
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), 1, "헤더에만 있는 검색어로는 탭이 열리지 않는다");
+        assert_eq!(app.doc().unwrap().find_status, "Not found");
+    }
+
+    #[test]
+    fn extract_headerless_has_no_header_row() {
+        // 숫자만 있는 CSV는 헤더로 감지되지 않는다. 그래도 방어적으로 끈다.
+        let mut app = extract_test_app(b"1,hit\n2,no\n3,hit\n");
+        app.doc_mut().unwrap().has_header = false;
+        app.doc_mut().unwrap().find_query = "hit".to_owned();
+        app.extract_matching_rows();
+        assert_eq!(
+            read_all(&app.docs[1]),
+            v(&["1,hit", "3,hit"]),
+            "헤더가 없으면 앞에 아무것도 붙지 않는다"
+        );
+        assert!(!app.docs[1].has_header);
+    }
+
+    #[test]
+    fn extract_creates_new_tab_and_leaves_original_untouched() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\n");
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.find_query = "Seoul".to_owned();
+            // 원본의 선택 상태가 추출 때문에 흔들리면 안 된다.
+            doc.cell_sel = Some((2, 0, 2, 1));
+            doc.selected_col = Some(1);
+        }
+        let before_lines = read_all(app.doc().unwrap());
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), 2, "탭이 하나 늘어난다");
+        assert_eq!(app.active, 1, "새 탭이 활성화된다");
+        let orig = &app.docs[0];
+        assert_eq!(read_all(orig), before_lines, "원본 내용은 그대로");
+        assert_eq!(orig.cell_sel, Some((2, 0, 2, 1)), "원본 선택도 그대로");
+        assert_eq!(orig.selected_col, Some(1));
+        assert!(orig.edit.is_none(), "원본이 편집 모드로 끌려 들어가지 않는다");
+    }
+
+    #[test]
+    fn extract_inherits_encoding_and_separator() {
+        // 탭 구분 + CP949(한글). 확장자가 csv라도 내용으로 탭이 잡히도록
+        // 콤마를 쓰지 않는다.
+        let bytes = crate::save::encode_bytes(
+            "이름\t도시\n가가\t서울\n나나\t부산\n",
+            Encoding::Cp949,
+        );
+        let mut app = extract_test_app(&bytes);
+        {
+            let doc = app.doc_mut().unwrap();
+            assert_eq!(doc.enc, Encoding::Cp949, "사전 조건: CP949로 감지");
+            doc.find_query = "서울".to_owned();
+        }
+        let (enc, sep) = {
+            let d = app.doc().unwrap();
+            (d.enc, d.sep)
+        };
+        app.extract_matching_rows();
+        let new_doc = &app.docs[1];
+        assert_eq!(new_doc.enc, enc, "인코딩을 물려받는다");
+        assert_eq!(new_doc.sep, sep, "구분자를 물려받는다");
+    }
+
+    /// **(가) 방식이 실제로 동작하는지 증명하는 핵심 테스트.** 만들어진
+    /// 문서는 인메모리 `Source` + 동기로 채운 `LineIndex`만 갖는다 —
+    /// 그 위에서 `logical_line`(= 뷰 경로 `decode_logical_line`)이 추출된
+    /// 행을 정확히 돌려주어야 한다. 인덱스 offset이 하나라도 어긋나면 행이
+    /// 밀리거나 화면이 빈다. CP949 + 한글로 확인해 인코딩 왕복도 함께 건다.
+    #[test]
+    fn extracted_doc_is_readable_through_logical_line() {
+        let bytes = crate::save::encode_bytes(
+            "이름,도시\n가가,서울\n나나,부산\n다다,서울\n",
+            Encoding::Cp949,
+        );
+        let mut app = extract_test_app(&bytes);
+        {
+            let doc = app.doc_mut().unwrap();
+            assert_eq!(doc.enc, Encoding::Cp949, "사전 조건: CP949");
+            assert!(doc.has_header, "사전 조건: 헤더 감지");
+            doc.find_query = "서울".to_owned();
+        }
+        app.extract_matching_rows();
+        let new_doc = &app.docs[1];
+        assert_eq!(
+            doc_line_count(new_doc),
+            3,
+            "인덱스가 헤더 1 + 매치 2 = 3행을 알아야 한다"
+        );
+        assert_eq!(
+            read_all(new_doc),
+            v(&["이름,도시", "가가,서울", "다다,서울"]),
+            "뷰 경로 디코딩이 추출된 행을 그대로 돌려준다"
+        );
+        assert_eq!(
+            new_doc.index.status().phase,
+            Phase::Complete,
+            "동기로 다 채웠으므로 인덱싱은 완료 상태다"
+        );
+        assert!(new_doc.indexer.is_none(), "백그라운드 인덱서를 띄우지 않는다");
+        // 추출본에서 편집 모드로 들어가도 같은 내용이 읽혀야 한다
+        // (뷰 모드로 되돌릴 수 있는 온전한 문서라는 뜻).
+        let new_doc = &mut app.docs[1];
+        enter_edit_mode(new_doc);
+        assert_eq!(read_all(new_doc), v(&["이름,도시", "가가,서울", "다다,서울"]));
+        exit_edit_mode(new_doc);
+        assert_eq!(read_all(new_doc), v(&["이름,도시", "가가,서울", "다다,서울"]));
+    }
+
+    /// CRLF 원본에서 추출해도 행이 밀리지 않는다(개행이 2바이트여도 offset이
+    /// 맞아야 한다). 편집 버퍼의 `newline`을 물려받는 경로를 함께 탄다.
+    #[test]
+    fn extract_preserves_crlf_newline_of_edit_buffer() {
+        let mut app = extract_test_app(b"a,b\r\n1,hit\r\n2,no\r\n3,hit\r\n");
+        {
+            let doc = app.doc_mut().unwrap();
+            enter_edit_mode(doc);
+            assert_eq!(
+                doc.edit.as_ref().unwrap().newline,
+                crate::edit::Newline::CrLf,
+                "사전 조건: CRLF로 읽힌다"
+            );
+            doc.has_header = true;
+            doc.find_query = "hit".to_owned();
+        }
+        app.extract_matching_rows();
+        assert_eq!(read_all(&app.docs[1]), v(&["a,b", "1,hit", "3,hit"]));
+    }
+
+    #[test]
+    fn extract_zero_matches_creates_no_tab() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\n");
+        app.doc_mut().unwrap().find_query = "zzz".to_owned();
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), 1, "매치가 없으면 빈 탭을 만들지 않는다");
+        assert_eq!(app.doc().unwrap().find_status, "Not found");
+    }
+
+    #[test]
+    fn extract_with_empty_query_does_nothing() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\n");
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), 1);
+        assert_eq!(app.doc().unwrap().find_status, "Enter text to find");
+    }
+
+    /// 저장/확인 다이얼로그가 떠 있으면(탭 바 잠금) 추출이 탭을 추가하지 않는다.
+    /// **실제 가드(`extract_allowed`)를 통과하는 진짜 경로**인
+    /// `extract_matching_rows`를 호출한다 — 가드 식을 테스트에 복붙하면
+    /// `extract_matching_rows` 안의 가드를 지워도 이 테스트가 계속 통과한다.
+    #[test]
+    fn extract_blocked_while_dialog_open() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\n");
+        app.doc_mut().unwrap().find_query = "Seoul".to_owned();
+        // (1) 저장 다이얼로그.
+        app.show_save_dialog = true;
+        assert!(!extract_allowed(&app), "사전 조건: 잠긴 상태");
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), 1, "저장 다이얼로그 중에는 탭이 늘지 않는다");
+        assert_eq!(app.active, 0, "active도 움직이지 않는다");
+        assert_eq!(app.doc().unwrap().find_status, EXTRACT_LOCKED_STATUS);
+        // (2) 확인 다이얼로그.
+        app.show_save_dialog = false;
+        app.pending_action = Some(PendingAction::ExitEditMode);
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), 1, "확인 다이얼로그 중에도 탭이 늘지 않는다");
+        // (3) 잠금이 풀리면 정상 동작한다 — 위의 0건이 "잠금 때문"임을 확정한다.
+        app.pending_action = None;
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), 2, "잠금이 풀리면 추출된다");
+    }
+
+    /// 추출본은 `path`가 비어 있으므로 `tab_label`이 `path_label`을 쓴다.
+    /// 원본 파일명이 라벨 앞부분(24자 예산 안)에 보여야 탭에서 구분된다.
+    #[test]
+    fn extracted_tab_label_shows_source_file_name() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\n");
+        let file_name = app
+            .doc()
+            .unwrap()
+            .path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        app.doc_mut().unwrap().find_query = "Seoul".to_owned();
+        app.extract_matching_rows();
+        let new_doc = &app.docs[1];
+        assert!(new_doc.path.as_os_str().is_empty(), "추출본에는 파일 경로가 없다");
+        assert_eq!(new_doc.path_label, format!("[hit] {file_name}"));
+        let label = tab_label(new_doc);
+        assert!(label.starts_with("[hit]"), "라벨 앞부분에 추출본 표시가 남는다: {label}");
+        assert!(label.chars().count() <= 24, "tab_label의 24자 상한을 지킨다");
+    }
+
+    /// 파일이 없는 추출본을 저장하면 `render_save_dialog`가 "덮어쓰기"가 아니라
+    /// **"다른 이름으로 저장"으로 폴백**해야 한다(빈 경로에 write_file을 부르면
+    /// 실패한다). 그 판정식은 다이얼로그 클로저 밖의 순수한 한 줄이므로
+    /// 여기서 `path`만으로 직접 확인한다.
+    #[test]
+    fn extracted_doc_saves_via_save_as_fallback() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\n");
+        app.doc_mut().unwrap().find_query = "Seoul".to_owned();
+        app.extract_matching_rows();
+        let cur_path = app.doc().unwrap().path.clone();
+        assert!(
+            app.save_as || cur_path.as_os_str().is_empty(),
+            "추출본은 save_as가 아니어도 경로가 비어 파일 선택 창으로 폴백한다"
+        );
+    }
+
+    /// 저장(다른 이름으로) 후 `repoint_source_after_save`가 인메모리 소스를
+    /// 진짜 파일로 갈아 끼운다 — 그 뒤로 그 탭은 저장된 파일을 본다.
+    /// (`render_save_dialog`의 성공 분기가 하는 일을 그대로 재현한다.)
+    #[test]
+    fn extracted_doc_repoints_to_file_after_save_as() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\n");
+        app.doc_mut().unwrap().find_query = "Seoul".to_owned();
+        app.extract_matching_rows();
+        let ctx = egui::Context::default();
+        let target = temp(b"");
+        {
+            let doc = app.doc_mut().unwrap();
+            enter_edit_mode(doc);
+            let opts = crate::save::SaveOptions {
+                enc: doc.enc,
+                bom: false,
+                newline: crate::edit::Newline::Lf,
+            };
+            let lines = doc.edit.as_ref().unwrap().lines.clone();
+            crate::save::write_file(&target, &lines, &opts, None).unwrap();
+            // render_save_dialog의 save_as 성공 분기와 동일한 뒷정리.
+            doc.edit.as_mut().unwrap().dirty = false;
+            doc.path_label = target.display().to_string();
+            doc.path = target.clone();
+            repoint_source_after_save(doc, &target, &ctx).unwrap();
+            doc.indexer.take().unwrap().join().unwrap();
+            exit_edit_mode(doc);
+        }
+        let doc = app.doc().unwrap();
+        assert_eq!(
+            read_all(doc),
+            v(&["name,city", "Alice,Seoul"]),
+            "저장 후 그 탭은 저장된 파일을 본다"
+        );
+        assert_eq!(tab_label(doc), target.file_name().unwrap().to_str().unwrap());
+    }
+
+    /// 추출은 편집 모드에서도 동작해야 한다(찾기와 같다). 편집 버퍼의 내용이
+    /// 추출 대상이 되는지 확인한다 — 버퍼가 파일과 다르면 버퍼가 진실이다.
+    #[test]
+    fn extract_works_in_edit_mode_from_the_buffer() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\n");
+        {
+            let doc = app.doc_mut().unwrap();
+            enter_edit_mode(doc);
+            // 버퍼만 바꾼다(파일은 그대로) — 추출이 버퍼를 보는지 판별한다.
+            doc.edit.as_mut().unwrap().lines[2] = "Bob,Seoul".to_owned();
+            doc.find_query = "Seoul".to_owned();
+        }
+        app.extract_matching_rows();
+        assert_eq!(
+            read_all(&app.docs[1]),
+            v(&["name,city", "Alice,Seoul", "Bob,Seoul"]),
+            "편집 버퍼의 내용이 추출된다"
+        );
+        assert!(app.docs[1].edit.is_none(), "추출본은 뷰 모드로 열린다");
+    }
+
+    /// 추출 결과 안내는 **원본 탭**에 남는다(활성 탭은 새 탭으로 바뀌지만,
+    /// 원본으로 돌아왔을 때 방금 무슨 일이 있었는지 보여야 한다).
+    #[test]
+    fn extract_reports_row_count_on_the_source_tab() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\nCarol,Seoul\n");
+        app.doc_mut().unwrap().find_query = "Seoul".to_owned();
+        app.extract_matching_rows();
+        assert_eq!(app.docs[0].find_status, "2 rows extracted");
+        assert!(app.docs[1].find_status.is_empty(), "새 탭은 안내 문구 없이 시작");
+        // 1행이면 단수(기존 "1 replacement"와 같은 규율).
+        app.active = 0;
+        app.doc_mut().unwrap().find_query = "Busan".to_owned();
+        app.extract_matching_rows();
+        assert_eq!(app.docs[0].find_status, "1 row extracted");
+    }
+
+    /// 추출은 찾기 옵션(대소문자/단어 단위)을 그대로 따른다 — 찾기로 잡히는
+    /// 행과 추출되는 행이 어긋나면 안 된다.
+    #[test]
+    fn extract_respects_find_options() {
+        let mut app = extract_test_app(b"a,b\n1,HIT\n2,hit\n3,hitting\n");
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.has_header = true;
+            doc.find_query = "hit".to_owned();
+            doc.find_opts.match_case = true;
+        }
+        app.extract_matching_rows();
+        assert_eq!(
+            read_all(&app.docs[1]),
+            v(&["a,b", "2,hit", "3,hitting"]),
+            "대소문자 구분이 켜지면 HIT는 빠진다"
+        );
+        app.active = 0;
+        app.doc_mut().unwrap().find_opts.whole_word = true;
+        app.extract_matching_rows();
+        assert_eq!(
+            read_all(&app.docs[2]),
+            v(&["a,b", "2,hit"]),
+            "단어 단위까지 켜지면 hitting도 빠진다"
+        );
+    }
+
+    /// 추출본에서 다시 추출해도 동작한다(파일이 없는 문서를 원본으로 삼는 경우).
+    #[test]
+    fn extract_from_an_extracted_doc() {
+        let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\nCarol,Seoul\n");
+        app.doc_mut().unwrap().find_query = "Seoul".to_owned();
+        app.extract_matching_rows();
+        app.doc_mut().unwrap().find_query = "Carol".to_owned();
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), 3);
+        assert_eq!(read_all(&app.docs[2]), v(&["name,city", "Carol,Seoul"]));
+        assert_eq!(
+            app.docs[2].path_label, app.docs[1].path_label,
+            "접두사가 이미 붙어 있으면 다시 붙이지 않는다(반복 추출로 라벨이 자라면 \
+             24자 예산이 접두사로만 찬다)"
+        );
+    }
+
+    /// 찾기 패널이 실제로 `Extract` 인텐트를 낼 수 있는 상태인지 — 검색어가
+    /// 비어 있으면 버튼이 비활성이어야 한다. 패널을 실제로 그려 프레임이
+    /// 성립하는지도 함께 확인한다.
+    #[test]
+    fn extract_button_renders_in_find_panel() {
+        let mut app = find_test_doc(&["hit"]);
+        app.doc_mut().unwrap().show_find = true;
+        let ctx = egui::Context::default();
+        // 검색어가 빈 상태로 한 프레임.
+        let _ = ctx.run(Default::default(), |ctx| {
+            let doc = app.doc_mut().unwrap();
+            assert_eq!(render_find_panel(ctx, doc), None);
+        });
+        // 검색어가 있는 상태로 한 프레임(버튼이 활성화된 경로).
+        app.doc_mut().unwrap().find_query = "hit".to_owned();
+        let _ = ctx.run(Default::default(), |ctx| {
+            let doc = app.doc_mut().unwrap();
+            assert_eq!(render_find_panel(ctx, doc), None, "클릭하지 않았으면 인텐트도 없다");
+        });
+    }
+
+    /// `apply_find_action`은 추출을 처리하지 않는다(탭을 건드릴 수 없으므로).
+    /// `update()`가 그 변형만 `extract_matching_rows`로 돌려보내는 것이 계약이다.
+    #[test]
+    fn apply_find_action_ignores_extract() {
+        let mut app = find_test_doc(&["hit"]);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "hit".to_owned();
+        apply_find_action(doc, FindAction::Extract);
+        assert_eq!(app.docs.len(), 1, "탭이 늘지 않는다");
     }
 
     /// 찾기 상태는 **탭마다** 독립이어야 한다.

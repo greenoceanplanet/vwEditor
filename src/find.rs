@@ -269,6 +269,40 @@ pub fn replace_all(
     (changed, total)
 }
 
+/// 검색어가 들어 있는 논리 행들의 행번호를 **훑은 순서 그대로** 모은다.
+/// needle이 비면 빈 결과(`find_in_line`과 같은 규칙 — 빈 검색어는 매치가 없다).
+///
+/// `get_line`이 None을 주는 행은 건너뛴다(뷰 모드에서 인덱싱이 아직 그 행에
+/// 닿지 않은 경우 — `find_next`가 같은 이유로 같은 처리를 한다).
+///
+/// **판정은 반드시 `find_in_line`으로 한다.** 여기서 `contains()` 같은 자체
+/// 판정을 쓰면 대소문자/단어 단위 옵션이 찾기와 추출에서 서로 다르게 먹어,
+/// "찾기로는 안 잡히는 행이 추출본에는 들어 있다"는 어긋남이 생긴다.
+/// 매치 개수는 세지 않는다 — 한 행에 여러 번 나와도 그 행은 결과에 한 번뿐이다
+/// (행 단위 추출이므로 개수는 의미가 없다).
+///
+/// `line_count`가 곧 훑는 범위다. 헤더 행을 제외하고 훑는 것은 호출부의
+/// 몫이 아니라 `extract_plan`(`app.rs`)의 몫이다 — 여기는 "어느 구간을
+/// 훑을 것인가"를 모른 채 "주어진 구간에서 매치 행을 고른다"만 한다.
+pub fn matching_lines(
+    line_count: usize,
+    needle: &str,
+    opts: &FindOptions,
+    get_line: impl Fn(usize) -> Option<String>,
+) -> Vec<usize> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..line_count {
+        let Some(text) = get_line(i) else { continue };
+        if !find_in_line(&text, needle, opts).is_empty() {
+            out.push(i);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +648,70 @@ mod tests {
         let (changed, total) = replace_all(&v, "test", "X", &opts(false, true));
         assert_eq!(total, 2);
         assert_eq!(changed, vec![(0, "X testing".to_string()), (1, "X".to_string())]);
+    }
+
+    #[test]
+    fn matching_lines_collects_row_numbers() {
+        let v = lines(&["alpha", "beta hit", "gamma", "hit again"]);
+        let got = matching_lines(4, "hit", &opts(true, false), getter(v));
+        assert_eq!(got, vec![1, 3], "매치가 있는 행번호만 훑은 순서 그대로");
+    }
+
+    #[test]
+    fn matching_lines_counts_each_row_once() {
+        // 한 행에 세 번 나와도 그 행은 결과에 한 번뿐이다(행 단위 추출).
+        let v = lines(&["hit hit hit", "none"]);
+        let got = matching_lines(2, "hit", &opts(true, false), getter(v));
+        assert_eq!(got, vec![0]);
+    }
+
+    #[test]
+    fn matching_lines_empty_needle_is_empty() {
+        let v = lines(&["a", "b"]);
+        assert!(matching_lines(2, "", &opts(true, false), getter(v)).is_empty());
+    }
+
+    #[test]
+    fn matching_lines_skips_none_lines() {
+        // 뷰 모드에서 인덱싱이 아직 닿지 않은 행은 get_line이 None을 준다 —
+        // 건너뛸 뿐 그 자리에서 멈추지 않는다(뒤의 매치도 찾아야 한다).
+        let got = matching_lines(4, "hit", &opts(true, false), |i| match i {
+            0 => Some("hit".to_string()),
+            1 => None,
+            2 => None,
+            3 => Some("hit too".to_string()),
+            _ => None,
+        });
+        assert_eq!(got, vec![0, 3]);
+    }
+
+    #[test]
+    fn matching_lines_respects_match_case() {
+        let v = lines(&["HIT", "hit"]);
+        assert_eq!(
+            matching_lines(2, "hit", &opts(true, false), getter(v.clone())),
+            vec![1],
+            "대소문자 구분이 켜지면 소문자 행만"
+        );
+        assert_eq!(
+            matching_lines(2, "hit", &opts(false, false), getter(v)),
+            vec![0, 1],
+            "꺼지면 둘 다"
+        );
+    }
+
+    #[test]
+    fn matching_lines_respects_whole_word() {
+        let v = lines(&["testing", "a test here"]);
+        assert_eq!(
+            matching_lines(2, "test", &opts(true, true), getter(v.clone())),
+            vec![1],
+            "단어 단위면 'testing'은 매치가 아니다"
+        );
+        assert_eq!(
+            matching_lines(2, "test", &opts(true, false), getter(v)),
+            vec![0, 1]
+        );
     }
 
     #[test]

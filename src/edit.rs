@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn load_lf_basic() {
         // "a\nb\nc\n" → ["a","b","c"], newline=Lf
-        let src = crate::source::Source::from_bytes_for_test(b"a\nb\nc\n");
+        let src = crate::source::Source::from_bytes(b"a\nb\nc\n".to_vec());
         let buf = load_edit_buffer(&src, Encoding::Utf8);
         assert_eq!(buf.lines, vec!["a", "b", "c"]);
         assert_eq!(buf.newline, Newline::Lf);
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn load_crlf_detected() {
-        let src = crate::source::Source::from_bytes_for_test(b"a\r\nb\r\n");
+        let src = crate::source::Source::from_bytes(b"a\r\nb\r\n".to_vec());
         let buf = load_edit_buffer(&src, Encoding::Utf8);
         assert_eq!(buf.lines, vec!["a", "b"]);
         assert_eq!(buf.newline, Newline::CrLf);
@@ -543,14 +543,14 @@ mod tests {
     #[test]
     fn load_no_trailing_newline() {
         // 마지막 줄에 개행이 없으면 그 줄도 포함.
-        let src = crate::source::Source::from_bytes_for_test(b"a\nb");
+        let src = crate::source::Source::from_bytes(b"a\nb".to_vec());
         let buf = load_edit_buffer(&src, Encoding::Utf8);
         assert_eq!(buf.lines, vec!["a", "b"]);
     }
 
     #[test]
     fn load_empty_file_is_one_empty_line() {
-        let src = crate::source::Source::from_bytes_for_test(b"");
+        let src = crate::source::Source::from_bytes(b"".to_vec());
         let buf = load_edit_buffer(&src, Encoding::Utf8);
         assert_eq!(buf.lines, vec![""]);
         assert_eq!(buf.newline, Newline::Lf);
@@ -559,7 +559,7 @@ mod tests {
     #[test]
     fn load_cp949_decodes() {
         // "가나" in CP949 = B0 A1 B3 AA, 한 줄.
-        let src = crate::source::Source::from_bytes_for_test(&[0xB0, 0xA1, 0xB3, 0xAA, b'\n']);
+        let src = crate::source::Source::from_bytes(vec![0xB0, 0xA1, 0xB3, 0xAA, b'\n']);
         let buf = load_edit_buffer(&src, Encoding::Cp949);
         assert_eq!(buf.lines, vec!["가나"]);
     }

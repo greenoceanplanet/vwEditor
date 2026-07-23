@@ -8,7 +8,8 @@ use std::path::Path;
 /// `mmap: None`으로 표현하고, `len`/`slice`/`as_bytes`가 이를 빈 슬라이스로 처리한다.
 pub struct Source {
     mmap: Option<Mmap>,
-    /// 테스트용: 파일 없이 메모리 바이트로 만든 소스. mmap과 배타적.
+    /// 파일 없이 메모리 바이트로 만든 소스. mmap과 배타적.
+    /// (찾기 결과 행 추출처럼 디스크에 대응하는 파일이 없는 문서용.)
     owned: Option<Vec<u8>>,
 }
 
@@ -25,10 +26,15 @@ pub fn open(path: &Path) -> std::io::Result<Source> {
 }
 
 impl Source {
-    /// 테스트 전용: 메모리 바이트로 Source를 만든다.
-    #[cfg(test)]
-    pub fn from_bytes_for_test(bytes: &[u8]) -> Source {
-        Source { mmap: None, owned: Some(bytes.to_vec()) }
+    /// 메모리 바이트로 Source를 만든다. 파일이 없는 문서(찾기 결과 행 추출)와
+    /// 테스트가 함께 쓴다. `Vec`을 그대로 받아 소유권을 넘긴다 — 추출본은
+    /// 수백 MB가 될 수 있으므로 복사를 한 번 더 하지 않는다.
+    ///
+    /// 빈 바이트도 허용된다: `bytes()`가 `owned`가 비면 빈 슬라이스를 주므로
+    /// `open()`의 빈 파일 경로와 같은 상태가 된다(Windows 0바이트 mmap 문제와
+    /// 무관하게 안전).
+    pub fn from_bytes(bytes: Vec<u8>) -> Source {
+        Source { mmap: None, owned: Some(bytes) }
     }
 
     fn bytes(&self) -> &[u8] {
