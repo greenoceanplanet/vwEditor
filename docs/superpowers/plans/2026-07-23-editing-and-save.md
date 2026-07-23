@@ -2414,6 +2414,231 @@ git commit -m "feat: Ctrl+Z/C/X/V 단축키, 컬럼 전체 복사, 선택색 조
 
 ---
 
+### Task 16: Shift+클릭 범위 선택 + 컬럼 연산 성능 수정
+
+> 사용자 보고: (1) "특정 위치 클릭하고 쉬프트 누른채 다른 위치 클릭하면 그 사이에
+> 전체 선택되는 기능은 없네? 이런거 윈도우 기본 기능 아니야?" (2) "특정 컬럼하려고
+> 하면 너무 오래 걸려. 지나치게 오래 걸려"
+
+**Files:**
+- Modify: `src/edit.rs` (성능), `src/app.rs` (Shift+클릭)
+
+#### 문제 1 — 컬럼 연산이 지나치게 느림 (성능 결함)
+
+**원인:** 컬럼을 선택하면 `effective_cell_rect`가 `(data_start, col, line_count-1, col)`
+즉 **전체 행 범위**를 만든다. 그러면 `cells_to_tsv`/`clear_cells`/`paste_tsv`가 행마다
+`parse::split_fields`를 부른다. `split_fields`는 행마다 **csv_core 리더를 새로 생성**하고
+버퍼 `Vec` 두 개를 할당한 뒤 **그 행의 모든 필드를 `String`으로** 만든다 — 컬럼 하나만
+필요한데도. 3억 행이면 리더 3억 개 + String 수십억 개.
+
+**해결:** 이 프로젝트엔 이미 정답이 있다 — 정렬 최적화 때 만든
+`parse::field_slice(line: &[u8], delim: u8, col: usize) -> Option<&[u8]>`
+(할당 없이 해당 필드의 바이트 슬라이스만 반환, 따옴표 인식).
+
+- [ ] **Step 1: 성능 회귀 테스트 먼저**
+
+`src/edit.rs` tests에 추가. 큰 입력에서 현재 구현이 느리다는 걸 시간이 아니라
+**할당 횟수 대신 규모**로 잡기 어렵기 때문에, 여기서는 **정확성 동치 테스트**를 두고
+성능은 벤치(#[ignore])로 잰다:
+
+```rust
+    #[test]
+    fn cells_to_tsv_single_column_matches_split_fields() {
+        // 최적화 경로(단일 컬럼)와 일반 경로가 같은 결과를 내야 한다.
+        let lines = v(&["a,b,c", "d,e,f", "\"x,y\",z,w"]);
+        for col in 0..3 {
+            let fast = cells_to_tsv(&lines, 0, col, 2, col, b',');
+            // 일반 경로를 직접 재현(참조 구현).
+            let mut want = String::new();
+            for (i, l) in lines.iter().enumerate() {
+                if i > 0 {
+                    want.push('\n');
+                }
+                let f = crate::parse::split_fields(l, b',');
+                want.push_str(f.get(col).map(|s| s.as_str()).unwrap_or(""));
+            }
+            assert_eq!(fast, want, "col {col}");
+        }
+    }
+
+    /// 대용량 컬럼 복사 벤치. 무시 상태이며 필요할 때만 돌린다:
+    ///   cargo test --release bench_column_copy -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_column_copy() {
+        use std::time::Instant;
+        let rows = 2_000_000;
+        let lines: Vec<String> = (0..rows).map(|i| format!("{i},bbb,ccc,ddd")).collect();
+        let t = Instant::now();
+        let s = cells_to_tsv(&lines, 0, 1, rows - 1, 1, b',');
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("컬럼 복사 {rows}행: {ms:.0}ms, 결과 {}바이트", s.len());
+    }
+```
+
+- [ ] **Step 2: 테스트 실패/통과 확인**
+
+Run: `cargo test edit::tests::cells_to_tsv_single_column`
+Expected: 현재 구현으로도 PASS(동치성은 이미 성립). 이 테스트는 최적화 후 회귀를 막는 안전망이다.
+
+- [ ] **Step 3: `cells_to_tsv` 최적화**
+
+행마다 전 필드를 String으로 만들지 말고, 필요한 컬럼만 `field_slice`로 뽑는다:
+
+```rust
+pub fn cells_to_tsv(lines: &[String], r0: usize, c0: usize, r1: usize, c1: usize, delim: u8) -> String {
+    let (r0, r1) = (r0.min(r1), r0.max(r1));
+    let (c0, c1) = (c0.min(c1), c0.max(c1));
+    // 결과 크기를 대략 예측해 재할당을 줄인다(행당 평균 16바이트 가정).
+    let mut out = String::with_capacity((r1.saturating_sub(r0) + 1) * 16);
+    for r in r0..=r1 {
+        if r > r0 {
+            out.push('\n');
+        }
+        if r >= lines.len() {
+            continue;
+        }
+        let bytes = lines[r].as_bytes();
+        for c in c0..=c1 {
+            if c > c0 {
+                out.push('\t');
+            }
+            // 할당 없이 해당 필드 슬라이스만. 따옴표로 감싼 값은 그대로
+            // 포함되므로 여기서 벗겨 준다(split_fields와 결과를 맞추기 위함).
+            if let Some(f) = crate::parse::field_slice(bytes, delim, c) {
+                out.push_str(&unquote_field(f));
+            }
+        }
+    }
+    out
+}
+
+/// `field_slice`가 돌려준 raw 필드에서 CSV 인용을 벗긴다.
+/// 감싸는 `"`를 제거하고 내부 `""`를 `"` 하나로 되돌린다. 인용이 아니면
+/// 빌려온 그대로 반환한다(할당 없음).
+fn unquote_field(f: &[u8]) -> std::borrow::Cow<'_, str> {
+    let s = String::from_utf8_lossy(f);
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        std::borrow::Cow::Owned(s[1..s.len() - 1].replace("\"\"", "\""))
+    } else {
+        s
+    }
+}
+```
+
+주의: `field_slice`는 **단일 바이트 구분자 전용**이며 UTF-16에는 부정확하다. 하지만
+`EditBuffer.lines`는 이미 UTF-8 `String`이므로(로드 시 디코딩 완료) 안전하다.
+
+- [ ] **Step 4: `clear_cells`도 같은 문제 — 단일 컬럼 최적화**
+
+`clear_cells`는 값을 비우고 **줄을 다시 조립**해야 하므로 `split_fields`+`join_fields`가
+필요하다. 하지만 **바꿀 게 없는 행은 건너뛸 수 있다**: 대상 필드가 이미 비어 있으면
+재조립을 생략한다.
+
+```rust
+pub fn clear_cells(lines: &mut [String], r0: usize, c0: usize, r1: usize, c1: usize, delim: u8) {
+    let (r0, r1) = (r0.min(r1), r0.max(r1));
+    let (c0, c1) = (c0.min(c1), c0.max(c1));
+    for r in r0..=r1 {
+        if r >= lines.len() {
+            break;
+        }
+        // 이미 전부 비어 있으면 재조립(할당) 자체를 건너뛴다.
+        let already_empty = {
+            let bytes = lines[r].as_bytes();
+            (c0..=c1).all(|c| {
+                crate::parse::field_slice(bytes, delim, c).map_or(true, |f| f.is_empty())
+            })
+        };
+        if already_empty {
+            continue;
+        }
+        let mut fields = split_fields(&lines[r], delim);
+        let hi = c1.min(fields.len().saturating_sub(1));
+        for c in c0..=hi {
+            if c < fields.len() {
+                fields[c].clear();
+            }
+        }
+        lines[r] = join_fields(&fields, delim);
+    }
+}
+```
+
+- [ ] **Step 5: UI 쪽 — 컬럼 전체 연산에 확인 받기**
+
+수백만 행 컬럼을 복사하면 클립보드 문자열이 수백 MB가 될 수 있다. `render_table`의
+컬럼 대상 연산 직전에, 대상 행 수가 임계치를 넘으면 확인 다이얼로그를 띄운다:
+
+```rust
+/// 확인 없이 바로 수행할 컬럼 연산의 최대 행 수. 이보다 크면 사용자에게 묻는다.
+const BIG_COLUMN_OP_ROWS: usize = 1_000_000;
+```
+
+`App`에 `pending_column_op: Option<CellMenuAction>` 같은 상태를 두고, 기존
+`render_confirm_discard_dialog` 패턴으로 "N행에 대해 작업합니다. 계속할까요?"를 묻는다.
+(Task 15 리뷰에서 지적된 "컬럼 선택 상태 우클릭 → 행 삭제가 전 데이터 행을 지운다"
+위험도 이 확인으로 함께 완화된다.)
+
+- [ ] **Step 6: 벤치로 개선 확인**
+
+Run: `cargo test --release bench_column_copy -- --ignored --nocapture`
+최적화 전후 수치를 보고서에 기록한다(200만 행 기준).
+
+#### 문제 2 — Shift+클릭 범위 선택 (Windows 기본 동작)
+
+- [ ] **Step 7: 표 모드 Shift+클릭**
+
+현재 셀 범위 선택은 드래그로만 된다. Windows 표준대로 **클릭 → Shift+클릭**이면
+그 사이 사각 범위가 선택돼야 한다.
+
+`render_table`의 셀 클릭 처리에서:
+- 평소 클릭: `cell_sel = Some((lrow, c, lrow, c))` (기존과 동일, anchor 갱신)
+- **Shift+클릭**: anchor는 그대로 두고 **끝점만** 갱신 →
+  `cell_sel = Some((기존_anchor_r, 기존_anchor_c, lrow, c))`
+
+anchor는 `cell_sel`의 앞 두 값(정규화 전 원본)이 이미 갖고 있다. Shift 여부는
+`ui.input(|i| i.modifiers.shift)`로 읽는다. 기존 드래그 경로(`drag_anchor`/`drag_head`)와
+충돌하지 않게, Shift+클릭은 **anchor를 새로 잡지 않는** 분기로 처리한다.
+
+- [ ] **Step 8: 텍스트 모드 Shift+클릭**
+
+`render_text`도 동일하게: 평소 클릭은 캐럿 이동 + 선택 해제, **Shift+클릭은 기존
+캐럿(또는 기존 선택의 anchor)을 anchor로 유지한 채 caret만 클릭 위치로** 옮겨
+`text_sel = Some((anchor, new_caret))`.
+
+- [ ] **Step 9: Shift+클릭 순수 헬퍼 테스트**
+
+anchor 유지 로직을 순수 함수로 뽑아 테스트한다:
+
+```rust
+    #[test]
+    fn shift_click_keeps_anchor_extends_head() {
+        // 기존 선택 (2,1)-(2,1)에서 (5,3)을 shift+클릭 → (2,1)-(5,3)
+        let prev = Some((2usize, 1usize, 2usize, 1usize));
+        assert_eq!(shift_extend(prev, 5, 3), (2, 1, 5, 3));
+    }
+
+    #[test]
+    fn shift_click_without_previous_selection_starts_there() {
+        // 이전 선택이 없으면 그 셀 단일 선택으로 시작.
+        assert_eq!(shift_extend(None, 4, 2), (4, 2, 4, 2));
+    }
+```
+
+- [ ] **Step 10: 빌드 + 전체 테스트**
+
+Run: `cargo test && cargo build --release`
+
+- [ ] **Step 11: 커밋**
+
+```bash
+git add src/edit.rs src/app.rs
+git commit -m "fix: 컬럼 연산 성능(field_slice로 할당 제거) + Shift+클릭 범위 선택"
+```
+
+---
+
 ### Task 11: .readme 정리 + 최종 검증
 
 **Files:**
