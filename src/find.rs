@@ -127,7 +127,9 @@ pub fn find_in_line(hay: &str, needle: &str, opts: &FindOptions) -> Vec<(usize, 
 /// 텍스트" 계약이다. 두 곳의 요구가 나중에 갈릴 수 있는데(예: 셀만 탭도
 /// 막고 싶어지는 경우) 지금 묶어 두면 한쪽 요구가 다른 쪽을 조용히 끌고
 /// 간다. 지킬 불변식이 같을 뿐 계약이 다르므로 3줄을 각자 갖는다.
-fn sanitize_replacement(s: &str) -> String {
+/// (`app.rs`의 "한 곳만 바꾸기"도 같은 규칙을 써야 하므로 `pub(crate)`다 —
+///  그쪽은 `replace_in_line`을 거치지 않고 매치 구간만 직접 갈아 끼운다.)
+pub(crate) fn sanitize_for_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
@@ -145,7 +147,7 @@ pub fn replace_in_line(
     if hits.is_empty() {
         return (hay.to_owned(), 0);
     }
-    let rep = sanitize_replacement(replacement);
+    let rep = sanitize_for_line(replacement);
     // 매치 위치는 char 인덱스이므로 바이트 오프셋으로 옮겨 잘라 붙인다.
     // `char_indices`를 한 번만 돌아 (char 인덱스 → 바이트 오프셋) 표를 만든다.
     let mut byte_of: Vec<usize> = hay.char_indices().map(|(b, _)| b).collect();
