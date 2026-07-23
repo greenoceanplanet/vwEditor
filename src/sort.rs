@@ -23,6 +23,9 @@ pub struct SortSpec {
     pub col: usize,
     pub kind: SortKind,
     pub dir: SortDir,
+    /// 문자 정렬에서 대소문자 무시(case-insensitive) 여부. true면 ASCII 대문자를
+    /// 소문자로 접어 비교(A와 a를 같게). 숫자 정렬에선 무시된다.
+    pub ci: bool,
 }
 
 /// 다중 정렬 최대 기준 수. 키를 고정 배열 `[u64; MAX_KEYS]`로 담아 캐시 친화적
@@ -54,10 +57,18 @@ type Key = u64;
 const NUM_INVALID: Key = Key::MAX;
 
 /// 문자 필드 바이트 → big-endian pack u64 키(앞 8바이트).
-fn text_key(field: &[u8]) -> Key {
+/// `ci`(case-insensitive)면 ASCII 대문자(A-Z)를 소문자로 접어 대소문자를 같게
+/// 취급한다. 비-ASCII(한글 등 UTF-8 멀티바이트)는 그대로 두므로, ASCII 대소문자
+/// 구분만 무시하는 실용적 동작(대부분의 실데이터 요구를 충족).
+fn text_key(field: &[u8], ci: bool) -> Key {
     let mut buf = [0u8; PREFIX_LEN];
     let n = field.len().min(PREFIX_LEN);
     buf[..n].copy_from_slice(&field[..n]);
+    if ci {
+        for b in buf[..n].iter_mut() {
+            b.make_ascii_lowercase();
+        }
+    }
     Key::from_be_bytes(buf)
 }
 
@@ -153,6 +164,7 @@ pub fn spawn_sort(
     data_start: usize,
     kind: SortKind,
     dir: SortDir,
+    ci: bool,
     ctx: egui::Context,
 ) -> SortJob {
     let total_rows = (index.line_count().saturating_sub(data_start)) as u64;
@@ -182,6 +194,7 @@ pub fn spawn_sort(
             data_start,
             kind,
             dir,
+            ci,
             Some(&progress),
         );
         // 진행률을 100%로 마무리.
@@ -226,6 +239,7 @@ pub fn spawn_multi_sort(
         col: 0,
         kind: SortKind::Text,
         dir: SortDir::Asc,
+        ci: true,
     });
 
     let shared_bg = shared.clone();
@@ -280,6 +294,7 @@ pub fn spawn_multi_sort(
 /// - 비수치(숫자 정렬)/빈값/컬럼 없는 행은 방향과 무관하게 맨 뒤로 간다.
 /// - 안정성: 키가 같으면 원본 행번호 순서를 유지(tie-break).
 /// - `progress`: 키 추출 진행을 알리는 콜백(처리한 행 수 누적). None이면 무시.
+#[allow(clippy::too_many_arguments)]
 pub fn extract_and_sort(
     source: &Arc<Source>,
     index: &LineIndex,
@@ -289,6 +304,7 @@ pub fn extract_and_sort(
     data_start: usize,
     kind: SortKind,
     dir: SortDir,
+    ci: bool,
     progress: Option<&(dyn Fn(usize) + Sync)>,
 ) -> Vec<u32> {
     let total = index.line_count();
@@ -317,13 +333,13 @@ pub fn extract_and_sort(
     keyed
         .par_chunks_mut(CHUNK)
         .enumerate()
-        .for_each(|(ci, chunk)| {
-            let base = ci * CHUNK;
+        .for_each(|(chunk_idx, chunk)| {
+            let base = chunk_idx * CHUNK;
             for (j, slot) in chunk.iter_mut().enumerate() {
                 let i = base + j;
                 let logical = data_start + i;
                 let (key, truncated) =
-                    extract_key_fast(bytes, offsets, total_bytes, enc, delim, col, kind, logical);
+                    extract_key_fast(bytes, offsets, total_bytes, enc, delim, col, kind, ci, logical);
                 *slot = (key, truncated, logical as u32);
             }
             if let Some(p) = progress {
@@ -345,12 +361,16 @@ pub fn extract_and_sort(
                 if kind == SortKind::Text && a.1 && b.1 {
                     // 앞 8바이트만 같음(양쪽 truncated) → 원본 전체로 tie-break.
                     // 락 없는 offsets 슬라이스 + mmap 바이트로 직접 비교.
-                    let fa = full_field_fast(bytes, offsets, total_bytes, enc, delim, col, a.2 as usize);
-                    let fb = full_field_fast(bytes, offsets, total_bytes, enc, delim, col, b.2 as usize);
-                    fa.as_deref()
-                        .unwrap_or(&[])
-                        .cmp(fb.as_deref().unwrap_or(&[]))
-                        .then_with(|| a.2.cmp(&b.2))
+                    let mut fa = full_field_fast(bytes, offsets, total_bytes, enc, delim, col, a.2 as usize)
+                        .unwrap_or_default();
+                    let mut fb = full_field_fast(bytes, offsets, total_bytes, enc, delim, col, b.2 as usize)
+                        .unwrap_or_default();
+                    // ci면 tie-break 비교도 소문자로 접어야 앞 키와 정책이 일관된다.
+                    if ci {
+                        fa.make_ascii_lowercase();
+                        fb.make_ascii_lowercase();
+                    }
+                    fa.cmp(&fb).then_with(|| a.2.cmp(&b.2))
                 } else {
                     a.2.cmp(&b.2)
                 }
@@ -380,7 +400,7 @@ pub fn extract_and_sort(
 fn col_key(field: Option<&[u8]>, spec: SortSpec) -> u64 {
     let raw = match spec.kind {
         SortKind::Text => match field {
-            Some(f) => text_key(f),
+            Some(f) => text_key(f, spec.ci),
             None => 0, // 컬럼 없음/빈값 = 사전순 맨 앞
         },
         SortKind::Number => match field {
@@ -498,6 +518,7 @@ fn extract_key_fast(
     delim: u8,
     col: usize,
     kind: SortKind,
+    ci: bool,
     logical: usize,
 ) -> (Key, bool) {
     let Some((s, e)) = LineIndex::range_in(offsets, total_bytes, logical) else {
@@ -509,7 +530,7 @@ fn extract_key_fast(
         Encoding::Utf8 | Encoding::Cp949 => {
             let line = trim_newline(raw);
             match parse::field_slice(line, delim, col) {
-                Some(field) => make_key(field, kind),
+                Some(field) => make_key(field, kind, ci),
                 None => (empty_key(kind), false),
             }
         }
@@ -517,7 +538,7 @@ fn extract_key_fast(
             let text = parse::decode_line(raw, enc);
             let fields = parse::split_fields(text.trim_end_matches(['\r', '\n']), delim);
             match fields.get(col) {
-                Some(f) => make_key(f.as_bytes(), kind),
+                Some(f) => make_key(f.as_bytes(), kind, ci),
                 None => (empty_key(kind), false),
             }
         }
@@ -560,10 +581,10 @@ fn empty_key(kind: SortKind) -> Key {
 }
 
 /// 반환: (키, truncated). 문자 키는 필드가 PREFIX_LEN(8바이트) 초과면 truncated=true.
-/// 숫자 키는 값 전체를 담으므로 항상 false.
-fn make_key(field: &[u8], kind: SortKind) -> (Key, bool) {
+/// 숫자 키는 값 전체를 담으므로 항상 false. `ci`는 문자 정렬 대소문자 무시.
+fn make_key(field: &[u8], kind: SortKind, ci: bool) -> (Key, bool) {
     match kind {
-        SortKind::Text => (text_key(field), field.len() > PREFIX_LEN),
+        SortKind::Text => (text_key(field, ci), field.len() > PREFIX_LEN),
         SortKind::Number => (number_key(field), false),
     }
 }
@@ -609,14 +630,14 @@ mod tests {
         // 컬럼 0을 문자 오름차순: banana, apple, cherry → apple, banana, cherry
         // 원본 행번호: 0 banana, 1 apple, 2 cherry → permutation [1,0,2]
         let (src, idx) = open_indexed(b"banana\napple\ncherry\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, false, None);
         assert_eq!(perm, vec![1, 0, 2]);
     }
 
     #[test]
     fn text_sort_descending() {
         let (src, idx) = open_indexed(b"banana\napple\ncherry\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Desc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Desc, false, None);
         // cherry, banana, apple → 원본 [2,0,1]
         assert_eq!(perm, vec![2, 0, 1]);
     }
@@ -626,14 +647,14 @@ mod tests {
         // 문자면 "10" < "2" < "9" 지만, 숫자면 2 < 9 < 10 이어야 한다.
         // 원본: 0 "10", 1 "2", 2 "9" → 숫자 오름 permutation [1,2,0]
         let (src, idx) = open_indexed(b"10\n2\n9\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, false, None);
         assert_eq!(perm, vec![1, 2, 0]);
     }
 
     #[test]
     fn number_sort_descending() {
         let (src, idx) = open_indexed(b"10\n2\n9\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Desc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Desc, false, None);
         // 10, 9, 2 → 원본 [0,2,1]
         assert_eq!(perm, vec![0, 2, 1]);
     }
@@ -643,7 +664,7 @@ mod tests {
         // 숫자 정렬에서 비수치("abc")는 맨 뒤. 원본: 0 "5", 1 "abc", 2 "1"
         // 오름: 1, 5, [abc] → [2,0,1]
         let (src, idx) = open_indexed(b"5\nabc\n1\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, false, None);
         assert_eq!(perm, vec![2, 0, 1]);
     }
 
@@ -651,7 +672,7 @@ mod tests {
     fn non_numeric_goes_last_descending_too() {
         // 내림차순에서도 비수치는 맨 뒤(방향 무관하게 뒤).
         let (src, idx) = open_indexed(b"5\nabc\n1\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Desc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Desc, false, None);
         // 내림: 5, 1, [abc] → [0,2,1]
         assert_eq!(perm, vec![0, 2, 1]);
     }
@@ -661,7 +682,7 @@ mod tests {
         // 같은 키(둘 다 "x")면 원본 행번호 순서 유지(tie-break).
         // 원본: 0 "x", 1 "a", 2 "x" → 문자 오름: a(1), x(0), x(2) → [1,0,2]
         let (src, idx) = open_indexed(b"x\na\nx\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, false, None);
         assert_eq!(perm, vec![1, 0, 2]);
     }
 
@@ -671,7 +692,7 @@ mod tests {
         // 원본(헤더 제외 가정 data_start=0): 0 "a,30", 1 "b,10", 2 "c,20"
         // age 오름: 10(1),20(2),30(0) → [1,2,0]
         let (src, idx) = open_indexed(b"a,30\nb,10\nc,20\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 1, 0, SortKind::Number, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 1, 0, SortKind::Number, SortDir::Asc, false, None);
         assert_eq!(perm, vec![1, 2, 0]);
     }
 
@@ -681,7 +702,7 @@ mod tests {
         // 원본: 0 "name"(헤더), 1 "banana", 2 "apple"
         // 문자 오름(데이터만): apple(2), banana(1) → [2,1]
         let (src, idx) = open_indexed(b"name\nbanana\napple\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 1, SortKind::Text, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 1, SortKind::Text, SortDir::Asc, false, None);
         assert_eq!(perm, vec![2, 1]);
     }
 
@@ -691,7 +712,7 @@ mod tests {
         // 원본: 0 "5,3", 1 "9"(col1 없음), 2 "5,1"
         // col1 숫자 오름: 1(row2), 3(row0), [none](row1) → [2,0,1]
         let (src, idx) = open_indexed(b"5,3\n9\n5,1\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 1, 0, SortKind::Number, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 1, 0, SortKind::Number, SortDir::Asc, false, None);
         assert_eq!(perm, vec![2, 0, 1]);
     }
 
@@ -705,7 +726,7 @@ mod tests {
         let (src, idx) = open_indexed(
             b"abcdefghijklmnop_Z\nabcdefghijklmnop_A\nabcdefghijklmnop_M\n",
         );
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, false, None);
         assert_eq!(perm, vec![1, 2, 0], "17번째 바이트 차이로 tie-break되어야 함");
     }
 
@@ -713,7 +734,7 @@ mod tests {
     fn text_sort_shorter_prefix_first() {
         // 사전순: "ab" < "abc" < "b". prefix pack + 0패딩이 이 순서를 내는지.
         let (src, idx) = open_indexed(b"b\nabc\nab\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, false, None);
         // ab(2), abc(1), b(0) → [2,1,0]
         assert_eq!(perm, vec![2, 1, 0]);
     }
@@ -769,7 +790,7 @@ mod tests {
 
         // 숫자 정렬(맨 우측).
         let t = Instant::now();
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, delim, first, 0, SortKind::Number, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, delim, first, 0, SortKind::Number, SortDir::Asc, false, None);
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "숫자 정렬: {ms:8.1} ms  ({:.1} M rows/s)  perm_len={}",
@@ -779,7 +800,7 @@ mod tests {
 
         // 문자 정렬(맨 우측).
         let t = Instant::now();
-        let perm2 = extract_and_sort(&src, &idx, Encoding::Utf8, delim, first, 0, SortKind::Text, SortDir::Asc, None);
+        let perm2 = extract_and_sort(&src, &idx, Encoding::Utf8, delim, first, 0, SortKind::Text, SortDir::Asc, false, None);
         let ms2 = t.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "문자 정렬: {ms2:8.1} ms  ({:.1} M rows/s)  perm_len={}",
@@ -794,14 +815,19 @@ mod tests {
         // 원본: 0 "-3.5", 1 "2", 2 "-10", 3 "0.5"
         // 오름: -10(2), -3.5(0), 0.5(3), 2(1) → [2,0,3,1]
         let (src, idx) = open_indexed(b"-3.5\n2\n-10\n0.5\n");
-        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, None);
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, false, None);
         assert_eq!(perm, vec![2, 0, 3, 1]);
     }
 
     // ---- 다중 컬럼 정렬 ----
 
     fn spec(col: usize, kind: SortKind, dir: SortDir) -> SortSpec {
-        SortSpec { col, kind, dir }
+        // 기존 다중 테스트는 대소문자 구분(ci=false)을 가정하고 짜였으므로 기본 false.
+        SortSpec { col, kind, dir, ci: false }
+    }
+
+    fn spec_ci(col: usize, kind: SortKind, dir: SortDir, ci: bool) -> SortSpec {
+        SortSpec { col, kind, dir, ci }
     }
 
     #[test]
@@ -881,7 +907,7 @@ mod tests {
         // 기준 1개면 단일 정렬과 동일 결과(회귀).
         let (src, idx) = open_indexed(b"10\n2\n9\n");
         let single =
-            extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, None);
+            extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, false, None);
         let multi = extract_and_multi_sort(
             &src,
             &idx,
@@ -899,5 +925,53 @@ mod tests {
         let (src, idx) = open_indexed(b"a\nb\n");
         let perm = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &[], 0, None);
         assert!(perm.is_empty());
+    }
+
+    // ---- case-insensitive ----
+
+    #[test]
+    fn single_text_case_sensitive_vs_insensitive() {
+        // 원본: 0 "banana", 1 "Apple", 2 "cherry"
+        // 대소문자 구분(ci=false, 바이트순): 'A'(0x41) < 'b'(0x62) < 'c'(0x63)
+        //   → Apple(1), banana(0), cherry(2) = [1,0,2]
+        // 대소문자 무시(ci=true, 소문자화): apple < banana < cherry
+        //   → Apple(1), banana(0), cherry(2) = [1,0,2] (이 데이터는 동일)
+        // 구분이 실제로 갈리는 케이스: "Zebra" vs "apple"
+        //   구분: 'Z'(0x5A) < 'a'(0x61) → Zebra 먼저. 무시: apple < zebra → apple 먼저.
+        let (src, idx) = open_indexed(b"Zebra\napple\n");
+        let cs = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, false, None);
+        assert_eq!(cs, vec![0, 1], "구분: 대문자 Z가 소문자 a보다 앞");
+        let ci = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, true, None);
+        assert_eq!(ci, vec![1, 0], "무시: apple이 zebra보다 앞");
+    }
+
+    #[test]
+    fn ci_groups_mixed_case_together() {
+        // 대소문자 무시면 "Apple"과 "apple"이 같은 그룹(동률) → 원본 순서 유지.
+        // 원본: 0 "apple", 1 "Banana", 2 "Apple", 3 "banana"
+        // 무시 오름: apple/Apple 그룹(0,2), banana/Banana 그룹(1,3)
+        //   각 그룹 내 안정 정렬(원본 행번호) → [0,2,1,3]
+        let (src, idx) = open_indexed(b"apple\nBanana\nApple\nbanana\n");
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, true, None);
+        assert_eq!(perm, vec![0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn ci_tie_break_beyond_prefix() {
+        // 앞 8바이트가 대소문자만 달라 ci 키는 같고, 9번째 이후에서 갈리는 경우
+        // tie-break가 소문자화해 비교하는지. prefix "ABCDEFGH"(8자, ci 동률).
+        // row0 = ABCDEFGH_z, row1 = abcdefgh_a → 무시: ..._a < ..._z → [1,0]
+        let (src, idx) = open_indexed(b"ABCDEFGH_z\nabcdefgh_a\n");
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Text, SortDir::Asc, true, None);
+        assert_eq!(perm, vec![1, 0]);
+    }
+
+    #[test]
+    fn multi_ci_spec() {
+        // 다중에서 문자 기준 ci: "Zebra" vs "apple" 무시 → apple 먼저.
+        let (src, idx) = open_indexed(b"Zebra\napple\n");
+        let specs = [spec_ci(0, SortKind::Text, SortDir::Asc, true)];
+        let perm = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, None);
+        assert_eq!(perm, vec![1, 0]);
     }
 }
