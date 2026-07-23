@@ -1482,6 +1482,23 @@ fn next_caret_and_sel(
     }
 }
 
+/// Backspace/Delete가 버퍼를 실제로 바꿨는지 판정한다(dirty 표시 여부).
+///
+/// - 선택이 있었으면 그 범위를 지웠으므로 무조건 변경이다.
+/// - 선택이 없었으면 캐럿이 움직였는지로 본다. Backspace는 한 글자/개행을
+///   지울 때 반드시 캐럿이 뒤로 가고, 지울 게 없는 문서 맨 앞(0,0)에서는
+///   `edit::backspace`가 위치를 그대로 돌려주므로 이 판정이 정확하다.
+///
+/// (Delete는 실제 삭제를 해도 캐럿이 제자리라 이 함수를 쓰지 않는다 —
+///  호출측이 "삭제를 수행했는가"를 직접 본다.)
+fn backspace_or_delete_changed(
+    had_sel: bool,
+    before: crate::edit::TextPos,
+    after: crate::edit::TextPos,
+) -> bool {
+    had_sel || before != after
+}
+
 /// 문서 전체를 덮는 선택 (0,0) ~ (마지막 줄 끝).
 fn whole_document_sel(lines: &[String]) -> (crate::edit::TextPos, crate::edit::TextPos) {
     use crate::edit::TextPos;
@@ -1512,6 +1529,20 @@ fn sel_span_on_line(
     }
     Some((c0, c1))
 }
+
+/// 편집 모드 텍스트 줄이 쓰는 상호작용 sense.
+///
+/// `Sense::click_and_drag()`와 click/drag는 같지만 `focusable`이 다르다:
+/// 그 생성자는 `focusable: true`를 넣는다(`egui-0.28.1/src/sense.rs:92-98`).
+/// 본문 줄이 focusable이면 `Context::create_widget`이
+/// `interested_in_focus`로 등록해(`context.rs:1050`) Tab 순회 대상이 되고,
+/// Tab 한 번으로 포커스가 줄에 걸리면 `render_text`의 keyboard_free 게이트가
+/// 닫혀 모든 키 입력이 삼켜진다. 그래서 명시적으로 opt-out 한다.
+const TEXT_LINE_SENSE: egui::Sense = egui::Sense {
+    click: true,
+    drag: true,
+    focusable: false,
+};
 
 /// 텍스트 모드 렌더: 라인번호 + 줄 전체(구분 안 함).
 ///
@@ -1559,12 +1590,24 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
 
     // 키 입력은 프레임당 한 번만 읽는다. 편집 모드 + 다른 위젯이 키보드 포커스를
     // 갖고 있지 않을 때만 소비한다 — 그렇지 않으면 툴바의 "직접:" 구분자
-    // TextEdit 등에 타이핑할 때 같은 키가 본문에도 들어간다. 텍스트 본문에는
-    // 포커스 가능한 위젯이 없으므로(interact는 focusable하지 않다) "포커스 없음"
-    // = "본문이 입력을 받는다"로 본다.
-    let keyboard_free = ui.memory(|m| m.focused().is_none());
-    let intents: Vec<TextEditIntent> = if editing && keyboard_free {
-        ui.input(collect_text_intents)
+    // TextEdit 등에 타이핑할 때 같은 키가 본문에도 들어간다.
+    //
+    // 이 게이트가 성립하는 전제는 "본문 텍스트 줄이 포커스를 가져갈 수 없다"이다.
+    // 그 전제는 저절로 성립하지 않는다 — `Sense::click_and_drag()`는
+    // `focusable: true`이고(`egui-0.28.1/src/sense.rs:92-98`), 그런 sense로 만든
+    // 위젯은 `context.rs:1050`에서 `interested_in_focus`로 등록되어 Tab 순회
+    // 대상이 된다. 그래서 아래 줄 interact는 `focusable: false`를 **명시적으로**
+    // 지정한다(TEXT_LINE_SENSE). 그 결과 Tab이 본문 줄로 포커스를 옮길 수 없고,
+    // "포커스 없음" = "본문이 입력을 받는다"가 실제로 참이 된다.
+    // (명시하지 않으면 Tab 한 번으로 포커스가 줄에 걸려 모든 키 입력이 조용히
+    //  삼켜지고 문서가 편집 불가 상태가 된다.)
+    let intents: Vec<TextEditIntent> = if editing {
+        let keyboard_free = ui.memory(|m| m.focused().is_none());
+        if keyboard_free {
+            ui.input(collect_text_intents)
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -1661,8 +1704,12 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                     }
 
                     // 4) 클릭/드래그 상호작용. 셀 전체가 대상.
+                    // sense를 직접 만들어 `focusable: false`를 강제한다 —
+                    // `Sense::click_and_drag()`는 focusable: true라 Tab이 여기로
+                    // 포커스를 옮길 수 있고, 그러면 위쪽 keyboard_free 게이트가
+                    // 닫혀 문서 전체가 편집 불가가 된다(위 주석 참조).
                     let id = ui.id().with(("textline", logical));
-                    let resp = ui.interact(cell_rect, id, egui::Sense::click_and_drag());
+                    let resp = ui.interact(cell_rect, id, TEXT_LINE_SENSE);
                     // 포인터 x → char 인덱스(같은 galley로 역매핑).
                     let pos_at_pointer = |pp: egui::Pos2| -> crate::edit::TextPos {
                         let local = pp - origin;
@@ -1702,15 +1749,23 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                     }
 
                     // 5) 우클릭 컨텍스트 메뉴.
-                    resp.context_menu(|ui| {
-                        // 어떤 줄에서 우클릭했는지만 기록한다. col은 줄 끝으로
-                        // 둔다 — 메뉴가 열린 뒤 포인터는 메뉴 창 위에 있어
-                        // 이 줄 좌표계로 되돌릴 수 없고, 메뉴 동작들은
-                        // "선택 밖이면 그 줄로" 이상의 정밀도를 쓰지 않는다.
+                    // 어떤 줄에서 우클릭했는지는 **메뉴가 열리는 프레임에만** 기록한다.
+                    // context_menu의 클로저는 메뉴가 떠 있는 매 프레임 다시 돌기
+                    // 때문에, 그 안에서 set하면 menu_target이 메뉴 수명 내내
+                    // Some으로 남아 아래 4)의 "선택 밖이면 선택 해제" 판정이 매
+                    // 프레임 재실행된다. 그러면 메뉴가 열린 채 Ctrl+A/Shift+화살표로
+                    // 만든 **새 선택이 곧바로 지워진다**. secondary_clicked()는
+                    // 메뉴를 여는 release 프레임에만 참이므로 여는 순간만 잡는다.
+                    // col은 줄 끝으로 둔다 — 메뉴가 열린 뒤 포인터는 메뉴 창 위에
+                    // 있어 이 줄 좌표계로 되돌릴 수 없고, 메뉴 동작들은
+                    // "선택 밖이면 그 줄로" 이상의 정밀도를 쓰지 않는다.
+                    if resp.secondary_clicked() {
                         menu_target.set(Some(crate::edit::TextPos {
                             line: logical,
                             col: len,
                         }));
+                    }
+                    resp.context_menu(|ui| {
                         let pick = |ui: &mut egui::Ui, label: &str, act: TextMenuAction| {
                             if ui.button(label).clicked() {
                                 menu_action.set(Some(act));
@@ -1724,6 +1779,18 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                         ui.separator();
                         pick(ui, "전체 선택", TextMenuAction::SelectAll);
                     });
+
+                    // `TEXT_LINE_SENSE`의 `focusable: false`만으로는 부족하다.
+                    // `Response::context_menu`는 내부에서
+                    // `response.interact(Sense::click())`을 부르는데
+                    // (`egui-0.28.1/src/menu.rs:415`), `Sense::click()`은
+                    // `focusable: true`라 sense가 **union**되어
+                    // (`response.rs:855-868`) 이 줄이 다시 focusable 위젯으로
+                    // 등록된다. 그러면 Tab이 또 줄에 걸려 keyboard_free 게이트가
+                    // 닫힌다. 그래서 이 줄이 포커스를 쥐고 있으면 즉시 반납한다.
+                    // (`surrender_focus`는 그 id가 포커스일 때만 지우므로
+                    //  툴바 TextEdit 등 다른 위젯의 포커스는 건드리지 않는다.)
+                    ui.memory_mut(|m| m.surrender_focus(id));
                 });
             });
         });
@@ -1758,8 +1825,16 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
 
     // 4) 컨텍스트 메뉴 동작. 우클릭 줄이 현재 선택 밖이면 캐럿만 그 줄로 옮긴다
     //    (선택은 유지 — 선택 안에서 우클릭한 경우 그 선택에 대해 동작해야 한다).
+    //    menu_target은 메뉴가 열리는 프레임에만 채워진다(위 5) 참조).
+    //    판정은 프레임 시작 스냅샷(sel_norm)이 아니라 **현재** doc.text_sel로
+    //    한다 — 3)의 키 인텐트가 이미 선택을 바꿨을 수 있고, 그 최신 선택이
+    //    "우클릭이 선택 안이었나"의 진실이다.
     if let Some(t) = menu_target.get() {
-        let inside = sel_norm.map_or(false, |(a, b)| {
+        let cur_sel = doc
+            .text_sel
+            .map(|(a, b)| crate::edit::normalize(a, b))
+            .filter(|(a, b)| a != b);
+        let inside = cur_sel.map_or(false, |(a, b)| {
             (a.line..=b.line).contains(&t.line)
         });
         if !inside {
@@ -1890,14 +1965,26 @@ fn apply_text_intent(
             e.dirty = true;
         }
         TextEditIntent::Backspace => {
+            // 아무것도 지우지 않았으면 dirty를 세우지 않는다. 선택이 없고
+            // 캐럿이 문서 맨 앞(0,0)이면 backspace는 위치를 그대로 돌려주는
+            // no-op이다 — 그때도 dirty를 세우면 파일을 열자마자 Backspace 한 번에
+            // "저장 안 됨" 상태가 생긴다.
+            let had_sel = sel.is_some();
             doc.text_caret = match delete_sel(&mut e.lines, sel) {
                 Some(p) => p,
                 None => backspace(&mut e.lines, caret),
             };
             doc.text_sel = None;
-            e.dirty = true;
+            if backspace_or_delete_changed(had_sel, caret, doc.text_caret) {
+                e.dirty = true;
+            }
         }
         TextEditIntent::Delete => {
+            // Backspace와 같은 이유로 no-op(문서 끝에서 Delete)에는 dirty를
+            // 세우지 않는다. 다만 Delete는 캐럿이 제자리인 채로 실제 삭제가
+            // 일어나므로(다음 문자/개행 제거), 캐럿 이동이 아니라 "삭제를
+            // 수행했는가"를 직접 본다.
+            let mut changed = sel.is_some();
             doc.text_caret = match delete_sel(&mut e.lines, sel) {
                 Some(p) => p,
                 None => {
@@ -1906,12 +1993,15 @@ fn apply_text_intent(
                     if next == caret {
                         caret // 문서 끝 — no-op
                     } else {
+                        changed = true;
                         delete_range(&mut e.lines, caret, next)
                     }
                 }
             };
             doc.text_sel = None;
-            e.dirty = true;
+            if changed {
+                e.dirty = true;
+            }
         }
         TextEditIntent::Move(mv, extend) => {
             let (new_caret, new_sel) = next_caret_and_sel(&e.lines, caret, sel, mv, extend);
@@ -2280,6 +2370,129 @@ mod tests {
         assert_eq!(sel_span_on_line(a, a, 1, 5), None);
         // 끝 줄의 col이 0이면(다음 줄 처음에서 끝나는 선택) 그 줄엔 음영 없음.
         assert_eq!(sel_span_on_line(tp(0, 0), tp(1, 0), 1, 5), None);
+    }
+
+    /// Backspace의 dirty 판정. `apply_text_intent`가 쓰는 것과 똑같이
+    /// `edit::backspace`의 반환 위치를 헬퍼에 먹여, 실제 no-op 조건에서
+    /// dirty가 서지 않음을 고정한다(파일 열자마자 Backspace → "저장 안 됨" 방지).
+    #[test]
+    fn backspace_at_origin_is_not_dirty() {
+        // 문서 맨 앞 + 선택 없음 → edit::backspace가 위치를 그대로 돌려주고,
+        // 버퍼도 그대로다. 변경 없음으로 판정해야 한다.
+        let mut lines = v(&["ab", "cd"]);
+        let before = tp(0, 0);
+        let after = crate::edit::backspace(&mut lines, before);
+        assert_eq!(lines, v(&["ab", "cd"]), "버퍼가 바뀌면 안 된다");
+        assert!(!backspace_or_delete_changed(false, before, after));
+    }
+
+    #[test]
+    fn backspace_that_deletes_is_dirty() {
+        // (a) 줄 중간: 한 글자 삭제 → 캐럿이 뒤로 → 변경.
+        let mut lines = v(&["ab"]);
+        let before = tp(0, 2);
+        let after = crate::edit::backspace(&mut lines, before);
+        assert_eq!(lines, v(&["a"]));
+        assert!(backspace_or_delete_changed(false, before, after));
+
+        // (b) 줄 맨 앞: 앞 줄과 병합 → 캐럿이 앞 줄로 → 변경.
+        let mut lines = v(&["ab", "cd"]);
+        let before = tp(1, 0);
+        let after = crate::edit::backspace(&mut lines, before);
+        assert_eq!(lines, v(&["abcd"]));
+        assert!(backspace_or_delete_changed(false, before, after));
+
+        // (c) 선택이 있으면 캐럿이 제자리여도(선택 시작 == 캐럿) 변경이다.
+        assert!(backspace_or_delete_changed(true, tp(0, 0), tp(0, 0)));
+    }
+
+    /// Delete의 no-op 조건: 문서 끝에서는 Right 이동이 제자리라 삭제가 없다.
+    /// `apply_text_intent`의 Delete 분기가 이 조건으로 dirty를 가른다.
+    #[test]
+    fn delete_at_document_end_is_noop() {
+        let lines = v(&["ab", "cd"]);
+        let caret = tp(1, 2); // 마지막 줄 끝
+        assert_eq!(apply_caret_move(&lines, caret, CaretMove::Right), caret);
+        // 문서 끝이 아니면 이동이 생기고 → 삭제할 대상이 있다.
+        let mid = tp(0, 2); // 첫 줄 끝(개행 위치)
+        assert_ne!(apply_caret_move(&lines, mid, CaretMove::Right), mid);
+    }
+
+    /// Tab이 본문 텍스트 줄로 포커스를 옮길 수 없어야 한다.
+    ///
+    /// `render_text`의 키 입력 게이트는 `memory.focused().is_none()`이다.
+    /// 줄이 포커스를 가져갈 수 있으면 Tab 한 번으로 게이트가 닫혀 **모든 키
+    /// 입력이 조용히 삼켜지고 문서가 편집 불가**가 된다(화면에 아무 표시도 없다).
+    ///
+    /// 방어가 두 겹인 이유를 이 테스트가 고정한다:
+    /// 1. `TEXT_LINE_SENSE`의 `focusable: false` — Tab 순회 등록 자체를 막는다.
+    /// 2. `surrender_focus` — `context_menu`가 내부에서
+    ///    `interact(Sense::click())`(focusable: true)로 sense를 union해
+    ///    줄을 **다시** focusable로 등록하는 것을 되돌린다.
+    ///
+    /// 2번 없이 1번만으로는 실제로 막히지 않는다(이 테스트로 실증했다).
+    #[test]
+    fn tab_cannot_steal_focus_onto_text_line() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("textline_focus_probe");
+        // render_text가 한 줄에 대해 하는 것과 같은 순서: interact → context_menu
+        // → surrender_focus.
+        let draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 20.0));
+                let resp = ui.interact(rect, id, TEXT_LINE_SENSE);
+                resp.context_menu(|ui| {
+                    ui.label("메뉴");
+                });
+                ui.memory_mut(|m| m.surrender_focus(id));
+            });
+        };
+        // 1프레임: 위젯 등록.
+        let _ = ctx.run(Default::default(), |ctx| draw(ctx));
+        // 2프레임: Tab.
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input, |ctx| draw(ctx));
+
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            None,
+            "Tab이 텍스트 줄에 포커스를 걸면 keyboard_free 게이트가 닫혀 \
+             문서 전체가 편집 불가가 된다"
+        );
+    }
+
+    /// 게이트 자체의 의미 고정: 포커스가 있으면 키를 소비하지 않는다.
+    /// (툴바 "직접:" 구분자 TextEdit에 타이핑할 때 본문에 중복 입력되지 않게 하는
+    ///  원래 목적 — I-1 수정이 이 성질을 깨지 않았음을 확인한다.)
+    #[test]
+    fn focused_widget_blocks_document_key_intents() {
+        let ctx = egui::Context::default();
+        let other = egui::Id::new("toolbar_textedit");
+        // 포커스를 가진 다른 위젯이 있는 상태를 만든다.
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(50.0, 20.0));
+                let r = ui.interact(rect, other, egui::Sense::click());
+                r.request_focus();
+            });
+        });
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(other),
+            "사전 조건: 다른 위젯이 포커스를 쥐고 있어야 한다"
+        );
+        // render_text의 게이트 식과 동일.
+        let keyboard_free = ctx.memory(|m| m.focused().is_none());
+        assert!(!keyboard_free, "포커스가 있으면 본문은 키를 소비하지 않는다");
     }
 
     #[test]
