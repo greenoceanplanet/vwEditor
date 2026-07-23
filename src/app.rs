@@ -65,6 +65,11 @@ pub struct App {
     pub save_as: bool,
     pub save_enc: crate::parse::Encoding,
     pub save_bom: bool,
+    /// 셀 복사/잘라내기 시 채우는 앱 내부 클립보드. egui 0.28은 시스템
+    /// 클립보드 읽기를 직접 제공하지 않으므로(붙여넣기는 이벤트로만 들어온다),
+    /// 우클릭 "붙여넣기"의 소스로 이 캐시를 쓴다. 복사 시 시스템 클립보드에도
+    /// 같은 내용을 넣어 외부 앱으로의 복사는 정상 동작한다.
+    pub clipboard_cache: String,
 }
 
 impl Default for App {
@@ -80,6 +85,7 @@ impl Default for App {
             save_as: false,
             save_enc: crate::parse::Encoding::Utf8,
             save_bom: false,
+            clipboard_cache: String::new(),
         }
     }
 }
@@ -161,6 +167,12 @@ use crate::index::Phase;
 use egui_extras::{Column, TableBuilder};
 
 const ROW_HEIGHT: f32 = 22.0;
+
+/// 선택 음영(컬럼 선택·셀 사각 선택 공통). 줄무늬 위에 덧그리는 반투명 파랑.
+/// `from_rgba_unmultiplied`가 const가 아니라 함수로 둔다.
+fn sel_shade() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(80, 150, 230, 70)
+}
 
 /// 논리 행 번호(logical)에 해당하는 줄을 offset으로 조회해 디코딩·개행 제거한
 /// 문자열 하나를 돌려준다(구분자 분리 없음). 텍스트 모드 렌더와, 표 모드의
@@ -452,10 +464,16 @@ impl eframe::App for App {
         // 본문: 구분 모드에 따라 표 뷰 / 텍스트 뷰로 분기.
         let row_base = self.row_base;
         let col_base = self.col_base;
+        // 클립보드 캐시는 render_table이 복사/붙여넣기에 쓰므로 가변 대여를
+        // doc과 분리해 넘긴다(App 전체를 넘기면 doc과 동시 대여가 불가능).
+        let clipboard = &mut self.clipboard_cache;
+        let doc_opt = &mut self.doc;
         egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(doc) = &mut self.doc else { return };
+            let Some(doc) = doc_opt else { return };
             match doc.sep {
-                SeparatorMode::Char(delim) => render_table(ui, doc, delim, row_base, col_base),
+                SeparatorMode::Char(delim) => {
+                    render_table(ui, doc, delim, row_base, col_base, clipboard)
+                }
                 SeparatorMode::None => render_text(ui, &*doc, row_base),
             }
         });
@@ -814,10 +832,43 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
     }
 }
 
+/// 우클릭 컨텍스트 메뉴에서 고른 동작. 클로저 안에서는 doc을 가변으로 빌릴 수
+/// 없으므로 "무엇을 눌렀는지"만 기록해 두고, 테이블 클로저가 끝난 뒤 적용한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellMenuAction {
+    Copy,
+    Cut,
+    Paste,
+    Clear,
+    InsertRowAbove,
+    InsertRowBelow,
+    DeleteRows,
+}
+
+/// 사각 선택을 정규화한다: (r0<=r1, c0<=c1).
+fn normalize_rect(sel: (usize, usize, usize, usize)) -> (usize, usize, usize, usize) {
+    let (r0, c0, r1, c1) = sel;
+    (r0.min(r1), c0.min(c1), r0.max(r1), c0.max(c1))
+}
+
+/// (row, col)이 정규화 전 선택 사각형 안에 들어가는지.
+fn rect_contains(sel: (usize, usize, usize, usize), row: usize, col: usize) -> bool {
+    let (r0, c0, r1, c1) = normalize_rect(sel);
+    (r0..=r1).contains(&row) && (c0..=c1).contains(&col)
+}
+
 /// 표 모드 렌더: 라인번호 + 구분자로 분리한 필드 컬럼들.
 /// 헤더 클릭으로 컬럼을 선택하고, 정렬이 적용돼 있으면 permutation 순서로 렌더.
-fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8, row_base: usize, col_base: usize) {
-    use std::cell::Cell;
+/// 편집 모드(`doc.edit.is_some()`)에서는 셀 편집/드래그 선택/우클릭 메뉴가 켜진다.
+fn render_table(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    delim: u8,
+    row_base: usize,
+    col_base: usize,
+    clipboard: &mut String,
+) {
+    use std::cell::{Cell, RefCell};
 
     // 헤더 행 데이터(있으면 첫 줄)와 데이터 시작 행 결정
     let total_lines = match &doc.edit {
@@ -842,6 +893,36 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8, row_base: usiz
     let permutation: Option<&[u32]> = doc.sort.as_ref().map(|s| s.permutation.as_slice());
     // 헤더 클릭으로 새로 선택된 컬럼을 클로저 밖으로 전달하는 통로.
     let clicked_col: Cell<Option<usize>> = Cell::new(None);
+
+    // ---- 편집 모드 상태 스냅샷 + 클로저 → 바깥 인텐트 통로 ----
+    // 테이블 클로저는 doc을 불변으로만 빌린다. 셀 상호작용 결과는 여기 모아
+    // 두었다가 클로저가 끝난 뒤 doc.edit에 적용한다(기존 clicked_col과 동일 패턴).
+    let editing = doc.edit.is_some();
+    // cell_sel / editing_cell은 논리 행번호를 담는다(편집 모드에선 sort=None이므로
+    // logical = data_start + view_row).
+    let cur_sel = doc.cell_sel;
+    let editing_cell = doc.editing_cell;
+    // 편집 중 텍스트는 클로저 안에서 &mut로 써야 하므로 로컬 버퍼에 복사했다가
+    // 클로저 종료 후 doc.cell_edit_text에 되돌린다(편집 중일 때만 복사).
+    let edit_text: RefCell<String> = RefCell::new(if doc.editing_cell.is_some() {
+        doc.cell_edit_text.clone()
+    } else {
+        String::new()
+    });
+
+    // 드래그 시작 셀(논리 행, 열). 드래그 중 확장 끝점.
+    let drag_anchor: Cell<Option<(usize, usize)>> = Cell::new(None);
+    let drag_head: Cell<Option<(usize, usize)>> = Cell::new(None);
+    // 더블클릭으로 편집을 시작할 셀 + 그 셀의 현재 값.
+    let begin_edit: RefCell<Option<(usize, usize, String)>> = RefCell::new(None);
+    // 편집 중 셀의 커밋(Enter 또는 포커스 상실) 요청.
+    let commit_edit: Cell<bool> = Cell::new(false);
+    // 우클릭으로 선택을 단일 셀로 바꿔야 하는 경우.
+    let menu_target: Cell<Option<(usize, usize)>> = Cell::new(None);
+    // 컨텍스트 메뉴에서 고른 동작.
+    let menu_action: Cell<Option<CellMenuAction>> = Cell::new(None);
+    // 좌클릭 버튼이 눌린 상태인지(드래그 확장 판정용). 프레임당 한 번만 읽는다.
+    let primary_down = ui.input(|i| i.pointer.primary_down());
 
     // col_count는 헤더 필드 수와, 앞부분 데이터 행 몇 개를 샘플링한 필드 수의
     // 최댓값으로 정한다. 헤더가 없는 파일(header_fields == None)에서 1로
@@ -937,18 +1018,108 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8, row_base: usiz
                     .unwrap_or_default();
                 for c in 0..col_count {
                     row.col(|ui| {
+                        let cell_rect = ui.max_rect();
                         // 선택된 컬럼은 셀 배경에 밝은 파란 음영(줄무늬 위에 반투명).
                         if selected_col == Some(c) {
                             ui.painter().rect_filled(
-                                ui.max_rect(),
+                                cell_rect,
                                 0.0,
-                                egui::Color32::from_rgba_unmultiplied(80, 150, 230, 70),
+                                sel_shade(),
                             );
                         }
+
+                        // ---- 뷰 전용 모드: 기존 동작 그대로(라벨만) ----
+                        if !editing {
+                            ui.add(
+                                egui::Label::new(fields.get(c).cloned().unwrap_or_default())
+                                    .truncate(),
+                            );
+                            return;
+                        }
+
+                        // ---- 편집 모드 ----
+                        // 편집 모드에선 permutation이 없으므로 logical은 항상 Some.
+                        let Some(lrow) = logical else {
+                            ui.add(egui::Label::new("").truncate());
+                            return;
+                        };
+
+                        // 이 셀이 편집 중이면 라벨 대신 인라인 TextEdit.
+                        if editing_cell == Some((lrow, c)) {
+                            let mut buf = edit_text.borrow_mut();
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut *buf)
+                                    .desired_width(cell_rect.width())
+                                    .id(ui.id().with(("celledit", lrow, c))),
+                            );
+                            // 진입 프레임에 포커스를 준다(이미 있으면 no-op).
+                            if !resp.has_focus() && !resp.lost_focus() {
+                                resp.request_focus();
+                            }
+                            // 커밋 조건은 "포커스 상실" 하나로 충분하다 —
+                            // singleline TextEdit은 Enter를 누르면 포커스를 놓고,
+                            // 다른 곳을 클릭해도 포커스를 놓는다. Esc는 egui가
+                            // 포커스만 해제하므로 여기선 동일하게 커밋 처리한다.
+                            if resp.lost_focus() {
+                                commit_edit.set(true);
+                            }
+                            return;
+                        }
+
+                        // 선택 사각형 음영(컬럼 음영과 같은 색).
+                        if let Some(sel) = cur_sel {
+                            if rect_contains(sel, lrow, c) {
+                                ui.painter().rect_filled(cell_rect, 0.0, sel_shade());
+                            }
+                        }
+
                         ui.add(
                             egui::Label::new(fields.get(c).cloned().unwrap_or_default())
                                 .truncate(),
                         );
+
+                        // 셀 전체를 클릭/드래그 대상으로. Label 뒤에 interact를 걸어
+                        // 셀 칸 어디를 눌러도 반응하게 한다.
+                        let resp = ui.interact(
+                            cell_rect,
+                            ui.id().with(("cell", lrow, c)),
+                            egui::Sense::click_and_drag(),
+                        );
+
+                        // 드래그 시작 = 새 앵커. 단일 클릭도 그 셀 하나를 선택으로.
+                        if resp.drag_started() || resp.clicked() {
+                            drag_anchor.set(Some((lrow, c)));
+                            drag_head.set(Some((lrow, c)));
+                        }
+                        // 드래그 중 끝점 확장. 드래그 이벤트는 최초로 눌린 셀만
+                        // 받으므로(egui가 포인터를 그 위젯에 캡처), 다른 행/열로
+                        // 넘어가는 확장은 "포인터가 이 셀 위 + 버튼 눌림"으로 감지한다.
+                        if resp.contains_pointer() && primary_down {
+                            drag_head.set(Some((lrow, c)));
+                        }
+                        if resp.double_clicked() {
+                            let val = fields.get(c).cloned().unwrap_or_default();
+                            *begin_edit.borrow_mut() = Some((lrow, c, val));
+                        }
+
+                        // 우클릭 컨텍스트 메뉴.
+                        resp.context_menu(|ui| {
+                            menu_target.set(Some((lrow, c)));
+                            let pick = |ui: &mut egui::Ui, label: &str, act: CellMenuAction| {
+                                if ui.button(label).clicked() {
+                                    menu_action.set(Some(act));
+                                    ui.close_menu();
+                                }
+                            };
+                            pick(ui, "복사", CellMenuAction::Copy);
+                            pick(ui, "잘라내기", CellMenuAction::Cut);
+                            pick(ui, "붙여넣기", CellMenuAction::Paste);
+                            pick(ui, "셀 내용 지우기", CellMenuAction::Clear);
+                            ui.separator();
+                            pick(ui, "위에 행 삽입", CellMenuAction::InsertRowAbove);
+                            pick(ui, "아래에 행 삽입", CellMenuAction::InsertRowBelow);
+                            pick(ui, "행 삭제", CellMenuAction::DeleteRows);
+                        });
                     });
                 }
             });
@@ -961,6 +1132,133 @@ fn render_table(ui: &mut egui::Ui, doc: &mut Document, delim: u8, row_base: usiz
         } else {
             Some(c)
         };
+    }
+
+    // ---- 여기서부터 편집 인텐트 적용(테이블 클로저 종료 → doc 가변 대여 가능) ----
+    if !editing {
+        return;
+    }
+    // 편집 중 텍스트 버퍼를 doc으로 되돌린다(TextEdit이 로컬 버퍼를 고쳤을 수 있음).
+    // 프레임 시작 시 편집 중이 아니었다면 로컬 버퍼는 빈 더미이므로 쓰지 않는다.
+    if doc.editing_cell.is_some() {
+        doc.cell_edit_text = edit_text.into_inner();
+    }
+
+    // 1) 셀 편집 커밋 — 새 편집 시작보다 먼저 처리해야 이전 셀 값이 저장된다.
+    if commit_edit.get() {
+        commit_editing_cell(doc, delim);
+        doc.editing_cell = None;
+        doc.cell_edit_text.clear();
+    }
+
+    // 2) 드래그/클릭 선택 갱신. 앵커가 새로 잡히면 앵커+끝점을 함께 설정하고,
+    // 이전 프레임에 시작된 드래그가 이어지는 중이면(버튼 눌린 상태) 앵커는
+    // 유지한 채 끝점만 확장한다.
+    if let Some((ar, ac)) = drag_anchor.get() {
+        let (hr, hc) = drag_head.get().unwrap_or((ar, ac));
+        doc.cell_sel = Some((ar, ac, hr, hc));
+    } else if primary_down {
+        if let (Some(sel), Some((hr, hc))) = (doc.cell_sel, drag_head.get()) {
+            doc.cell_sel = Some((sel.0, sel.1, hr, hc));
+        }
+    }
+
+    // 3) 더블클릭 → 셀 편집 시작.
+    if let Some((lrow, c, val)) = begin_edit.into_inner() {
+        // 다른 셀이 아직 편집 중이면(예: 편집 셀이 스크롤 밖으로 나가 lost_focus를
+        // 못 받은 경우) 그 값을 먼저 커밋해 편집 내용을 잃지 않게 한다.
+        if doc.editing_cell.is_some() && doc.editing_cell != Some((lrow, c)) {
+            commit_editing_cell(doc, delim);
+        }
+        doc.editing_cell = Some((lrow, c));
+        doc.cell_edit_text = val;
+        // 편집 시작 셀을 단일 선택으로.
+        doc.cell_sel = Some((lrow, c, lrow, c));
+    }
+
+    // 4) 컨텍스트 메뉴 동작.
+    // 우클릭 셀이 현재 선택 밖이면 그 셀을 단일 선택으로 만든다.
+    if let Some((lrow, c)) = menu_target.get() {
+        let inside = doc.cell_sel.map_or(false, |s| rect_contains(s, lrow, c));
+        if !inside {
+            doc.cell_sel = Some((lrow, c, lrow, c));
+        }
+    }
+    if let Some(act) = menu_action.get() {
+        apply_cell_menu_action(ui, doc, delim, clipboard, act);
+    }
+}
+
+/// 현재 `editing_cell`의 `cell_edit_text`를 편집 버퍼에 써넣는다(dirty 표시).
+/// `editing_cell` 자체는 지우지 않는다 — 호출측이 상황에 맞게 정리한다.
+fn commit_editing_cell(doc: &mut Document, delim: u8) {
+    let Some((lrow, c)) = doc.editing_cell else { return };
+    let text = doc.cell_edit_text.clone();
+    let Some(e) = doc.edit.as_mut() else { return };
+    if lrow >= e.lines.len() {
+        return;
+    }
+    crate::edit::set_cell(&mut e.lines, lrow, c, &text, delim);
+    e.dirty = true;
+}
+
+/// 컨텍스트 메뉴 동작을 편집 버퍼에 적용한다. 선택 사각형은 논리 행/열 기준.
+fn apply_cell_menu_action(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    delim: u8,
+    clipboard: &mut String,
+    act: CellMenuAction,
+) {
+    let Some(sel) = doc.cell_sel else { return };
+    let (r0, c0, r1, c1) = normalize_rect(sel);
+    let Some(e) = doc.edit.as_mut() else { return };
+
+    match act {
+        CellMenuAction::Copy => {
+            let tsv = crate::edit::cells_to_tsv(&e.lines, r0, c0, r1, c1, delim);
+            *clipboard = tsv.clone();
+            ui.output_mut(|o| o.copied_text = tsv);
+        }
+        CellMenuAction::Cut => {
+            let tsv = crate::edit::cells_to_tsv(&e.lines, r0, c0, r1, c1, delim);
+            *clipboard = tsv.clone();
+            ui.output_mut(|o| o.copied_text = tsv);
+            crate::edit::clear_cells(&mut e.lines, r0, c0, r1, c1, delim);
+            e.dirty = true;
+        }
+        CellMenuAction::Paste => {
+            if !clipboard.is_empty() {
+                crate::edit::paste_tsv(&mut e.lines, r0, c0, clipboard, delim);
+                e.dirty = true;
+            }
+        }
+        CellMenuAction::Clear => {
+            crate::edit::clear_cells(&mut e.lines, r0, c0, r1, c1, delim);
+            e.dirty = true;
+        }
+        CellMenuAction::InsertRowAbove => {
+            crate::edit::insert_row(&mut e.lines, r0, String::new());
+            e.dirty = true;
+            // 삽입된 빈 행 아래로 선택이 밀린다.
+            doc.cell_sel = Some((r0 + 1, c0, r1 + 1, c1));
+        }
+        CellMenuAction::InsertRowBelow => {
+            crate::edit::insert_row(&mut e.lines, r1 + 1, String::new());
+            e.dirty = true;
+        }
+        CellMenuAction::DeleteRows => {
+            // 뒤에서부터 지워야 인덱스가 밀리지 않는다.
+            for r in (r0..=r1).rev() {
+                crate::edit::remove_row(&mut e.lines, r);
+            }
+            e.dirty = true;
+            // 선택은 삭제 지점 한 셀로 축소(범위 밖이면 마지막 행으로 클램프).
+            let last = e.lines.len().saturating_sub(1);
+            let r = r0.min(last);
+            doc.cell_sel = Some((r, c0, r, c1));
+            doc.editing_cell = None;
+        }
     }
 }
 
@@ -1162,6 +1460,28 @@ mod tests {
         enter_edit_mode(doc);
         assert!(doc.edit.is_some());
         assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a,b", "1,2"]);
+    }
+
+    #[test]
+    fn normalize_rect_orders_corners() {
+        // 아래→위, 오른쪽→왼쪽으로 드래그해도 (r0<=r1, c0<=c1)로 정규화.
+        assert_eq!(normalize_rect((5, 4, 2, 1)), (2, 1, 5, 4));
+        assert_eq!(normalize_rect((2, 1, 5, 4)), (2, 1, 5, 4));
+        // 역방향 혼합(행은 정방향, 열은 역방향).
+        assert_eq!(normalize_rect((2, 4, 5, 1)), (2, 1, 5, 4));
+    }
+
+    #[test]
+    fn rect_contains_respects_unnormalized_input() {
+        // 역방향으로 저장된 선택도 포함 판정이 정확해야 한다(우클릭 셀이
+        // 선택 안인지 밖인지 판단하는 데 쓰임).
+        let sel = (5, 4, 2, 1); // 실제 범위: 행 2..=5, 열 1..=4
+        assert!(rect_contains(sel, 3, 2));
+        assert!(rect_contains(sel, 2, 1));
+        assert!(rect_contains(sel, 5, 4));
+        assert!(!rect_contains(sel, 1, 2), "행 범위 밖");
+        assert!(!rect_contains(sel, 3, 0), "열 범위 밖");
+        assert!(!rect_contains(sel, 6, 4), "행 범위 밖");
     }
 
     #[test]
