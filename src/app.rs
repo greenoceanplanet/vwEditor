@@ -1903,6 +1903,18 @@ fn replace_op_for_rows(lines: &[String], r0: usize, r1: usize) -> crate::edit::E
     crate::edit::EditOp::Replace(items)
 }
 
+/// `before`가 `replace_op_for_rows`로 캡처한 편집 전 스냅샷일 때, 현재
+/// `lines`와 비교해 실제로 뭔가 바뀌었는지 판정한다. `before`가 `Replace`가
+/// 아니거나 담긴 행 중 하나라도 현재 값과 다르면 변경이 있는 것으로 본다.
+fn edit_op_differs_from_current(before: &crate::edit::EditOp, lines: &[String]) -> bool {
+    let crate::edit::EditOp::Replace(items) = before else {
+        return true;
+    };
+    items
+        .iter()
+        .any(|(r, old)| lines.get(*r).is_none_or(|cur| cur != old))
+}
+
 /// 컨텍스트 메뉴/키보드 단축키 동작을 편집 버퍼에 적용한다.
 /// 선택 사각형은 논리 행/열 기준. 셀 선택이 없고 헤더 클릭 컬럼 선택만 있으면
 /// 그 컬럼 전체(데이터 행)를 대상으로 삼는다(`effective_cell_rect`).
@@ -1937,9 +1949,15 @@ fn apply_cell_menu_action(
             let tsv = crate::edit::cells_to_tsv(&e.lines, r0, c0, r1, c1, delim);
             *clipboard = tsv.clone();
             ui.output_mut(|o| o.copied_text = tsv);
-            e.undo.push(replace_op_for_rows(&e.lines, r0, r1));
+            // 되돌리기용 스냅샷은 편집 전 상태를 담아야 하므로 지우기 **전에** 캡처.
+            let before = replace_op_for_rows(&e.lines, r0, r1);
             crate::edit::clear_cells(&mut e.lines, r0, c0, r1, c1, delim);
-            e.dirty = true;
+            // 대상 셀이 이미 비어 있어 실제로 바뀐 게 없으면(잘라내기는 클립보드
+            // 복사만 의미가 있고) 헛된 undo 단계를 남기지 않는다.
+            if edit_op_differs_from_current(&before, &e.lines) {
+                e.undo.push(before);
+                e.dirty = true;
+            }
         }
         CellMenuAction::Paste => {
             // 시스템 클립보드 문자열이 있으면 그것이 진실. 없으면 내부 캐시.
@@ -1987,9 +2005,15 @@ fn apply_cell_menu_action(
             e.dirty = true;
         }
         CellMenuAction::Clear => {
-            e.undo.push(replace_op_for_rows(&e.lines, r0, r1));
+            // 되돌리기용 스냅샷은 편집 전 상태를 담아야 하므로 지우기 **전에** 캡처.
+            let before = replace_op_for_rows(&e.lines, r0, r1);
             crate::edit::clear_cells(&mut e.lines, r0, c0, r1, c1, delim);
-            e.dirty = true;
+            // 대상 셀이 이미 비어 있어 실제로 바뀐 게 없으면 헛된 undo 단계를
+            // 남기지 않는다(commit_editing_cell과 같은 규율).
+            if edit_op_differs_from_current(&before, &e.lines) {
+                e.undo.push(before);
+                e.dirty = true;
+            }
         }
         CellMenuAction::InsertRowAbove => {
             e.undo.push(crate::edit::EditOp::RemoveInserted { at: r0, count: 1 });
@@ -3996,6 +4020,76 @@ mod tests {
             v(&["h1,h2", "a,", "b,", "c,"]),
             "헤더는 그대로, 데이터 컬럼만 빈다"
         );
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig);
+    }
+
+    /// 이미 비어 있는 셀 범위를 잘라내도 클립보드는 채워지지만(빈 문자열이라도
+    /// 복사 자체는 유효) 실제로 바뀐 게 없으니 undo 단계는 쌓이지 않는다.
+    #[test]
+    fn cut_on_already_empty_cells_pushes_no_undo_step() {
+        let (mut app, delim) = edit_doc(b"h,v\n,\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        doc.cell_sel = Some((1, 0, 1, 1));
+        let mut clip = String::new();
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::Cut, None)
+        });
+        assert_eq!(clip, "\t", "빈 셀이라도 클립보드 복사는 그대로 일어난다");
+        assert!(doc.edit.as_ref().unwrap().undo.is_empty());
+        assert!(!doc.edit.as_ref().unwrap().dirty);
+    }
+
+    /// 이미 비어 있는 셀 범위를 지워도(Clear) 변화가 없으니 undo 단계가
+    /// 쌓이면 안 된다.
+    #[test]
+    fn clear_on_already_empty_cells_pushes_no_undo_step() {
+        let (mut app, delim) = edit_doc(b"h,v\n,\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        doc.cell_sel = Some((1, 0, 1, 1));
+        let mut clip = String::new();
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::Clear, None)
+        });
+        assert!(doc.edit.as_ref().unwrap().undo.is_empty());
+        assert!(!doc.edit.as_ref().unwrap().dirty);
+    }
+
+    /// 내용이 있는 범위의 Cut은 정확히 undo 단계 하나를 쌓고 Ctrl+Z로 복원된다
+    /// (과도교정 방지 가드).
+    #[test]
+    fn cut_on_nonempty_cells_pushes_exactly_one_undo_step() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        doc.cell_sel = Some((1, 0, 1, 1));
+        let mut clip = String::new();
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::Cut, None)
+        });
+        assert_eq!(clip, "a\t1");
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", ","]));
+        assert_eq!(doc.edit.as_ref().unwrap().undo.len(), 1);
+        assert!(doc.edit.as_ref().unwrap().dirty);
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig);
+    }
+
+    /// 내용이 있는 범위의 Clear도 정확히 undo 단계 하나를 쌓고 Ctrl+Z로
+    /// 복원된다(과도교정 방지 가드).
+    #[test]
+    fn clear_on_nonempty_cells_pushes_exactly_one_undo_step() {
+        let (mut app, delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
+        let doc = app.doc.as_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        doc.cell_sel = Some((1, 0, 2, 1));
+        let mut clip = String::new();
+        with_ui(|ui| {
+            apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::Clear, None)
+        });
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["h,v", ",", ","]));
+        assert_eq!(doc.edit.as_ref().unwrap().undo.len(), 1);
+        assert!(doc.edit.as_ref().unwrap().dirty);
         undo_once(doc);
         assert_eq!(doc.edit.as_ref().unwrap().lines, orig);
     }
