@@ -53,6 +53,10 @@ pub struct Document {
     pub text_sel: Option<(crate::edit::TextPos, crate::edit::TextPos)>,
     /// 텍스트 커서(텍스트 모드).
     pub text_caret: crate::edit::TextPos,
+    /// 드래그 선택이 텍스트 줄에서 시작됐는지. `cell_drag_active`와 같은 이유로
+    /// 필요하다 — egui의 primary_down은 전역 상태라 누름이 어디서 시작됐는지
+    /// 알 수 없고, is_pointer_button_down_on()은 우클릭에도 참이다.
+    pub text_drag_active: bool,
 }
 
 pub struct App {
@@ -164,6 +168,7 @@ impl App {
             cell_drag_active: false,
             text_sel: None,
             text_caret: crate::edit::TextPos { line: 0, col: 0 },
+            text_drag_active: false,
         });
     }
 }
@@ -213,6 +218,7 @@ pub fn enter_edit_mode(doc: &mut Document) {
     doc.cell_drag_active = false;
     doc.text_sel = None;
     doc.text_caret = crate::edit::TextPos { line: 0, col: 0 };
+    doc.text_drag_active = false;
 }
 
 /// 편집 모드 이탈(버퍼 폐기). dirty 경고는 호출측 UI에서.
@@ -222,6 +228,7 @@ pub fn exit_edit_mode(doc: &mut Document) {
     doc.cell_sel = None;
     doc.cell_drag_active = false;
     doc.text_sel = None;
+    doc.text_drag_active = false;
 }
 
 /// logical 논리 행의 텍스트. 편집 모드면 EditBuffer에서, 아니면 mmap 디코딩.
@@ -481,7 +488,7 @@ impl eframe::App for App {
                 SeparatorMode::Char(delim) => {
                     render_table(ui, doc, delim, row_base, col_base, clipboard)
                 }
-                SeparatorMode::None => render_text(ui, &*doc, row_base),
+                SeparatorMode::None => render_text(ui, doc, row_base, clipboard),
             }
         });
 
@@ -1329,14 +1336,238 @@ fn apply_cell_menu_action(
     }
 }
 
-/// 텍스트 모드 렌더: 라인번호 + 줄 전체(구분 안 함). 긴 줄은 truncate하고
-/// 컬럼 폭을 넓히면(가로 스크롤) 전체가 보인다.
-fn render_text(ui: &mut egui::Ui, doc: &Document, row_base: usize) {
+/// 텍스트 모드 우클릭 컨텍스트 메뉴 동작. `CellMenuAction`과 같은 이유로
+/// (클로저 안에서 doc을 가변 대여할 수 없음) 인텐트만 기록해 두고 나중에 적용한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextMenuAction {
+    Cut,
+    Copy,
+    Paste,
+    Delete,
+    SelectAll,
+}
+
+/// 텍스트 모드 캐럿/선택 이동·편집 인텐트. 키 입력 루프가 이걸 만들어 내고,
+/// 적용 단계에서 `doc.edit`에 반영한다.
+enum TextEditIntent {
+    /// 문자 입력(개행 포함 가능). 선택이 있으면 먼저 지운다.
+    Insert(String),
+    /// Enter — 선택 삭제 후 줄 나누기.
+    Newline,
+    Backspace,
+    Delete,
+    /// 캐럿 이동. `extend`면 앵커를 유지한 채 선택을 확장한다.
+    Move(CaretMove, bool),
+    SelectAll,
+    Copy,
+    Cut,
+    Paste(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaretMove {
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+}
+
+/// 텍스트 모드에서 쓰는 고정폭 폰트. 캐럿/선택 x 좌표 매핑을 위해 줄 텍스트를
+/// 직접 레이아웃하므로, 렌더와 매핑이 같은 FontId를 써야 한다.
+fn text_font_id() -> egui::FontId {
+    egui::FontId::monospace(13.0)
+}
+
+/// 줄의 char 개수.
+fn line_char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// 캐럿을 문서 범위 안으로 클램프한다(줄 번호, 줄 안 col 모두).
+fn clamp_pos(lines: &[String], p: crate::edit::TextPos) -> crate::edit::TextPos {
+    if lines.is_empty() {
+        return crate::edit::TextPos { line: 0, col: 0 };
+    }
+    let line = p.line.min(lines.len() - 1);
+    let col = p.col.min(line_char_len(&lines[line]));
+    crate::edit::TextPos { line, col }
+}
+
+/// 캐럿 이동 한 번을 적용한 새 위치. 좌/우는 줄 경계를 넘어간다.
+fn apply_caret_move(
+    lines: &[String],
+    p: crate::edit::TextPos,
+    mv: CaretMove,
+) -> crate::edit::TextPos {
+    use crate::edit::TextPos;
+    let p = clamp_pos(lines, p);
+    match mv {
+        CaretMove::Left => {
+            if p.col > 0 {
+                TextPos { line: p.line, col: p.col - 1 }
+            } else if p.line > 0 {
+                TextPos { line: p.line - 1, col: line_char_len(&lines[p.line - 1]) }
+            } else {
+                p
+            }
+        }
+        CaretMove::Right => {
+            if p.col < line_char_len(&lines[p.line]) {
+                TextPos { line: p.line, col: p.col + 1 }
+            } else if p.line + 1 < lines.len() {
+                TextPos { line: p.line + 1, col: 0 }
+            } else {
+                p
+            }
+        }
+        // 위/아래는 col을 유지하되 대상 줄 길이로 클램프(일반 에디터 동작).
+        CaretMove::Up => {
+            if p.line == 0 {
+                TextPos { line: 0, col: 0 }
+            } else {
+                clamp_pos(lines, TextPos { line: p.line - 1, col: p.col })
+            }
+        }
+        CaretMove::Down => {
+            if p.line + 1 >= lines.len() {
+                TextPos { line: p.line, col: line_char_len(&lines[p.line]) }
+            } else {
+                clamp_pos(lines, TextPos { line: p.line + 1, col: p.col })
+            }
+        }
+        CaretMove::Home => TextPos { line: p.line, col: 0 },
+        CaretMove::End => TextPos { line: p.line, col: line_char_len(&lines[p.line]) },
+    }
+}
+
+/// 방향키/Home/End 한 번의 결과 (새 캐럿, 새 선택).
+///
+/// - `extend`(Shift 동반)면 앵커를 유지한 채 캐럿만 옮겨 선택을 넓힌다.
+///   선택이 없었다면 현재 캐럿이 앵커가 된다.
+/// - `extend`가 아니고 선택이 있으면 좌/위는 선택 시작으로, 우/아래는 선택
+///   끝으로 캐럿을 붕괴시킨다(일반 에디터 동작 — 첫 방향키는 선택 해제만).
+///   Home/End는 붕괴 후 그 줄 안에서 이동한다.
+/// - 선택이 없으면 그냥 한 칸 이동.
+fn next_caret_and_sel(
+    lines: &[String],
+    caret: crate::edit::TextPos,
+    sel: Option<(crate::edit::TextPos, crate::edit::TextPos)>,
+    mv: CaretMove,
+    extend: bool,
+) -> (
+    crate::edit::TextPos,
+    Option<(crate::edit::TextPos, crate::edit::TextPos)>,
+) {
+    if extend {
+        let anchor = sel.map(|(a, _)| a).unwrap_or(caret);
+        let to = apply_caret_move(lines, caret, mv);
+        let new_sel = if anchor == to { None } else { Some((anchor, to)) };
+        return (to, new_sel);
+    }
+    match sel {
+        Some((a, b)) => {
+            let (lo, hi) = crate::edit::normalize(a, b);
+            match mv {
+                // 좌/위: 선택 시작으로 붕괴(이동 없음).
+                CaretMove::Left | CaretMove::Up => (lo, None),
+                // 우/아래: 선택 끝으로 붕괴(이동 없음).
+                CaretMove::Right | CaretMove::Down => (hi, None),
+                // Home/End: 캐럿이 있던 줄 안에서 이동.
+                _ => (apply_caret_move(lines, caret, mv), None),
+            }
+        }
+        None => (apply_caret_move(lines, caret, mv), None),
+    }
+}
+
+/// 문서 전체를 덮는 선택 (0,0) ~ (마지막 줄 끝).
+fn whole_document_sel(lines: &[String]) -> (crate::edit::TextPos, crate::edit::TextPos) {
+    use crate::edit::TextPos;
+    let last = lines.len().saturating_sub(1);
+    (
+        TextPos { line: 0, col: 0 },
+        TextPos { line: last, col: lines.get(last).map_or(0, |l| line_char_len(l)) },
+    )
+}
+
+/// 정규화된 선택이 `line` 줄에서 덮는 char 구간 [c0, c1). 걸치지 않으면 None.
+/// 줄 끝을 넘어가는 선택(다음 줄로 이어지는 경우)은 줄 길이 + 1로 표시해
+/// "개행까지 선택됨"을 음영 폭으로 드러낸다.
+fn sel_span_on_line(
+    a: crate::edit::TextPos,
+    b: crate::edit::TextPos,
+    line: usize,
+    len: usize,
+) -> Option<(usize, usize)> {
+    if line < a.line || line > b.line {
+        return None;
+    }
+    let c0 = if line == a.line { a.col.min(len) } else { 0 };
+    // 마지막 줄이 아니면 줄 끝 + 개행 한 칸까지.
+    let c1 = if line == b.line { b.col.min(len) } else { len + 1 };
+    if c0 >= c1 {
+        return None;
+    }
+    Some((c0, c1))
+}
+
+/// 텍스트 모드 렌더: 라인번호 + 줄 전체(구분 안 함).
+///
+/// 뷰 전용 모드(`doc.edit == None`)에서는 기존과 동일하게 `Label` + truncate로
+/// 그린다. 편집 모드에서는 캐럿/선택을 정확히 그려야 하므로 줄 텍스트를 직접
+/// 고정폭 galley로 레이아웃해 그리고, char↔x 매핑에 그 galley의
+/// `pos_from_ccursor` / `cursor_from_pos`를 쓴다(근사 아님).
+fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard: &mut String) {
+    use std::cell::Cell;
+
+    let editing = doc.edit.is_some();
     let total_lines = match &doc.edit {
         Some(e) => e.lines.len(),
         None => doc.index.line_count(),
     };
     let avail_height = ui.available_height();
+
+    // ---- 편집 모드 상태 스냅샷 + 클로저 → 바깥 인텐트 통로 ----
+    // 표 모드와 같은 규율: 테이블 클로저는 doc을 불변으로만 빌리고, 상호작용
+    // 결과는 여기 모아 두었다가 클로저 종료 후 doc.edit에 적용한다.
+    let caret = doc.text_caret;
+    // 정규화한 선택(음영 그리기용).
+    let sel_norm = doc
+        .text_sel
+        .map(|(a, b)| crate::edit::normalize(a, b))
+        .filter(|(a, b)| a != b);
+    let font_id = text_font_id();
+    let text_color = ui.visuals().text_color();
+    let caret_color = ui.visuals().strong_text_color();
+
+    // 클릭/드래그로 잡은 위치. anchor는 누름 시작, head는 확장 끝점.
+    let drag_anchor: Cell<Option<crate::edit::TextPos>> = Cell::new(None);
+    let drag_head: Cell<Option<crate::edit::TextPos>> = Cell::new(None);
+    // 이번 프레임에 "텍스트 줄 위에서" 좌클릭 누름이 진행 중인지.
+    let line_press: Cell<bool> = Cell::new(false);
+    // 우클릭 대상 줄 위치 + 고른 메뉴 동작.
+    let menu_target: Cell<Option<crate::edit::TextPos>> = Cell::new(None);
+    let menu_action: Cell<Option<TextMenuAction>> = Cell::new(None);
+
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    // 이전 프레임부터 이어져 온 "줄에서 시작된 드래그". 버튼을 떼면 꺼진다.
+    // (`next_cell_drag_active`와 같은 전이 규칙을 그대로 쓴다 — 표/텍스트 모드가
+    // 다른 것은 무엇을 눌렀는지뿐이고, 래치 논리는 동일하다.)
+    let drag_active = doc.text_drag_active && primary_down;
+
+    // 키 입력은 프레임당 한 번만 읽는다. 편집 모드 + 다른 위젯이 키보드 포커스를
+    // 갖고 있지 않을 때만 소비한다 — 그렇지 않으면 툴바의 "직접:" 구분자
+    // TextEdit 등에 타이핑할 때 같은 키가 본문에도 들어간다. 텍스트 본문에는
+    // 포커스 가능한 위젯이 없으므로(interact는 focusable하지 않다) "포커스 없음"
+    // = "본문이 입력을 받는다"로 본다.
+    let keyboard_free = ui.memory(|m| m.focused().is_none());
+    let intents: Vec<TextEditIntent> = if editing && keyboard_free {
+        ui.input(collect_text_intents)
+    } else {
+        Vec::new()
+    };
 
     // 줄 전체 컬럼은 넉넉한 초기폭 + resizable. 긴 줄은 셀 안에서 truncate.
     let table = TableBuilder::new(ui)
@@ -1364,10 +1595,364 @@ fn render_text(ui: &mut egui::Ui, doc: &Document, row_base: usize) {
                 });
                 let line = logical_line(doc, logical).unwrap_or_default();
                 row.col(|ui| {
-                    ui.add(egui::Label::new(line).truncate());
+                    // ---- 뷰 전용 모드: 기존 동작 그대로(라벨만) ----
+                    if !editing {
+                        ui.add(egui::Label::new(line).truncate());
+                        return;
+                    }
+
+                    // ---- 편집 모드 ----
+                    let cell_rect = ui.max_rect();
+                    let len = line_char_len(&line);
+                    // 줄 텍스트를 고정폭으로 직접 레이아웃한다. 이 galley 하나가
+                    // (a) 실제 그리는 글자, (b) char→x, (c) x→char의 유일한
+                    // 진실이므로 캐럿/음영이 글자와 어긋날 수 없다.
+                    let galley = ui.fonts(|f| {
+                        f.layout_no_wrap(line.clone(), font_id.clone(), text_color)
+                    });
+                    // 셀 왼쪽 위에 세로 중앙 정렬해 그린다.
+                    let origin = egui::pos2(
+                        cell_rect.left(),
+                        cell_rect.center().y - galley.size().y * 0.5,
+                    );
+                    // char 인덱스 → 셀 좌표 x.
+                    let x_of = |c: usize| -> f32 {
+                        origin.x
+                            + galley
+                                .pos_from_ccursor(egui::text::CCursor::new(c.min(len)))
+                                .min
+                                .x
+                    };
+
+                    let painter = ui.painter().with_clip_rect(cell_rect);
+                    // 1) 선택 음영을 글자 아래에 먼저.
+                    if let Some((a, b)) = sel_norm {
+                        if let Some((c0, c1)) = sel_span_on_line(a, b, logical, len) {
+                            // c1이 len+1이면(개행 포함) 줄 끝 너머 한 칸을 더 칠한다.
+                            let x0 = x_of(c0);
+                            let x1 = if c1 > len {
+                                x_of(len) + galley.size().y * 0.4
+                            } else {
+                                x_of(c1)
+                            };
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(x0, cell_rect.top()),
+                                    egui::pos2(x1, cell_rect.bottom()),
+                                ),
+                                0.0,
+                                sel_shade(),
+                            );
+                        }
+                    }
+                    // 2) 글자.
+                    painter.galley(origin, galley.clone(), text_color);
+                    // 3) 캐럿(그 줄일 때만).
+                    if caret.line == logical {
+                        let x = x_of(caret.col);
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x, cell_rect.top() + 2.0),
+                                egui::pos2(x + 1.5, cell_rect.bottom() - 2.0),
+                            ),
+                            0.0,
+                            caret_color,
+                        );
+                    }
+
+                    // 4) 클릭/드래그 상호작용. 셀 전체가 대상.
+                    let id = ui.id().with(("textline", logical));
+                    let resp = ui.interact(cell_rect, id, egui::Sense::click_and_drag());
+                    // 포인터 x → char 인덱스(같은 galley로 역매핑).
+                    let pos_at_pointer = |pp: egui::Pos2| -> crate::edit::TextPos {
+                        let local = pp - origin;
+                        // y는 한 줄짜리 galley이므로 0으로 눌러 첫 행에 붙인다.
+                        let cur = galley.cursor_from_pos(egui::vec2(local.x, 0.0));
+                        crate::edit::TextPos {
+                            line: logical,
+                            col: cur.ccursor.index.min(len),
+                        }
+                    };
+
+                    // `&& primary_down` 게이트는 표 모드와 같은 이유다:
+                    // is_pointer_button_down_on()은 버튼을 가리지 않아 우클릭
+                    // press에도 참이므로, 게이트가 없으면 우클릭이 선택을
+                    // 캐럿 하나로 무너뜨린다(메뉴는 release에서야 열린다).
+                    let pressed_here = resp.is_pointer_button_down_on() && primary_down;
+                    if pressed_here {
+                        line_press.set(true);
+                    }
+                    if let Some(pp) = resp.interact_pointer_pos() {
+                        let p = pos_at_pointer(pp);
+                        // 새 앵커 = 이번 프레임에 이 줄에서 누름이 시작됐다.
+                        // 드래그가 이어지는 동안(drag_active)에는 앵커를 다시
+                        // 잡지 않아야 확장이 깨지지 않는다.
+                        if resp.clicked() || (pressed_here && !drag_active) {
+                            drag_anchor.set(Some(p));
+                            drag_head.set(Some(p));
+                        }
+                    }
+                    // 드래그 중 확장: 포인터가 이 줄 위 + 줄에서 시작된 드래그.
+                    // 다른 줄로 넘어가는 확장은 원 위젯이 포인터를 캡처하므로
+                    // contains_pointer()로 감지한다(표 모드와 동일).
+                    if drag_active && resp.contains_pointer() {
+                        if let Some(pp) = ui.input(|i| i.pointer.latest_pos()) {
+                            drag_head.set(Some(pos_at_pointer(pp)));
+                        }
+                    }
+
+                    // 5) 우클릭 컨텍스트 메뉴.
+                    resp.context_menu(|ui| {
+                        // 어떤 줄에서 우클릭했는지만 기록한다. col은 줄 끝으로
+                        // 둔다 — 메뉴가 열린 뒤 포인터는 메뉴 창 위에 있어
+                        // 이 줄 좌표계로 되돌릴 수 없고, 메뉴 동작들은
+                        // "선택 밖이면 그 줄로" 이상의 정밀도를 쓰지 않는다.
+                        menu_target.set(Some(crate::edit::TextPos {
+                            line: logical,
+                            col: len,
+                        }));
+                        let pick = |ui: &mut egui::Ui, label: &str, act: TextMenuAction| {
+                            if ui.button(label).clicked() {
+                                menu_action.set(Some(act));
+                                ui.close_menu();
+                            }
+                        };
+                        pick(ui, "잘라내기", TextMenuAction::Cut);
+                        pick(ui, "복사", TextMenuAction::Copy);
+                        pick(ui, "붙여넣기", TextMenuAction::Paste);
+                        pick(ui, "삭제", TextMenuAction::Delete);
+                        ui.separator();
+                        pick(ui, "전체 선택", TextMenuAction::SelectAll);
+                    });
                 });
             });
         });
+
+    // ---- 클로저 종료 → doc 가변 대여 가능 ----
+    if !editing {
+        return;
+    }
+
+    // 1) 드래그 원점 래치 갱신(표 모드와 같은 전이 규칙).
+    doc.text_drag_active =
+        next_cell_drag_active(doc.text_drag_active, primary_down, line_press.get());
+
+    // 2) 마우스 선택/캐럿 갱신.
+    if let Some(anchor) = drag_anchor.get() {
+        let head = drag_head.get().unwrap_or(anchor);
+        doc.text_caret = head;
+        doc.text_sel = if anchor == head { None } else { Some((anchor, head)) };
+    } else if drag_active {
+        if let Some(head) = drag_head.get() {
+            // 앵커는 유지하고 끝점만 확장. 선택이 없었으면 이전 캐럿이 앵커.
+            let anchor = doc.text_sel.map(|(a, _)| a).unwrap_or(doc.text_caret);
+            doc.text_caret = head;
+            doc.text_sel = if anchor == head { None } else { Some((anchor, head)) };
+        }
+    }
+
+    // 3) 키 입력 인텐트 적용.
+    for intent in intents {
+        apply_text_intent(ui, doc, clipboard, intent);
+    }
+
+    // 4) 컨텍스트 메뉴 동작. 우클릭 줄이 현재 선택 밖이면 캐럿만 그 줄로 옮긴다
+    //    (선택은 유지 — 선택 안에서 우클릭한 경우 그 선택에 대해 동작해야 한다).
+    if let Some(t) = menu_target.get() {
+        let inside = sel_norm.map_or(false, |(a, b)| {
+            (a.line..=b.line).contains(&t.line)
+        });
+        if !inside {
+            doc.text_sel = None;
+            if let Some(e) = &doc.edit {
+                doc.text_caret = clamp_pos(&e.lines, t);
+            }
+        }
+    }
+    if let Some(act) = menu_action.get() {
+        let intent = match act {
+            TextMenuAction::Cut => TextEditIntent::Cut,
+            TextMenuAction::Copy => TextEditIntent::Copy,
+            TextMenuAction::Paste => TextEditIntent::Paste(clipboard.clone()),
+            TextMenuAction::Delete => TextEditIntent::Delete,
+            TextMenuAction::SelectAll => TextEditIntent::SelectAll,
+        };
+        apply_text_intent(ui, doc, clipboard, intent);
+    }
+
+    // 5) 프레임 마무리: 캐럿/선택을 현재 버퍼 범위로 클램프해 다음 프레임 렌더와
+    //    다음 인텐트 적용이 항상 유효한 위치에서 시작하게 한다.
+    if let Some(e) = &doc.edit {
+        doc.text_caret = clamp_pos(&e.lines, doc.text_caret);
+        doc.text_sel = doc
+            .text_sel
+            .map(|(a, b)| (clamp_pos(&e.lines, a), clamp_pos(&e.lines, b)))
+            .filter(|(a, b)| a != b);
+    }
+}
+
+/// 이번 프레임의 입력 이벤트에서 텍스트 편집 인텐트를 뽑는다.
+/// egui-winit은 Ctrl+C/X/V를 `Event::Copy`/`Cut`/`Paste`로 변환해 보내고
+/// `Key` 이벤트는 만들지 않으므로, 그 세 개는 이벤트로만 처리한다.
+/// `Event::Text`는 ctrl/command가 눌린 동안에는 오지 않는다(같은 이유).
+fn collect_text_intents(i: &egui::InputState) -> Vec<TextEditIntent> {
+    let mut out = Vec::new();
+    for ev in &i.events {
+        match ev {
+            egui::Event::Text(t) if !t.is_empty() => {
+                out.push(TextEditIntent::Insert(t.clone()));
+            }
+            egui::Event::Copy => out.push(TextEditIntent::Copy),
+            egui::Event::Cut => out.push(TextEditIntent::Cut),
+            egui::Event::Paste(s) => out.push(TextEditIntent::Paste(s.clone())),
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                let shift = modifiers.shift;
+                let ctrl = modifiers.ctrl || modifiers.command;
+                match key {
+                    egui::Key::Enter => out.push(TextEditIntent::Newline),
+                    egui::Key::Backspace => out.push(TextEditIntent::Backspace),
+                    egui::Key::Delete => out.push(TextEditIntent::Delete),
+                    egui::Key::A if ctrl => out.push(TextEditIntent::SelectAll),
+                    egui::Key::ArrowLeft => {
+                        out.push(TextEditIntent::Move(CaretMove::Left, shift))
+                    }
+                    egui::Key::ArrowRight => {
+                        out.push(TextEditIntent::Move(CaretMove::Right, shift))
+                    }
+                    egui::Key::ArrowUp => out.push(TextEditIntent::Move(CaretMove::Up, shift)),
+                    egui::Key::ArrowDown => {
+                        out.push(TextEditIntent::Move(CaretMove::Down, shift))
+                    }
+                    egui::Key::Home => out.push(TextEditIntent::Move(CaretMove::Home, shift)),
+                    egui::Key::End => out.push(TextEditIntent::Move(CaretMove::End, shift)),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 인텐트 하나를 편집 버퍼에 적용한다. 모든 변경은 `dirty = true`.
+///
+/// 핵심 불변식: `lines[i]`에는 `\n`/`\r`가 들어가면 안 된다. 그래서
+/// 문자 삽입은 항상 `insert_str`(개행을 새 줄로 분해)을 거치고, Enter는
+/// `split_line`으로 라우팅한다 — `insert_char`에 `'\n'`을 넘기지 않는다.
+fn apply_text_intent(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    clipboard: &mut String,
+    intent: TextEditIntent,
+) {
+    use crate::edit::{backspace, delete_range, insert_str, normalize, selection_text, split_line};
+
+    let caret = doc.text_caret;
+    let sel_raw = doc.text_sel;
+    let Some(e) = doc.edit.as_mut() else { return };
+    if e.lines.is_empty() {
+        e.lines.push(String::new());
+    }
+    // 캐럿/선택은 반드시 현재 lines 범위로 클램프한 뒤 쓴다. delete_range 등은
+    // lines[pos.line]을 직접 인덱싱하므로, 한 프레임에 여러 인텐트가 연속으로
+    // 적용돼 줄 수가 줄어든 뒤의 오래된 위치를 그대로 넘기면 패닉한다.
+    let caret = clamp_pos(&e.lines, caret);
+    let sel = sel_raw
+        .map(|(a, b)| (clamp_pos(&e.lines, a), clamp_pos(&e.lines, b)))
+        .filter(|(a, b)| a != b);
+
+    // 선택을 먼저 지우고 그 지점을 새 캐럿으로 삼는 공통 처리.
+    let delete_sel = |lines: &mut Vec<String>, sel: Option<(_, _)>| -> Option<crate::edit::TextPos> {
+        sel.map(|(a, b)| delete_range(lines, a, b))
+    };
+
+    match intent {
+        TextEditIntent::Insert(t) => {
+            // \r은 버리고 \n만 남긴다 — insert_str이 \n을 줄 분할로 처리한다.
+            let t = t.replace('\r', "");
+            if t.is_empty() {
+                return;
+            }
+            let at = delete_sel(&mut e.lines, sel).unwrap_or(caret);
+            doc.text_caret = insert_str(&mut e.lines, at, &t);
+            doc.text_sel = None;
+            e.dirty = true;
+        }
+        TextEditIntent::Newline => {
+            let at = delete_sel(&mut e.lines, sel).unwrap_or(caret);
+            doc.text_caret = split_line(&mut e.lines, at);
+            doc.text_sel = None;
+            e.dirty = true;
+        }
+        TextEditIntent::Backspace => {
+            doc.text_caret = match delete_sel(&mut e.lines, sel) {
+                Some(p) => p,
+                None => backspace(&mut e.lines, caret),
+            };
+            doc.text_sel = None;
+            e.dirty = true;
+        }
+        TextEditIntent::Delete => {
+            doc.text_caret = match delete_sel(&mut e.lines, sel) {
+                Some(p) => p,
+                None => {
+                    // 캐럿 다음 한 문자. 줄 끝이면 다음 줄과 병합.
+                    let next = apply_caret_move(&e.lines, caret, CaretMove::Right);
+                    if next == caret {
+                        caret // 문서 끝 — no-op
+                    } else {
+                        delete_range(&mut e.lines, caret, next)
+                    }
+                }
+            };
+            doc.text_sel = None;
+            e.dirty = true;
+        }
+        TextEditIntent::Move(mv, extend) => {
+            let (new_caret, new_sel) = next_caret_and_sel(&e.lines, caret, sel, mv, extend);
+            doc.text_caret = new_caret;
+            doc.text_sel = new_sel;
+        }
+        TextEditIntent::SelectAll => {
+            let (a, b) = whole_document_sel(&e.lines);
+            doc.text_sel = Some((a, b));
+            doc.text_caret = b;
+        }
+        TextEditIntent::Copy => {
+            if let Some((a, b)) = sel {
+                let (a, b) = normalize(a, b);
+                let s = selection_text(&e.lines, a, b);
+                *clipboard = s.clone();
+                ui.output_mut(|o| o.copied_text = s);
+            }
+        }
+        TextEditIntent::Cut => {
+            if let Some((a, b)) = sel {
+                let (a, b) = normalize(a, b);
+                let s = selection_text(&e.lines, a, b);
+                *clipboard = s.clone();
+                ui.output_mut(|o| o.copied_text = s);
+                doc.text_caret = delete_range(&mut e.lines, a, b);
+                doc.text_sel = None;
+                e.dirty = true;
+            }
+        }
+        TextEditIntent::Paste(s) => {
+            let s = s.replace("\r\n", "\n").replace('\r', "\n");
+            if s.is_empty() {
+                return;
+            }
+            let at = delete_sel(&mut e.lines, sel).unwrap_or(caret);
+            doc.text_caret = insert_str(&mut e.lines, at, &s);
+            doc.text_sel = None;
+            e.dirty = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1566,6 +2151,135 @@ mod tests {
         // 뗐다가 다시 누르면 셀 누름이 다시 관측돼야만 켜진다.
         let after_release = next_cell_drag_active(true, false, false);
         assert!(!next_cell_drag_active(after_release, true, false));
+    }
+
+    fn v(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn tp(line: usize, col: usize) -> crate::edit::TextPos {
+        crate::edit::TextPos { line, col }
+    }
+
+    #[test]
+    fn clamp_pos_bounds_line_and_col() {
+        let lines = v(&["ab", "cdef"]);
+        assert_eq!(clamp_pos(&lines, tp(9, 9)), tp(1, 4));
+        assert_eq!(clamp_pos(&lines, tp(0, 9)), tp(0, 2));
+        assert_eq!(clamp_pos(&lines, tp(1, 2)), tp(1, 2));
+        // 빈 lines도 안전하게.
+        assert_eq!(clamp_pos(&[], tp(3, 3)), tp(0, 0));
+    }
+
+    #[test]
+    fn caret_move_crosses_line_boundaries() {
+        let lines = v(&["ab", "cd"]);
+        // 줄 끝에서 오른쪽 → 다음 줄 처음.
+        assert_eq!(apply_caret_move(&lines, tp(0, 2), CaretMove::Right), tp(1, 0));
+        // 줄 처음에서 왼쪽 → 앞 줄 끝.
+        assert_eq!(apply_caret_move(&lines, tp(1, 0), CaretMove::Left), tp(0, 2));
+        // 문서 처음/끝에서는 no-op(끝은 마지막 줄 끝으로 클램프).
+        assert_eq!(apply_caret_move(&lines, tp(0, 0), CaretMove::Left), tp(0, 0));
+        assert_eq!(apply_caret_move(&lines, tp(1, 2), CaretMove::Right), tp(1, 2));
+    }
+
+    #[test]
+    fn caret_move_up_down_clamps_column() {
+        let lines = v(&["abcdef", "xy"]);
+        // 긴 줄에서 짧은 줄로 내려가면 col이 줄 길이로 클램프.
+        assert_eq!(apply_caret_move(&lines, tp(0, 5), CaretMove::Down), tp(1, 2));
+        // 첫 줄에서 위 → 문서 처음.
+        assert_eq!(apply_caret_move(&lines, tp(0, 3), CaretMove::Up), tp(0, 0));
+        // 마지막 줄에서 아래 → 그 줄 끝.
+        assert_eq!(apply_caret_move(&lines, tp(1, 1), CaretMove::Down), tp(1, 2));
+    }
+
+    #[test]
+    fn caret_move_home_end() {
+        let lines = v(&["hello"]);
+        assert_eq!(apply_caret_move(&lines, tp(0, 3), CaretMove::Home), tp(0, 0));
+        assert_eq!(apply_caret_move(&lines, tp(0, 1), CaretMove::End), tp(0, 5));
+    }
+
+    #[test]
+    fn shift_arrow_extends_keeping_anchor() {
+        let lines = v(&["abcdef"]);
+        // 선택 없음 + Shift+Right → 앵커는 현재 캐럿.
+        let (c, s) = next_caret_and_sel(&lines, tp(0, 2), None, CaretMove::Right, true);
+        assert_eq!(c, tp(0, 3));
+        assert_eq!(s, Some((tp(0, 2), tp(0, 3))));
+        // 이어서 한 번 더 → 앵커 유지, 캐럿만 전진.
+        let (c2, s2) = next_caret_and_sel(&lines, c, s, CaretMove::Right, true);
+        assert_eq!(c2, tp(0, 4));
+        assert_eq!(s2, Some((tp(0, 2), tp(0, 4))));
+        // 되돌아와 앵커와 같아지면 선택 해제.
+        let (_, s3) = next_caret_and_sel(&lines, tp(0, 3), s, CaretMove::Left, true);
+        assert_eq!(s3, None);
+    }
+
+    #[test]
+    fn plain_arrow_collapses_selection_without_moving() {
+        let lines = v(&["abcdef"]);
+        let sel = Some((tp(0, 1), tp(0, 4)));
+        // 왼쪽 → 선택 시작으로 붕괴(한 칸 더 가지 않는다).
+        assert_eq!(
+            next_caret_and_sel(&lines, tp(0, 4), sel, CaretMove::Left, false),
+            (tp(0, 1), None)
+        );
+        // 오른쪽 → 선택 끝으로 붕괴.
+        assert_eq!(
+            next_caret_and_sel(&lines, tp(0, 4), sel, CaretMove::Right, false),
+            (tp(0, 4), None)
+        );
+        // 역방향 선택도 정규화해서 판단.
+        let rev = Some((tp(0, 4), tp(0, 1)));
+        assert_eq!(
+            next_caret_and_sel(&lines, tp(0, 1), rev, CaretMove::Right, false),
+            (tp(0, 4), None)
+        );
+    }
+
+    #[test]
+    fn plain_arrow_moves_when_no_selection() {
+        let lines = v(&["abc"]);
+        assert_eq!(
+            next_caret_and_sel(&lines, tp(0, 1), None, CaretMove::Right, false),
+            (tp(0, 2), None)
+        );
+    }
+
+    #[test]
+    fn select_all_spans_whole_document() {
+        let lines = v(&["ab", "cde"]);
+        assert_eq!(whole_document_sel(&lines), (tp(0, 0), tp(1, 3)));
+        // 빈 문서(줄 없음)에서도 패닉하지 않는다.
+        assert_eq!(whole_document_sel(&[]), (tp(0, 0), tp(0, 0)));
+    }
+
+    #[test]
+    fn sel_span_covers_first_middle_last_lines() {
+        // 0행 col2 ~ 2행 col1 선택. 중간 줄은 전부, 시작/끝 줄은 부분.
+        let a = tp(0, 2);
+        let b = tp(2, 1);
+        // 시작 줄: col2부터 줄 끝(len=5) + 개행 한 칸 → (2, 6)
+        assert_eq!(sel_span_on_line(a, b, 0, 5), Some((2, 6)));
+        // 중간 줄: 전부 + 개행.
+        assert_eq!(sel_span_on_line(a, b, 1, 3), Some((0, 4)));
+        // 끝 줄: 처음부터 col1까지(개행 없음).
+        assert_eq!(sel_span_on_line(a, b, 2, 7), Some((0, 1)));
+        // 범위 밖 줄.
+        assert_eq!(sel_span_on_line(a, b, 3, 4), None);
+    }
+
+    #[test]
+    fn sel_span_single_line_and_empty() {
+        let a = tp(1, 1);
+        let b = tp(1, 3);
+        assert_eq!(sel_span_on_line(a, b, 1, 5), Some((1, 3)));
+        // 같은 줄 빈 범위 → None(캐럿만 있는 상태).
+        assert_eq!(sel_span_on_line(a, a, 1, 5), None);
+        // 끝 줄의 col이 0이면(다음 줄 처음에서 끝나는 선택) 그 줄엔 음영 없음.
+        assert_eq!(sel_span_on_line(tp(0, 0), tp(1, 0), 1, 5), None);
     }
 
     #[test]

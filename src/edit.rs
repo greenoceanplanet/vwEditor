@@ -156,6 +156,39 @@ pub fn delete_range(lines: &mut Vec<String>, a: TextPos, b: TextPos) -> TextPos 
     a
 }
 
+/// [a, b) 범위의 텍스트를 추출한다(`delete_range`의 대칭). 정규화 후
+/// 시작 줄 뒷부분 + 중간 줄 전체 + 끝 줄 앞부분을 `\n`으로 join한다.
+/// 빈 범위(a == b)면 빈 문자열.
+pub fn selection_text(lines: &[String], a: TextPos, b: TextPos) -> String {
+    let (a, b) = normalize(a, b);
+    if a == b || a.line >= lines.len() {
+        return String::new();
+    }
+    if a.line == b.line {
+        let s = &lines[a.line];
+        let sa = byte_of(s, a.col);
+        let sb = byte_of(s, b.col);
+        return s[sa.min(sb)..sb.max(sa)].to_owned();
+    }
+    let mut out = String::new();
+    // 시작 줄의 뒷부분.
+    let sa = byte_of(&lines[a.line], a.col);
+    out.push_str(&lines[a.line][sa..]);
+    // 중간 줄 전체.
+    let last = b.line.min(lines.len().saturating_sub(1));
+    for l in (a.line + 1)..last {
+        out.push('\n');
+        out.push_str(&lines[l]);
+    }
+    // 끝 줄의 앞부분.
+    if last > a.line {
+        out.push('\n');
+        let sb = byte_of(&lines[last], b.col);
+        out.push_str(&lines[last][..sb]);
+    }
+    out
+}
+
 pub fn backspace(lines: &mut Vec<String>, pos: TextPos) -> TextPos {
     if pos.col > 0 {
         let prev = TextPos { line: pos.line, col: pos.col - 1 };
@@ -411,6 +444,89 @@ mod tests {
         // "a" + "b" / "c" + "d" → ["ab","cd"]
         assert_eq!(lines, v(&["ab", "cd"]));
         assert_eq!(p, TextPos { line: 1, col: 1 });
+    }
+
+    #[test]
+    fn selection_text_single_line() {
+        let lines = v(&["abcdef"]);
+        let s = selection_text(
+            &lines,
+            TextPos { line: 0, col: 1 },
+            TextPos { line: 0, col: 4 },
+        );
+        assert_eq!(s, "bcd");
+    }
+
+    #[test]
+    fn selection_text_multiline() {
+        // delete_range_multiline과 같은 범위 — 지워지는 부분이 그대로 나와야 한다.
+        let lines = v(&["abc", "XXX", "defg"]);
+        let s = selection_text(
+            &lines,
+            TextPos { line: 0, col: 1 },
+            TextPos { line: 2, col: 2 },
+        );
+        assert_eq!(s, "bc\nXXX\nde");
+    }
+
+    #[test]
+    fn selection_text_empty_range() {
+        let lines = v(&["abc"]);
+        let s = selection_text(
+            &lines,
+            TextPos { line: 0, col: 2 },
+            TextPos { line: 0, col: 2 },
+        );
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn selection_text_reversed_is_normalized() {
+        let lines = v(&["ab", "cd"]);
+        let s = selection_text(
+            &lines,
+            TextPos { line: 1, col: 1 },
+            TextPos { line: 0, col: 1 },
+        );
+        assert_eq!(s, "b\nc");
+    }
+
+    #[test]
+    fn selection_text_two_adjacent_lines() {
+        let lines = v(&["ab", "cd", "ef"]);
+        let s = selection_text(
+            &lines,
+            TextPos { line: 0, col: 2 },
+            TextPos { line: 1, col: 0 },
+        );
+        // 시작 줄 끝 ~ 다음 줄 처음 = 개행 하나.
+        assert_eq!(s, "\n");
+    }
+
+    #[test]
+    fn selection_text_multibyte_chars() {
+        // col은 char 인덱스 — 바이트 인덱스로 자르면 깨진다.
+        let lines = v(&["가나다라"]);
+        let s = selection_text(
+            &lines,
+            TextPos { line: 0, col: 1 },
+            TextPos { line: 0, col: 3 },
+        );
+        assert_eq!(s, "나다");
+    }
+
+    #[test]
+    fn selection_text_mirrors_delete_range() {
+        // selection_text가 뽑아낸 것을 다시 넣으면 원래대로 — 잘라내기/붙여넣기 왕복.
+        let orig = v(&["hello", "world", "again"]);
+        let a = TextPos { line: 0, col: 2 };
+        let b = TextPos { line: 2, col: 3 };
+        let cut = selection_text(&orig, a, b);
+        let mut lines = orig.clone();
+        let p = delete_range(&mut lines, a, b);
+        let end = insert_str(&mut lines, p, &cut);
+        assert_eq!(lines, orig);
+        assert_eq!(end, b);
     }
 
     #[test]
