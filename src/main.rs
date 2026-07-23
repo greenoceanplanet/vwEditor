@@ -2,6 +2,7 @@ mod app;
 mod index;
 mod indexer;
 mod parse;
+mod sort;
 mod source;
 
 fn main() -> eframe::Result<()> {

@@ -17,7 +17,9 @@ pub struct IndexStatus {
 }
 
 struct Inner {
-    offsets: RwLock<Vec<u64>>,
+    /// 줄 시작 offset 배열. `Arc`로 감싸 snapshot()이 O(1) Arc clone으로
+    /// 락 없는 읽기 뷰를 넘길 수 있게 한다(정렬 등 수억 행 순회 hot path).
+    offsets: RwLock<Arc<Vec<u64>>>,
     total_bytes: u64,
     bytes_done: AtomicU64,
     phase: RwLock<Phase>,
@@ -34,7 +36,7 @@ impl LineIndex {
     pub fn new(total_bytes: u64) -> LineIndex {
         LineIndex {
             inner: Arc::new(Inner {
-                offsets: RwLock::new(Vec::new()),
+                offsets: RwLock::new(Arc::new(Vec::new())),
                 total_bytes,
                 bytes_done: AtomicU64::new(0),
                 phase: RwLock::new(Phase::Priming),
@@ -48,7 +50,8 @@ impl LineIndex {
     /// offset 배열을 구성하는 데만 쓰인다. API 대칭성을 위해 남겨둔다.
     #[allow(dead_code)]
     pub fn push_offset(&self, off: u64) {
-        self.inner.offsets.write().unwrap().push(off);
+        let mut guard = self.inner.offsets.write().unwrap();
+        Arc::make_mut(&mut guard).push(off);
     }
 
     /// offset 배열 전체를 한 번의 락으로 교체한다. 병렬 스캔 결과(전체 파일의
@@ -56,11 +59,20 @@ impl LineIndex {
     /// 병렬 결과의 접두부와 동일하므로, 교체해도 이음새 없이 이어진다.
     /// 프라이밍 도중(교체 전)에는 기존 앞부분이 남아 첫 화면이 유지된다.
     pub fn replace_offsets(&self, offsets: Vec<u64>) {
-        *self.inner.offsets.write().unwrap() = offsets;
+        *self.inner.offsets.write().unwrap() = Arc::new(offsets);
     }
 
     pub fn line_count(&self) -> usize {
         self.inner.offsets.read().unwrap().len()
+    }
+
+    /// offset 배열의 락 없는 읽기 뷰(Arc clone, O(1))와 total_bytes를 함께
+    /// 돌려준다. 정렬처럼 수억 행을 순회하는 hot path에서 행마다 RwLock을
+    /// 잡지 않도록, 한 번 snapshot을 떠 워커들이 공유한다. 인덱싱 완료 후에는
+    /// offsets가 불변이므로 이 뷰가 안정적이다.
+    pub fn snapshot(&self) -> (Arc<Vec<u64>>, u64) {
+        let offsets = self.inner.offsets.read().unwrap().clone();
+        (offsets, self.inner.total_bytes)
     }
 
     /// 현재 UI는 line_range만 사용하지만, offset 조회 API를 대칭적으로 남겨둔다.
@@ -77,6 +89,14 @@ impl LineIndex {
             .get(row + 1)
             .copied()
             .unwrap_or(self.inner.total_bytes);
+        Some((start, end))
+    }
+
+    /// snapshot으로 얻은 offsets 슬라이스에서 행 범위를 계산하는 순수 헬퍼.
+    /// 락 없이 동작하도록 offsets와 total_bytes를 인자로 받는다.
+    pub fn range_in(offsets: &[u64], total_bytes: u64, row: usize) -> Option<(u64, u64)> {
+        let start = *offsets.get(row)?;
+        let end = offsets.get(row + 1).copied().unwrap_or(total_bytes);
         Some((start, end))
     }
 
