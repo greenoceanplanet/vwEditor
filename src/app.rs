@@ -93,6 +93,8 @@ pub enum PendingAction {
     ExitEditMode,
     /// 다른 파일 열기(경로는 이미 고른 상태).
     OpenFile(std::path::PathBuf),
+    /// 창 닫기(X / Alt+F4). 확인되면 실제로 `ViewportCommand::Close`를 보낸다.
+    CloseApp,
 }
 
 impl Default for App {
@@ -254,6 +256,49 @@ pub fn enter_edit_mode(doc: &mut Document) {
     doc.text_drag_active = false;
 }
 
+/// 저장 직후 문서의 뷰 소스(mmap)를 방금 쓴 파일로 다시 겨눈다.
+///
+/// **왜 필요한가.** `Source`는 `Document`가 사는 동안 `Mmap`을 붙들고 있는데
+/// (`source.rs`), `save::write_file`은 임시 파일을 만든 뒤 `std::fs::rename`으로
+/// 원본을 갈아치운다(`save.rs`). Windows에서 이 rename 자체는 **성공**하지만,
+/// 기존 매핑은 고아가 된 옛 파일 오브젝트의 **저장 전 바이트를 계속 돌려준다**.
+/// 그대로 두면 저장 후 편집 모드를 껐을 때 `logical_line`이 `decode_logical_line`
+/// (mmap 경로)으로 떨어지면서 화면이 **저장 전 내용**으로 되돌아가 사용자에게는
+/// 작업이 날아간 것처럼 보인다. `index`도 낡아 행 수가 파일과 어긋난다.
+/// "다른 이름으로 저장"이면 `path`만 새 파일을 가리키고 `source`는 원본을 매핑한
+/// 채로 남아 더 나쁘다.
+///
+/// **왜 `open_path`가 아닌가.** `open_path`는 인코딩/구분자/헤더를 새로 감지하고
+/// `Document`를 통째로 갈아끼운다 — 편집 버퍼(`edit`), 선택(`cell_sel`/`text_sel`),
+/// 커서, 선택 컬럼이 전부 날아가고, 저장 인코딩이 원본과 다르면 툴바 설정까지
+/// 바뀐다. 저장은 "파일이 갱신됐다"는 사건일 뿐 "새 파일을 열었다"가 아니므로,
+/// 여기서는 `source` + `index` + 인덱서만 교체하고 나머지 편집 세션 상태는
+/// **손대지 않는다**. `edit.lines`는 편집 모드의 진실이므로 절대 다시 읽지 않는다.
+///
+/// 실패(파일이 곧바로 지워졌다 등)하면 소스를 교체하지 않고 에러 문자열을
+/// 돌려준다 — 낡은 매핑이 남지만 저장 자체는 이미 성공했고, 편집 버퍼가
+/// 여전히 진실이므로 편집 모드 화면은 정확하다.
+fn repoint_source_after_save(
+    doc: &mut Document,
+    path: &Path,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let src = match source::open(path) {
+        Ok(s) => Arc::new(s),
+        Err(e) => return Err(format!("저장 후 파일 다시 열기 실패: {e}")),
+    };
+    // 새 인덱스를 만들고 인덱서를 새로 띄운다(Paused → "이어서 읽기"와 같은 패턴).
+    let index = LineIndex::new(src.len());
+    let handle = indexer::spawn_indexer(src.clone(), index.clone(), doc.enc, ctx.clone());
+    doc.source = src;
+    doc.index = index;
+    doc.indexer = Some(handle);
+    // 옛 인덱스 기준의 permutation은 새 파일에 맞지 않는다.
+    doc.sort = None;
+    doc.sort_job = None;
+    Ok(())
+}
+
 /// 편집 모드 이탈(버퍼 폐기). dirty 경고는 호출측 UI에서.
 pub fn exit_edit_mode(doc: &mut Document) {
     doc.edit = None;
@@ -297,6 +342,21 @@ impl eframe::App for App {
             // 휠 한 칸(대략 ±? px)마다 배율을 곱셈으로 조절해 부드럽게.
             let new_factor = (factor * (1.0 + scroll_y * 0.001)).clamp(0.5, 4.0);
             ctx.set_zoom_factor(new_factor);
+        }
+
+        // 창 닫기(X / Alt+F4). 저장하지 않은 편집이 있으면 닫기를 취소하고 다른
+        // 폐기 경로(편집 모드 Off, 파일 → 열기…)와 같은 확인 창으로 보낸다.
+        // 확인 창에서 "계속"을 누르면 그때 실제로 Close를 보낸다.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            // 이미 확인 창이 떠 있으면(사용자가 X를 또 눌렀다) 중복 처리하지 않고
+            // 닫기만 막는다 — pending_action을 덮어써 앞선 동작을 잃지 않게.
+            if self.pending_action.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else if self.edit_dirty() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.pending_action = Some(PendingAction::CloseApp);
+            }
+            // dirty가 아니면 그대로 닫히게 둔다.
         }
 
         // 최상단 메뉴바 (파일 / 도구)
@@ -477,9 +537,16 @@ impl eframe::App for App {
         // 하단 상태바
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // 오류는 문서 상태와 **배타 분기가 아니라 덧붙는 구간**이다.
+                // 저장 실패 순간이야말로 "편집 중 — N 행 / ● 변경됨"이 가장
+                // 필요한 때인데, 예전처럼 else-if로 두면 그 표시가 사라졌다.
                 if let Some(err) = &self.error {
                     ui.colored_label(egui::Color32::RED, err);
-                } else if let Some(doc) = &mut self.doc {
+                    if self.doc.is_some() {
+                        ui.separator();
+                    }
+                }
+                if let Some(doc) = &mut self.doc {
                     let st = doc.index.status();
                     let done_gb = st.bytes_done as f64 / 1e9;
                     let total_gb = st.total_bytes as f64 / 1e9;
@@ -552,7 +619,8 @@ impl eframe::App for App {
                             ui.colored_label(egui::Color32::from_rgb(230, 120, 60), "● 변경됨");
                         }
                     }
-                } else {
+                } else if self.error.is_none() {
+                    // 문서도 오류도 없을 때만 안내 문구.
                     ui.label("파일을 여세요");
                 }
             });
@@ -733,7 +801,13 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
                 }
                 if save_as {
                     doc.path_label = target.display().to_string();
-                    doc.path = target;
+                    doc.path = target.clone();
+                }
+                // write_file의 rename으로 옛 mmap이 낡았다. 방금 쓴 파일로 다시
+                // 겨눠야 편집 모드를 껐을 때 저장된 내용이 보인다. 편집 버퍼와
+                // 선택 상태는 그대로 유지된다(사용자는 편집 모드에 남는다).
+                if let Err(msg) = repoint_source_after_save(doc, &target, ctx) {
+                    app.error = Some(msg);
                 }
             }
         }
@@ -781,6 +855,14 @@ fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
         }
         Some(PendingAction::OpenFile(p)) => {
             app.open_path(&p, ctx);
+        }
+        Some(PendingAction::CloseApp) => {
+            // 확인됐으니 실제로 닫는다. 이번엔 close_requested 훅이 dirty를
+            // 다시 보지 않도록 편집 버퍼의 dirty를 내려 둔다(이미 폐기 동의).
+            if let Some(e) = app.doc.as_mut().and_then(|d| d.edit.as_mut()) {
+                e.dirty = false;
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         None => {}
     }
@@ -2762,6 +2844,137 @@ mod tests {
         doc2.enc = crate::parse::Encoding::Cp949;
         enter_edit_mode(doc2);
         assert_eq!(doc2.edit.as_ref().unwrap().lines, v(&["h,v", "가,1"]));
+    }
+
+    /// 저장 후 뷰 경로(mmap)가 낡지 않는지. 리뷰가 지목한 CRITICAL 결함의 회귀 방지:
+    /// `Source`가 붙들고 있는 `Mmap`은 `write_file`의 `rename` 뒤에도 **저장 전
+    /// 바이트**를 계속 돌려주므로, 저장 직후 편집 모드를 끄면 화면이 편집 전
+    /// 내용으로 되돌아간다. `repoint_source_after_save`가 이를 막아야 한다.
+    #[test]
+    fn save_repoints_source_so_view_mode_shows_saved_content() {
+        let (mut app, delim) = edit_doc(b"h,v\nold,1\n", true);
+        let ctx = egui::Context::default();
+        let path = app.doc.as_ref().unwrap().path.clone();
+
+        // 편집: 셀 하나를 바꾼다.
+        {
+            let doc = app.doc.as_mut().unwrap();
+            crate::edit::set_cell(&mut doc.edit.as_mut().unwrap().lines, 1, 0, "new", delim);
+            doc.edit.as_mut().unwrap().dirty = true;
+        }
+
+        // 저장 다이얼로그가 하는 일과 같은 순서: write_file → dirty 해제 → 소스 재지정.
+        {
+            let doc = app.doc.as_mut().unwrap();
+            let e = doc.edit.as_ref().unwrap();
+            let opts = crate::save::SaveOptions {
+                enc: doc.enc,
+                bom: false,
+                newline: e.newline,
+            };
+            crate::save::write_file(&path, &e.lines, &opts, None).unwrap();
+            doc.edit.as_mut().unwrap().dirty = false;
+            repoint_source_after_save(doc, &path, &ctx).unwrap();
+            doc.indexer.take().unwrap().join().unwrap();
+        }
+
+        let doc = app.doc.as_mut().unwrap();
+        // 매핑된 바이트 자체가 저장된 내용이어야 한다(옛 매핑이면 "old,1"이 보인다).
+        let raw = String::from_utf8(doc.source.as_bytes().to_vec()).unwrap();
+        assert!(raw.contains("new,1"), "mmap이 저장된 내용을 보여야 함: {raw:?}");
+        assert!(!raw.contains("old,1"), "저장 전 내용이 남아 있으면 안 됨: {raw:?}");
+
+        // 편집 모드를 끄면 뷰 경로(decode_logical_line)로 떨어진다 — 저장된 내용이어야.
+        exit_edit_mode(doc);
+        assert!(doc.edit.is_none());
+        assert_eq!(decode_logical_line(doc, 1).as_deref(), Some("new,1"));
+        assert_eq!(logical_line(doc, 1).as_deref(), Some("new,1"));
+        // 인덱스 행 수도 새 파일과 맞아야 한다(낡은 인덱스면 유령 행이 남는다).
+        assert_eq!(doc.index.line_count(), 2);
+    }
+
+    /// 소스 재지정이 편집 세션을 건드리지 않는지. 사용자는 저장 후에도 편집 모드에
+    /// 남아 계속 편집할 수 있어야 하고, `edit.lines`는 절대 디스크에서 다시
+    /// 읽히면 안 된다(만약 내용이 달랐다면 편집 내용을 잃게 된다).
+    #[test]
+    fn repoint_after_save_preserves_edit_buffer_and_selection() {
+        let (mut app, _delim) = edit_doc(b"h,v\na,1\nb,2\n", true);
+        let ctx = egui::Context::default();
+        let path = app.doc.as_ref().unwrap().path.clone();
+        let doc = app.doc.as_mut().unwrap();
+        doc.cell_sel = Some((1, 0, 2, 1));
+        doc.selected_col = Some(1);
+        // 디스크에는 버퍼와 다른 내용을 써 둔다 — 재지정이 버퍼를 덮어쓰면 들킨다.
+        // 열린 mmap 때문에 in-place 쓰기(fs::write)는 Windows에서 실패하므로
+        // (ERROR_USER_MAPPED_FILE), 프로덕션과 같은 rename 경로(write_file)를 쓴다.
+        {
+            let opts = crate::save::SaveOptions {
+                enc: doc.enc,
+                bom: false,
+                newline: crate::edit::Newline::Lf,
+            };
+            crate::save::write_file(&path, &v(&["h,v", "DISK,9"]), &opts, None).unwrap();
+        }
+
+        repoint_source_after_save(doc, &path, &ctx).unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+
+        let e = doc.edit.as_ref().expect("편집 모드가 유지되어야 함");
+        assert_eq!(e.lines, v(&["h,v", "a,1", "b,2"]), "버퍼는 디스크에서 다시 읽지 않는다");
+        assert_eq!(doc.cell_sel, Some((1, 0, 2, 1)), "선택 유지");
+        assert_eq!(doc.selected_col, Some(1), "선택 컬럼 유지");
+        // 편집 모드에서는 여전히 버퍼가 진실.
+        assert_eq!(logical_line(doc, 1).as_deref(), Some("a,1"));
+    }
+
+    /// save-as: 새 경로로 저장하면 소스도 새 파일을 매핑해야 한다
+    /// (예전에는 path만 새 파일을 가리키고 source는 원본을 매핑한 채였다).
+    #[test]
+    fn save_as_repoints_source_to_new_path() {
+        let (mut app, delim) = edit_doc(b"h,v\nold,1\n", true);
+        let ctx = egui::Context::default();
+        let out = temp_ext(b"", "csv");
+        {
+            let doc = app.doc.as_mut().unwrap();
+            crate::edit::set_cell(&mut doc.edit.as_mut().unwrap().lines, 1, 0, "new", delim);
+            let e = doc.edit.as_ref().unwrap();
+            let opts = crate::save::SaveOptions {
+                enc: doc.enc,
+                bom: false,
+                newline: e.newline,
+            };
+            crate::save::write_file(&out, &e.lines, &opts, None).unwrap();
+            doc.path_label = out.display().to_string();
+            doc.path = out.clone();
+            repoint_source_after_save(doc, &out, &ctx).unwrap();
+            doc.indexer.take().unwrap().join().unwrap();
+        }
+        let doc = app.doc.as_mut().unwrap();
+        exit_edit_mode(doc);
+        assert_eq!(decode_logical_line(doc, 1).as_deref(), Some("new,1"));
+        assert_eq!(doc.path, out);
+    }
+
+    /// 저장 실패해도 편집 버퍼는 dirty로 남는지(Finding 3의 내부 상태 쪽).
+    /// 표시 자체(`ui.colored_label` 배치)는 GUI 없이 검증할 수 없어 수동
+    /// 체크리스트 F-5로 넘겼다 — 여기서는 상태바가 읽는 값이 살아 있음을 고정한다.
+    #[test]
+    fn failed_save_keeps_dirty_state_visible_to_status_bar() {
+        let (mut app, delim) = edit_doc(b"h,v\nold,1\n", true);
+        {
+            let doc = app.doc.as_mut().unwrap();
+            crate::edit::set_cell(&mut doc.edit.as_mut().unwrap().lines, 1, 0, "new", delim);
+            doc.edit.as_mut().unwrap().dirty = true;
+        }
+        // 존재하지 않는 디렉터리로 저장 → 실패.
+        let bad = std::path::Path::new("no_such_dir_xyz").join("out.csv");
+        let doc = app.doc.as_ref().unwrap();
+        let e = doc.edit.as_ref().unwrap();
+        let opts = crate::save::SaveOptions { enc: doc.enc, bom: false, newline: e.newline };
+        assert!(crate::save::write_file(&bad, &e.lines, &opts, None).is_err());
+        // 상태바가 읽는 두 값이 모두 살아 있어야 한다.
+        assert!(app.edit_dirty(), "실패한 저장은 dirty를 유지한다");
+        assert_eq!(app.doc.as_ref().unwrap().edit.as_ref().unwrap().lines.len(), 2);
     }
 
     #[test]
