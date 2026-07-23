@@ -164,4 +164,26 @@ mod tests {
         // 'A' in UTF-16BE = 00 41
         assert_eq!(encode_bytes("A", Encoding::Utf16Be), vec![0x00, 0x41]);
     }
+
+    #[test]
+    fn write_overwrites_existing_file() {
+        // 주 사용 사례: 열었던 파일에 그대로 저장(덮어쓰기).
+        // 임시파일 + rename이 기존 파일을 정확히 대체하는지, 이전 내용이
+        // 남지 않는지(길이가 줄어드는 경우 포함) 확인한다.
+        let p = tmp_path("overwrite");
+        std::fs::write(&p, b"OLD CONTENT THAT IS QUITE LONG\n").unwrap();
+        let opts = SaveOptions { enc: Encoding::Utf8, bom: false, newline: Newline::Lf };
+        write_file(&p, &v(&["new"]), &opts, None).unwrap();
+        // 새 내용만 남고 이전 내용의 잔재가 없어야 한다.
+        assert_eq!(std::fs::read(&p).unwrap(), b"new\n");
+        // 임시 파일이 남아 있으면 안 된다.
+        let tmp = {
+            let mut t = p.clone();
+            let mut n = t.file_name().unwrap().to_owned();
+            n.push(".tmp");
+            t.set_file_name(n);
+            t
+        };
+        assert!(!tmp.exists(), "임시 파일이 정리되어야 함");
+    }
 }
