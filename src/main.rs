@@ -5,6 +5,7 @@
 
 mod app;
 mod edit;
+mod find;
 mod index;
 mod indexer;
 mod parse;
