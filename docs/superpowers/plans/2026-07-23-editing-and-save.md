@@ -2037,6 +2037,383 @@ git commit -m "feat: 오류 행 창 - 파일 열 때 자동 검사, 목록·클�
 
 ---
 
+### Task 14: Undo 스택 (변경분만 기록, 100단계)
+
+> 사용자 추가 요구: "ctrl-z 구현해줘". 방식 = 변경된 부분만 기록(스냅샷 X),
+> 깊이 = 100단계. 대용량 파일이 RAM에 올라 있으므로 전체 복사는 불가.
+
+**Files:**
+- Modify: `src/edit.rs`
+- Test: `src/edit.rs`
+
+**Interfaces:**
+- Produces:
+  - `pub enum EditOp` — 되돌리기에 필요한 최소 정보만 담는 역연산 기록.
+  - `pub struct UndoStack { ops: Vec<EditOp>, limit: usize }` + `push`/`undo`/`clear`/`len`.
+  - `EditBuffer`에 `pub undo: UndoStack` 추가(기본 limit 100).
+
+**설계(중요):** 각 편집을 **되돌리는 데 필요한 것만** 기록한다. 정방향 연산이 아니라
+"이전 상태 조각"을 담는다.
+
+```rust
+/// 되돌리기 한 단계. 각 variant는 그 편집을 취소하는 데 필요한 최소 정보를 담는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditOp {
+    /// 여러 줄의 이전 내용을 복원한다(셀 편집·범위 지우기·붙여넣기 등 값 변경).
+    /// (논리 행번호, 그 행의 이전 전체 텍스트) 목록.
+    Replace(Vec<(usize, String)>),
+    /// 삽입된 행들을 제거한다. at부터 count개를 지우면 원상복구.
+    RemoveInserted { at: usize, count: usize },
+    /// 삭제된 행들을 되살린다. at 위치에 lines를 다시 끼워 넣는다.
+    ReinsertRemoved { at: usize, lines: Vec<String> },
+    /// 정렬 등 전체 재배치를 되돌린다. inverse[i] = 재배치 후 i번째 줄이
+    /// 원래 있던 위치. data_start 이전(헤더)은 건드리지 않는다.
+    Reorder { inverse: Vec<u32>, data_start: usize },
+}
+
+/// 되돌리기 스택. limit을 넘으면 가장 오래된 것부터 버린다(FIFO).
+pub struct UndoStack {
+    ops: Vec<EditOp>,
+    limit: usize,
+}
+
+/// 기본 되돌리기 깊이(사용자 확정).
+pub const UNDO_LIMIT: usize = 100;
+```
+
+- [ ] **Step 1: 실패 테스트 작성**
+
+`src/edit.rs` tests에 추가(`v` 헬퍼 재사용):
+
+```rust
+    #[test]
+    fn undo_replace_restores_previous_lines() {
+        let mut lines = v(&["a,b", "c,d"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        // 1행을 바꾸기 전에 이전 값을 기록.
+        st.push(EditOp::Replace(vec![(1, lines[1].clone())]));
+        lines[1] = "X,Y".to_string();
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["a,b", "c,d"]));
+    }
+
+    #[test]
+    fn undo_remove_inserted_rows() {
+        let mut lines = v(&["a", "b"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        insert_row(&mut lines, 1, String::new());
+        st.push(EditOp::RemoveInserted { at: 1, count: 1 });
+        assert_eq!(lines, v(&["a", "", "b"]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["a", "b"]));
+    }
+
+    #[test]
+    fn undo_reinsert_removed_rows() {
+        let mut lines = v(&["a", "b", "c"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::ReinsertRemoved { at: 1, lines: vec!["b".to_string()] });
+        remove_row(&mut lines, 1);
+        assert_eq!(lines, v(&["a", "c"]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn undo_reorder_restores_original_order() {
+        // 정렬로 재배치한 뒤 undo하면 원래 순서로 돌아온다(헤더 유지).
+        let mut lines = v(&["hdr", "b", "a", "c"]);
+        let order: Vec<u32> = vec![2, 1, 3]; // a(2), b(1), c(3)
+        let inverse = inverse_of(&order, 1);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::Reorder { inverse, data_start: 1 });
+        apply_permutation(&mut lines, &order, 1);
+        assert_eq!(lines, v(&["hdr", "a", "b", "c"]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["hdr", "b", "a", "c"]));
+    }
+
+    #[test]
+    fn undo_pops_in_lifo_order() {
+        let mut lines = v(&["a"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::Replace(vec![(0, "a".to_string())]));
+        lines[0] = "b".to_string();
+        st.push(EditOp::Replace(vec![(0, "b".to_string())]));
+        lines[0] = "c".to_string();
+        st.undo(&mut lines);
+        assert_eq!(lines, v(&["b"]), "최근 것부터 되돌린다");
+        st.undo(&mut lines);
+        assert_eq!(lines, v(&["a"]));
+    }
+
+    #[test]
+    fn undo_on_empty_stack_is_false() {
+        let mut lines = v(&["a"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        assert!(!st.undo(&mut lines));
+        assert_eq!(lines, v(&["a"]));
+    }
+
+    #[test]
+    fn undo_stack_drops_oldest_beyond_limit() {
+        let mut st = UndoStack::new(2);
+        st.push(EditOp::Replace(vec![(0, "1".into())]));
+        st.push(EditOp::Replace(vec![(0, "2".into())]));
+        st.push(EditOp::Replace(vec![(0, "3".into())]));
+        assert_eq!(st.len(), 2, "가장 오래된 것이 버려진다");
+    }
+
+    #[test]
+    fn undo_replace_out_of_range_row_is_ignored() {
+        // 행이 줄어든 뒤 낡은 인덱스가 들어와도 패닉하지 않는다.
+        let mut lines = v(&["a"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::Replace(vec![(5, "x".to_string())]));
+        assert!(st.undo(&mut lines));
+        assert_eq!(lines, v(&["a"]));
+    }
+
+    #[test]
+    fn inverse_of_roundtrips() {
+        let order: Vec<u32> = vec![3, 1, 2];
+        let inv = inverse_of(&order, 1);
+        let mut lines = v(&["h", "x", "y", "z"]);
+        let before = lines.clone();
+        apply_permutation(&mut lines, &order, 1);
+        apply_permutation(&mut lines, &inv, 1);
+        assert_eq!(lines, before);
+    }
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `cargo test edit::tests::undo`
+Expected: FAIL — 타입/함수 미정의.
+
+- [ ] **Step 3: 구현**
+
+```rust
+pub const UNDO_LIMIT: usize = 100;
+
+impl UndoStack {
+    pub fn new(limit: usize) -> Self {
+        UndoStack { ops: Vec::new(), limit }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// 되돌리기 한 단계를 쌓는다. limit을 넘으면 가장 오래된 것을 버린다.
+    /// **편집을 적용하기 직전에** 호출해야 한다(이전 상태를 담으므로).
+    pub fn push(&mut self, op: EditOp) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.ops.len() >= self.limit {
+            self.ops.remove(0);
+        }
+        self.ops.push(op);
+    }
+
+    pub fn clear(&mut self) {
+        self.ops.clear();
+    }
+
+    /// 가장 최근 편집을 되돌린다. 되돌릴 게 없으면 false.
+    /// 범위를 벗어난 인덱스는 조용히 건너뛴다(패닉 없음).
+    pub fn undo(&mut self, lines: &mut Vec<String>) -> bool {
+        let Some(op) = self.ops.pop() else {
+            return false;
+        };
+        match op {
+            EditOp::Replace(items) => {
+                for (row, text) in items {
+                    if row < lines.len() {
+                        lines[row] = text;
+                    }
+                }
+            }
+            EditOp::RemoveInserted { at, count } => {
+                let end = (at + count).min(lines.len());
+                if at < end {
+                    lines.drain(at..end);
+                }
+                if lines.is_empty() {
+                    lines.push(String::new());
+                }
+            }
+            EditOp::ReinsertRemoved { at, lines: removed } => {
+                let at = at.min(lines.len());
+                for (k, text) in removed.into_iter().enumerate() {
+                    lines.insert(at + k, text);
+                }
+            }
+            EditOp::Reorder { inverse, data_start } => {
+                apply_permutation(lines, &inverse, data_start);
+            }
+        }
+        true
+    }
+}
+
+/// 재배치 order의 역순열을 만든다. `apply_permutation(lines, order, ds)`를
+/// 되돌리려면 `apply_permutation(lines, inverse_of(order, ds), ds)`를 적용하면 된다.
+/// order[i] = 재배치 후 i번째 자리에 올 원본 논리 행번호.
+pub fn inverse_of(order: &[u32], data_start: usize) -> Vec<u32> {
+    let mut inv = vec![0u32; order.len()];
+    for (new_i, &orig) in order.iter().enumerate() {
+        let orig_slot = (orig as usize).saturating_sub(data_start);
+        if orig_slot < inv.len() {
+            inv[orig_slot] = (data_start + new_i) as u32;
+        }
+    }
+    inv
+}
+```
+
+`EditBuffer`에 필드 추가(`load_edit_buffer`에서 `undo: UndoStack::new(UNDO_LIMIT)`로 초기화):
+
+```rust
+    /// 되돌리기 스택(최근 UNDO_LIMIT 단계).
+    pub undo: UndoStack,
+```
+
+- [ ] **Step 4: 테스트 통과 확인**
+
+Run: `cargo test edit::tests`
+Expected: PASS.
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add src/edit.rs
+git commit -m "feat: undo 스택 - 변경분만 기록, 100단계"
+```
+
+---
+
+### Task 15: 단축키(Ctrl+Z/C/X/V) + 컬럼 복사 + 선택색 조정
+
+**Files:**
+- Modify: `src/app.rs`
+
+**Interfaces:**
+- Consumes: Task 14의 `EditOp`/`UndoStack`, 기존 `edit::{cells_to_tsv, paste_tsv, clear_cells, set_cell, insert_row, remove_row}`.
+
+**Note:** GUI 배선. 순수 로직은 Task 14 및 기존 태스크에서 테스트됨.
+
+- [ ] **Step 1: 선택 색상 약간 어둡게**
+
+`src/app.rs`의 `sel_shade()`(약 223행)와 헤더 선택색(약 1407행)을 조정한다.
+사용자 요청: "선택 하늘색은 약간만 어둡게".
+
+```rust
+// 데이터 셀/선택 영역 반투명 음영: 기존 (80,150,230,70) → 약간 어둡게
+egui::Color32::from_rgba_unmultiplied(60, 120, 200, 80)
+```
+
+헤더 선택 불투명색도 같은 비율로 낮춘다: `from_rgb(60, 110, 180)` → `from_rgb(45, 90, 155)`.
+
+- [ ] **Step 2: 표 모드 Ctrl+C/X/V 키보드 단축키**
+
+현재 표 모드는 우클릭 메뉴로만 복사/붙여넣기가 된다. `render_table`의 편집 분기에서
+키 입력을 읽어 기존 `CellMenuAction` 경로로 보낸다:
+
+- `Ctrl+C` → `CellMenuAction::Copy`
+- `Ctrl+X` → `CellMenuAction::Cut`
+- `Ctrl+V` → `CellMenuAction::Paste`
+- `Delete` → `CellMenuAction::Clear`(선택 영역 지우기)
+
+주의: egui-winit은 Ctrl+C/X/V를 `Event::Copy`/`Cut`/`Paste`로 변환하고 `Key` 이벤트를
+내지 않는다(텍스트 모드 구현에서 확인됨). 따라서 **`Event::Copy`/`Event::Cut`/
+`Event::Paste`를 처리**해야 한다. `Event::Paste(s)`는 시스템 클립보드 문자열을
+직접 주므로, 표 모드 붙여넣기는 이 문자열을 우선 사용하고 없으면 `clipboard_cache`를
+쓴다(외부 앱 → 뷰어 붙여넣기가 이걸로 가능해진다 — 기존 미해결 항목 해소).
+
+키 입력은 셀 인라인 편집 중(`editing_cell.is_some()`)이면 처리하지 않는다(그 땐
+TextEdit이 가져가야 함). 텍스트 모드에서 쓴 포커스 게이트(`keyboard_free`)와 같은
+규율을 적용한다.
+
+- [ ] **Step 3: 컬럼 전체 선택 복사**
+
+헤더 클릭으로 컬럼을 선택한 상태(`doc.selected_col == Some(c)`)에서 복사가 되게 한다.
+현재 `cells_to_tsv`/`clear_cells`는 사각 범위를 받으므로, 컬럼 선택을 **전체 행 범위의
+사각 선택으로 변환**해 같은 경로를 태운다:
+
+```rust
+/// 컬럼 선택(헤더 클릭)을 데이터 전 구간 사각 선택으로 바꾼다.
+/// 헤더 행은 제외하고 data_start부터 마지막 행까지.
+fn column_as_rect(col: usize, data_start: usize, line_count: usize)
+    -> Option<(usize, usize, usize, usize)>
+{
+    if line_count <= data_start {
+        return None;
+    }
+    Some((data_start, col, line_count - 1, col))
+}
+```
+
+동작:
+- 컬럼이 선택돼 있고 `cell_sel`이 없으면, 복사/잘라내기/지우기/붙여넣기가 이 컬럼
+  사각 범위를 대상으로 한다.
+- 붙여넣기는 컬럼 선택 시 그 컬럼의 첫 데이터 행부터 아래로 채운다.
+- 우클릭 메뉴에서도 동일하게 동작해야 한다.
+
+`cells_to_tsv`는 한 컬럼이면 각 행이 한 필드뿐이라 결과가 `값\n값\n값...` 형태가 되어
+다른 곳(엑셀 등)에 세로로 붙는다 — 의도한 동작.
+
+- [ ] **Step 4: Ctrl+Z 배선 + 편집 지점마다 undo 기록**
+
+`update()`에서 `Ctrl+Z`를 `consume_key(COMMAND, Key::Z)`로 받아 편집 모드일 때
+`edit.undo.undo(&mut edit.lines)`를 호출하고, 성공하면 `dirty = true`,
+선택/커서를 범위 안으로 클램프한다.
+
+**중요 — 편집을 적용하기 직전에 undo를 기록해야 한다.** 각 편집 지점에 push를 넣는다:
+
+| 편집 | 기록할 EditOp |
+|---|---|
+| 셀 편집 커밋(`set_cell`) | `Replace(vec![(logical, 이전_줄_전체)])` |
+| 셀 범위 지우기(`clear_cells`) | `Replace(범위 각 행의 이전 줄)` |
+| 붙여넣기(`paste_tsv`) | `Replace(덮어쓸 행들의 이전 줄)` + 행이 늘면 `RemoveInserted` — 둘 다 필요하면 붙여넣기 전 행 수를 재서 판단 |
+| 행 삽입 | `RemoveInserted { at, count: 1 }` |
+| 행 삭제 | `ReinsertRemoved { at, lines: 삭제된_줄들 }` |
+| 편집 모드 정렬 | `Reorder { inverse: inverse_of(&order, data_start), data_start }` |
+| 텍스트 모드 편집 | 해당 편집이 건드린 행들의 이전 내용을 `Replace`로. 줄 분할/병합은 행 수가 바뀌므로 `RemoveInserted`/`ReinsertRemoved`도 함께 필요 — 가장 단순하고 정확한 방법은 **영향 범위의 이전 줄들을 통째로 `ReinsertRemoved`+`RemoveInserted` 조합 대신, 편집 전후 행 수 변화를 보고 적절한 op를 고르는 것**. 텍스트 편집은 대부분 한두 줄만 바뀌므로 비용이 작다. |
+
+붙여넣기처럼 한 동작이 여러 op를 필요로 하면, `EditOp::Replace`에 여러 행을 담고
+행 수 변화는 별도 op로 push하되 **undo가 LIFO이므로 push 순서를 뒤집어** 넣는다
+(나중에 push한 것이 먼저 되돌려짐).
+
+- [ ] **Step 5: 편집 메뉴 항목 추가**
+
+메뉴바에 "편집" 메뉴를 새로 만들거나 도구 메뉴에 "실행 취소 (Ctrl+Z)" 항목을 넣는다
+(편집 모드 + undo 스택이 비어있지 않을 때만 활성). 사용자가 단축키를 모를 때를 위한 것.
+
+- [ ] **Step 6: 편집 모드 진입/이탈 시 undo 초기화**
+
+`enter_edit_mode`에서 새 버퍼를 만들 때 undo 스택은 비어 있어야 한다(`load_edit_buffer`가
+그렇게 만든다). `exit_edit_mode`는 버퍼를 통째로 버리므로 별도 처리 불필요.
+
+- [ ] **Step 7: 빌드 + 전체 테스트**
+
+Run: `cargo test && cargo build --release`
+Expected: 전체 PASS, 경고 baseline 유지.
+
+- [ ] **Step 8: 커밋**
+
+```bash
+git add src/app.rs
+git commit -m "feat: Ctrl+Z/C/X/V 단축키, 컬럼 전체 복사, 선택색 조정"
+```
+
+---
+
 ### Task 11: .readme 정리 + 최종 검증
 
 **Files:**
