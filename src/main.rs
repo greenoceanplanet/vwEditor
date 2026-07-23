@@ -1,3 +1,8 @@
+// 릴리스 빌드에서는 콘솔 창을 띄우지 않는다(GUI 앱).
+// Rust 기본은 콘솔 서브시스템이라 exe를 실행하면 cmd 창이 함께 뜬다.
+// 디버그 빌드에서는 println!/패닉 메시지를 봐야 하므로 콘솔을 남긴다.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod edit;
 mod index;
