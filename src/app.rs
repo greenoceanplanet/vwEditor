@@ -6791,10 +6791,14 @@ mod tests {
 
     #[test]
     fn scan_all_matches_view_mode_matches_brute_force() {
-        // UTF-8, Partial/WholeWord/WholeCell + CP949 인코딩을 두루 확인한다.
+        // UTF-8·CP949·UTF-16LE·UTF-16BE + Partial/WholeWord/WholeCell을 두루 확인한다.
+        // UTF-16은 코드유닛이 2바이트라 needle 바이트가 문자 경계와 어긋나게 걸릴 수
+        // 있는데, 그런 위양성 후보를 find_in_line_scoped 최종 필터가 걸러야 한다.
         let cases: &[(&[&str], Encoding, SeparatorMode)] = &[
             (&["a,b,c", "hit,x", "y,hit", "no"], Encoding::Utf8, SeparatorMode::Char(b',')),
             (&["가,나", "다,가", "가나,x"], Encoding::Cp949, SeparatorMode::Char(b',')),
+            (&["가,나", "다,가", "가나,x"], Encoding::Utf16Le, SeparatorMode::Char(b',')),
+            (&["가,나", "다,가", "가나,x"], Encoding::Utf16Be, SeparatorMode::Char(b',')),
             (&["The quick", "brown hit", "hit the fox"], Encoding::Utf8, SeparatorMode::None),
         ];
         let scopes = [
