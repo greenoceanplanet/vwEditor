@@ -120,10 +120,45 @@ pub fn detect_separator(path: &std::path::Path, head_lines: &[&str]) -> Separato
 /// 단 한 번의 호출로 끝나도록 하고, 그 뒤에는 EOF 플러시 호출(nend 증가만)
 /// 만 반복해서 받도록 한다. 필드 벡터는 매 호출 후가 아니라 루프 종료 후
 /// 최종 `ends` 스냅샷을 기준으로 한 번에 구성한다.
+///
+/// **성능 노트(K-2).** `csv_core::ReaderBuilder::build()`는 호출마다 NFA/DFA
+/// 전이 테이블을 새로 만든다 — 측정값 **호출당 14.6µs**로, 75만 호출이면
+/// 11초다(따옴표 섞인 대용량 파일의 스캔 폴백 비용의 100%). 그래서 `Reader`를
+/// thread_local로 캐시하고 delim이 바뀔 때만 다시 만든다.
+///
+/// **출력이 달라지지 않는 근거.** `Reader::reset()`은 상태 기계를 초기 상태로
+/// 되돌릴 뿐 파싱 **규칙**(delimiter/quote/escape/terminator)을 바꾸지 않는다.
+/// 규칙은 `build()` 시점에 고정되고 `reset()`이 건드리지 않으므로, 같은 delim
+/// 으로 재사용한 Reader는 새로 만든 Reader와 완전히 같은 결과를 낸다. delim이
+/// 다르면 규칙이 다르므로 **반드시 새로 만든다**(캐시 오염 방지).
 pub fn split_fields(line: &str, delim: u8) -> Vec<String> {
-    let mut reader = csv_core::ReaderBuilder::new()
-        .delimiter(delim)
-        .build();
+    thread_local! {
+        /// (캐시된 delim, 그 delim으로 만든 Reader). 프로세스 전역이 아니라
+        /// thread_local인 이유: `Reader`는 내부 가변 상태(파싱 위치)를 가지므로
+        /// 스레드 간 공유가 불가능하고, 정렬·인덱싱이 rayon으로 여러 스레드에서
+        /// 이 함수를 부른다. thread_local이면 락도 경합도 없다.
+        static READER: std::cell::RefCell<Option<(u8, csv_core::Reader)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    READER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        // delim이 캐시된 것과 다르면 규칙 자체가 다르므로 새로 만든다.
+        // 같으면 reset()으로 상태만 되돌려 재사용한다.
+        match slot.as_mut() {
+            Some((d, r)) if *d == delim => r.reset(),
+            _ => {
+                *slot = Some((delim, csv_core::ReaderBuilder::new().delimiter(delim).build()));
+            }
+        }
+        let reader = &mut slot.as_mut().expect("바로 위에서 채웠다").1;
+        split_fields_with(reader, line)
+    })
+}
+
+/// `split_fields`의 본체. Reader를 **인자로 받아** 캐시 정책(위)과 파싱 논리를
+/// 분리한다 — 테스트가 갓 만든 Reader와 재사용한 Reader에 같은 입력을 넣어
+/// 출력이 동일한지 직접 확인할 수 있다.
+fn split_fields_with(reader: &mut csv_core::Reader, line: &str) -> Vec<String> {
     let bytes = line.as_bytes();
     // 넉넉한 출력 버퍼: 필드 구분자/따옴표가 제거되므로 출력은 입력보다 클 수 없다.
     let mut out = vec![0u8; bytes.len() + 1];
@@ -502,6 +537,97 @@ mod tests {
     #[test]
     fn split_empty_fields() {
         assert_eq!(split_fields("a,,c", b','), vec!["a", "", "c"]);
+    }
+
+    /// **K-2 캐시 오염 회귀.** `split_fields`는 `csv_core::Reader`를 thread_local로
+    /// 캐시하고 delim이 같으면 `reset()` 후 재사용한다. 캐시가 오염되면 delim을
+    /// 바꿨다 되돌렸을 때 **이전 delim 규칙으로 파싱**되므로, 그 왕복을 직접 태운다.
+    #[test]
+    fn split_fields_reuses_reader_across_delims() {
+        // 같은 delim 연속 호출 — reset()이 이전 호출의 상태를 확실히 지우는가.
+        assert_eq!(split_fields("a,b", b','), vec!["a", "b"]);
+        assert_eq!(split_fields("c,d,e", b','), vec!["c", "d", "e"]);
+        assert_eq!(split_fields("f", b','), vec!["f"]);
+        // delim을 바꾼다 — 새 Reader가 만들어져야 한다.
+        assert_eq!(split_fields("a\tb\tc", b'\t'), vec!["a", "b", "c"]);
+        // 탭 delim에서 콤마는 **평범한 문자**여야 한다(콤마 규칙이 남아 있으면 깨진다).
+        assert_eq!(split_fields("a,b\tc", b'\t'), vec!["a,b", "c"]);
+        // 원래 delim으로 되돌아온다 — 여기서 탭 규칙이 남아 있으면 깨진다.
+        assert_eq!(split_fields("a,b", b','), vec!["a", "b"]);
+        assert_eq!(split_fields("x\ty,z", b','), vec!["x\ty", "z"]);
+        // 또 다른 delim으로 한 바퀴 더.
+        assert_eq!(split_fields("p|q", b'|'), vec!["p", "q"]);
+        assert_eq!(split_fields("p,q", b'|'), vec!["p,q"]);
+        assert_eq!(split_fields("p,q", b','), vec!["p", "q"]);
+    }
+
+    /// 따옴표/이스케이프 케이스도 캐시 재사용 뒤에 동일한가. 인용은 상태
+    /// 기계가 "인용 안"을 기억하는 경로라, `reset()`이 그 상태를 안 지우면
+    /// 다음 호출이 인용 안에서 시작해 필드가 통째로 붙는다.
+    #[test]
+    fn split_fields_quotes_survive_reader_reuse() {
+        // 인용이 **닫히지 않은** 입력을 먼저 태워 상태 기계를 "인용 안"에 남긴다.
+        assert_eq!(split_fields("\"a,b", b','), vec!["a,b"]);
+        // 바로 다음 호출이 오염되면 안 된다.
+        assert_eq!(split_fields("c,d", b','), vec!["c", "d"]);
+        assert_eq!(split_fields("\"a,b\",c", b','), vec!["a,b", "c"]);
+        assert_eq!(split_fields("\"a\"\"b\",c", b','), vec!["a\"b", "c"]);
+        assert_eq!(split_fields("e,f", b','), vec!["e", "f"]);
+    }
+
+    /// **`reset()`이 실제로 필요한 지점(K-2).** `csv_core::Reader`는 첫 호출에서만
+    /// 선두 UTF-8 BOM(U+FEFF)을 벗긴다(`has_read` 플래그). 그래서 Reader를 캐시해
+    /// 재사용하면서 `reset()`을 빼먹으면, **두 번째 호출부터 BOM이 안 벗겨져**
+    /// 첫 필드 값이 달라진다(`"a"` → `"\u{feff}a"`). `reset()`이 `has_read`를
+    /// 되돌리므로 캐시된 Reader도 새 Reader와 같은 결과를 낸다.
+    ///
+    /// 이 앱에서 BOM 있는 UTF-8 파일은 `detect_encoding`이 그대로 통과시키므로
+    /// 0번 줄 첫 글자로 U+FEFF가 실제로 들어온다 — 가상의 케이스가 아니다.
+    #[test]
+    fn split_fields_strips_bom_even_on_cached_reader() {
+        let bom_line = "\u{FEFF}a,b";
+        // 캐시를 확실히 "이미 쓴" 상태로 만든다.
+        assert_eq!(split_fields("x,y", b','), vec!["x", "y"]);
+        // 재사용된 Reader여도 BOM이 벗겨져야 한다(reset()을 빼면 여기서 깨진다).
+        assert_eq!(split_fields(bom_line, b','), vec!["a", "b"]);
+        // 연달아 여러 번 불러도 같다.
+        assert_eq!(split_fields(bom_line, b','), vec!["a", "b"]);
+        // 새로 만든 Reader와도 같은 결과인지 직접 대조.
+        let mut fresh = csv_core::ReaderBuilder::new().delimiter(b',').build();
+        assert_eq!(split_fields(bom_line, b','), split_fields_with(&mut fresh, bom_line));
+    }
+
+    /// **출력 동일성의 직접 증명(K-2 핵심).** 캐시로 재사용한 Reader와 그
+    /// 호출마다 새로 만든 Reader가 **모든 입력에서 같은 결과**를 내는가.
+    /// `{a, ", ,, \t, U+FEFF}` 알파벳 길이 0~4 전수 + delim 교차로 확인한다.
+    /// `reset()`이 파싱 규칙을 안 바꾼다는 근거를 테스트가 직접 검증한다.
+    /// BOM을 알파벳에 넣은 이유는 위 `split_fields_strips_bom_even_on_cached_reader`
+    /// 주석 참조 — `reset()`을 빼면 여기서도 깨진다.
+    #[test]
+    fn split_fields_cached_reader_matches_fresh_reader_exhaustively() {
+        const ALPHABET: [char; 5] = ['a', '"', ',', '\t', '\u{FEFF}'];
+        for len in 0..=4usize {
+            for n in 0..ALPHABET.len().pow(len as u32) {
+                let mut n = n;
+                let mut s = String::new();
+                for _ in 0..len {
+                    s.push(ALPHABET[n % ALPHABET.len()]);
+                    n /= ALPHABET.len();
+                }
+                for delim in [b',', b'\t', b'|'] {
+                    // 새 Reader(캐시 이전 동작 그 자체).
+                    let mut fresh =
+                        csv_core::ReaderBuilder::new().delimiter(delim).build();
+                    let want = split_fields_with(&mut fresh, &s);
+                    // 캐시 경로. delim을 번갈아 태워 **재생성** 경로를,
+                    // 같은 delim으로 두 번 불러 **재사용** 경로를 둘 다 태운다.
+                    // (한 번만 부르면 delim이 매번 바뀌어 재생성만 검사하게 되고,
+                    //  `reset()`을 빼먹은 회귀를 놓친다 — 실제로 놓쳤었다.)
+                    assert_eq!(split_fields(&s, delim), want, "input {s:?} delim {delim:?} 1회차");
+                    assert_eq!(split_fields(&s, delim), want, "input {s:?} delim {delim:?} 2회차(재사용)");
+                }
+            }
+        }
     }
 
     #[test]
