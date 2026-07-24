@@ -5,6 +5,13 @@
 
 mod app;
 mod edit;
+// `find::matching_lines`(전 행 브루트포스)는 이제 프로덕션 경로에서 부르지
+// 않는다 — Find All도 추출도 `app::scan_all_matches`(바이트 스캔)를 쓴다.
+// 그래도 **지우지 않는다**: 그 함수가 바이트 스캔의 정답을 정의하는 기준이고,
+// `scan_all_matches`가 그것과 같은 행 집합을 낸다는 계약을 여러 테스트가
+// 그 함수로 검증한다. 그래서 "쓰이지 않는다"는 경고만 이 자리에서 끈다
+// (`find.rs` 자체는 손대지 않는다).
+#[allow(dead_code)]
 mod find;
 mod index;
 mod indexer;

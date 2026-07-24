@@ -2878,22 +2878,25 @@ impl App {
             return;
         }
         let plan = extract_plan(doc.has_header, doc.sep);
-        let total = doc_line_count(doc);
-        // `matching_lines`는 항상 0부터 훑으므로, 헤더를 검색 대상에서 빼려면
-        // 결과에서 거르는 게 아니라 **훑는 구간 자체**를 옮겨야 한다(그래야
-        // 헤더의 매치가 애초에 만들어지지 않는다). 구간을 옮기는 방법은
-        // `get_line`에서 `scan_from`을 더해 주고 돌려받은 행번호에서 다시
-        // 빼는 것 — 순수 함수 쪽에 "어디부터 훑을지"를 알리지 않아도 된다.
-        let hits: Vec<usize> = crate::find::matching_lines(
-            total.saturating_sub(plan.scan_from),
-            &doc.find_query,
-            &doc.find_opts,
-            doc_delimiter(doc),
-            |i| logical_line(doc, i + plan.scan_from),
-        )
-        .into_iter()
-        .map(|i| i + plan.scan_from)
-        .collect();
+        // Find All과 **같은** 스캐너(`scan_all_matches`)를 쓴다. 예전에는
+        // `find::matching_lines` 브루트포스를 불렀는데, 그건 행마다 디코딩 +
+        // `split_fields`/`chars().collect()` 할당을 하므로 같은 문서에서 Find
+        // All은 즉시 끝나는데 추출만 수십 초가 걸렸다(Task G/H/I가 바이트
+        // 스캔으로 최적화한 대상이 Find All뿐이었다).
+        //
+        // **헤더 제외를 왜 결과 필터로 해도 되는가.** 예전 방식은 `get_line`에
+        // `scan_from`을 더해 훑는 **구간 자체**를 옮겼는데, 그건 `matching_lines`가
+        // 돌려주는 행번호의 기준이 "훑기 시작한 자리"로 바뀌기 때문이었다(그래서
+        // 되돌려 더해 줘야 했다). `scan_all_matches`는 처음부터 **문서 전체 기준**
+        // 논리 행번호를 주므로 그 문제가 없고, `scan_from`(0 또는 1)보다 작은 행,
+        // 즉 헤더 행만 버리면 "헤더는 검색 대상이 아니다"가 그대로 성립한다.
+        // 결과 집합은 예전과 완전히 같다 — `scan_all_matches`는 `matching_lines`와
+        // 같은 행 집합을 돌려주도록 계약되어 있다(그 함수 주석 참조).
+        let hits: Vec<usize> = scan_all_matches(doc)
+            .into_iter()
+            .map(|r| r as usize)
+            .filter(|&r| r >= plan.scan_from)
+            .collect();
 
         if hits.is_empty() {
             // 0행이면 탭을 만들지 않는다 — 빈 탭이 열리면 짜증난다.
@@ -2910,7 +2913,10 @@ impl App {
             // 첫 데이터 행이 되어 버린다(행 수가 어긋나는 것보다 나쁘다).
             lines.push(logical_line(doc, 0).unwrap_or_default());
         }
-        // `matching_lines`가 이미 읽어 낸 행을 여기서 **다시** 읽는다. 두 번째
+        // 스캔이 이미 훑은 행을 여기서 **다시** 읽는다(스캔은 행 번호만 주고
+        // 텍스트를 남기지 않는다 — 전 행 텍스트를 들고 있으면 2GB 문서에서
+        // 메모리가 터진다). 매치된 행만 디코딩하므로 매치 수만큼만 든다.
+        // 두 번째
         // 읽기가 실패하는 경우(`None`)는 `unwrap_or_default`로 빈 줄을 넣어
         // 행 수를 지킨다 — `filter_map`으로 조용히 버리면 안내 문구가 말하는
         // 행 수("N rows extracted")와 실제 추출본 행 수가 어긋난다.
@@ -10087,6 +10093,116 @@ mod tests {
             read_all(&app.docs[2]),
             v(&["a,b", "2,hit"]),
             "단어 단위까지 켜지면 hitting도 빠진다"
+        );
+    }
+
+    /// J-1 회귀: 추출이 `find::matching_lines` 브루트포스 대신
+    /// `scan_all_matches` 바이트 스캔을 쓰게 바뀌었다. **행 집합은 예전과
+    /// 완전히 같아야 한다** — 그 등가성을 여기서 직접 확인한다: 예전 방식
+    /// (`matching_lines` + `scan_from` 오프셋)을 테스트 안에서 그대로 재현해
+    /// 실제 추출 결과와 비교한다. 옵션/구분자/헤더 유무를 두루 돌린다.
+    #[test]
+    fn extract_uses_fast_scan_and_matches_brute_force() {
+        // 예전(브루트포스) 방식의 히트 행 번호를 그대로 재현한다.
+        fn old_way(doc: &Document) -> Vec<usize> {
+            let plan = extract_plan(doc.has_header, doc.sep);
+            let total = doc_line_count(doc);
+            crate::find::matching_lines(
+                total.saturating_sub(plan.scan_from),
+                &doc.find_query,
+                &doc.find_opts,
+                doc_delimiter(doc),
+                |i| logical_line(doc, i + plan.scan_from),
+            )
+            .into_iter()
+            .map(|i| i + plan.scan_from)
+            .collect()
+        }
+
+        let bodies: &[&[u8]] = &[
+            b"name,city\nAlice,Seoul\nBob,Busan\nCarol,SEOUL\nseoul,Alice\n",
+            b"1,hit\n2,no\n3,HIT\n4,hitting\n",
+            b"a,b\n\"x,y\",hit\n\"hit\",z\nq,\"hi\"\"t\"\n",
+        ];
+        let scopes = [
+            crate::find::MatchScope::Partial,
+            crate::find::MatchScope::WholeWord,
+            crate::find::MatchScope::WholeCell,
+        ];
+        for body in bodies {
+            for has_header in [true, false] {
+                for needle in ["hit", "Seoul", "seoul", "x,y", "hi\"t"] {
+                    for &scope in &scopes {
+                        for match_case in [true, false] {
+                            let mut app = extract_test_app(body);
+                            {
+                                let doc = app.doc_mut().unwrap();
+                                doc.has_header = has_header;
+                                doc.find_query = needle.to_owned();
+                                doc.find_opts =
+                                    crate::find::FindOptions { match_case, scope };
+                            }
+                            let doc = app.doc().unwrap();
+                            let expected = old_way(doc);
+                            // 지금 구현이 실제로 고르는 행 집합.
+                            let plan = extract_plan(doc.has_header, doc.sep);
+                            let got: Vec<usize> = scan_all_matches(doc)
+                                .into_iter()
+                                .map(|r| r as usize)
+                                .filter(|&r| r >= plan.scan_from)
+                                .collect();
+                            assert_eq!(
+                                got, expected,
+                                "빠른 스캔 + 헤더 필터가 예전 브루트포스와 다르다 \
+                                 (needle={needle:?}, scope={scope:?}, \
+                                 match_case={match_case}, has_header={has_header})"
+                            );
+                            // 실제 추출 결과(줄 텍스트)도 같은 행 집합에서 나온다.
+                            // `extract_matching_rows`가 활성 탭을 새 탭으로 바꾸므로
+                            // 기대값은 **원본 문서에서 미리** 만들어 둔다.
+                            let want: Vec<String> = plan
+                                .prepend_header
+                                .then(|| logical_line(doc, 0).unwrap())
+                                .into_iter()
+                                .chain(expected.iter().map(|&i| logical_line(doc, i).unwrap()))
+                                .collect();
+                            app.extract_matching_rows();
+                            if expected.is_empty() {
+                                assert_eq!(app.docs.len(), 1, "0행이면 탭이 없다");
+                            } else {
+                                assert_eq!(read_all(&app.docs[1]), want);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// J-1 회귀: 새 방식은 문서 **전체**를 훑고 결과에서 헤더 행을 거른다.
+    /// 헤더에 검색어가 있어도 추출 결과에 절대 들어가면 안 된다 —
+    /// 필터(`r >= plan.scan_from`)를 지우면 헤더가 데이터 행으로 한 번 더
+    /// 들어가 결과가 중복된다(맨 앞의 `prepend_header`와 겹친다).
+    #[test]
+    fn extract_excludes_header_even_when_header_matches() {
+        let mut app = extract_test_app(b"city,name\nSeoul,Alice\nBusan,Bob\n");
+        {
+            let doc = app.doc_mut().unwrap();
+            assert!(doc.has_header, "사전 조건: 헤더가 감지된다");
+            // "city"는 헤더 행에만, 그리고 헤더에도 데이터에도 있는 경우를
+            // 함께 보려고 데이터 행에도 걸리는 검색어를 쓴다.
+            doc.find_query = "c".to_owned();
+            doc.find_opts.match_case = false;
+        }
+        app.extract_matching_rows();
+        assert_eq!(
+            read_all(&app.docs[1]),
+            v(&["city,name", "Seoul,Alice"]),
+            "헤더 행은 맨 앞에 한 번만 붙고 매치 결과로는 들어가지 않는다"
+        );
+        assert_eq!(
+            app.docs[0].find_status, "1 row extracted",
+            "행 수도 헤더를 뺀 데이터 행 수여야 한다"
         );
     }
 
