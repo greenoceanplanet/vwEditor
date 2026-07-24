@@ -86,14 +86,19 @@ pub struct Document {
     pub find_focus_pending: bool,
     /// 스크롤 마커용: 검색어가 있는 논리 행 번호(전체 문서). 마커만 이걸 쓴다.
     /// 전체 매치 하이라이트는 보이는 행만 즉석 계산하므로 이 목록을 쓰지 않는다.
-    /// (읽는 쪽은 다음 태스크의 스크롤 마커 거터 렌더다.)
-    #[allow(dead_code)]
+    /// (읽는 쪽은 스크롤 마커 거터 렌더 `render_match_gutter`다.)
     pub match_rows: Vec<u32>,
     /// `match_rows`가 어떤 (검색어, 옵션)으로 만들어졌는지. 현재 find_query/
     /// find_opts와 다르거나 None이면 재스캔(다음 태스크의 렌더 루프가 판단).
     /// 편집/정렬/바꾸기/undo로 버퍼가 바뀌면 `invalidate_match_scan`이 None으로
     /// 지운다.
     pub match_query: Option<(String, crate::find::FindOptions)>,
+    /// `match_rows`를 만들 때 문서가 몇 개 논리 행이었는지. 뷰 모드는 인덱싱이
+    /// 진행되며 행 수가 늘어나므로(부분 인덱싱), 검색어/옵션이 그대로여도 행 수가
+    /// 달라졌으면 스캔이 아직 못 본 행이 생겼다는 뜻이라 재스캔해야 한다. 이
+    /// 값을 `needs_rescan`이 캐시 키의 일부로 함께 본다 — 인덱서 완료 신호를
+    /// 따로 훅하지 않아도 행 수 증가만으로 자연히 재스캔된다(pause/resume도 포함).
+    pub match_scanned_lines: usize,
     /// 찾은 매치가 보이도록 스크롤할 화면 행 번호. 본문 렌더가 소비한다.
     ///
     /// **왜 그 자리에서 곧바로 스크롤하지 않는가.** 본문은 `TableBuilder`
@@ -387,6 +392,7 @@ impl App {
             find_focus_pending: false,
             match_rows: Vec::new(),
             match_query: None,
+            match_scanned_lines: 0,
             pending_scroll_row: None,
         });
     }
@@ -1113,9 +1119,31 @@ impl eframe::App for App {
             }
         }
 
+        // 스크롤 마커 스캔 캐시 갱신. **본문을 그리기 전에** 부른다 — 거터가
+        // 방금 갱신된 `match_rows`를 그리고, 본문 하이라이트가 최신 검색어를
+        // 반영해야 하기 때문이다. `refresh_match_scan`이 needs_rescan일 때만
+        // 비싼 스캔을 돌리므로(query/opts/행수 불변이면 skip) 매 프레임 값싸다.
+        if let Some(doc) = self.doc_mut() {
+            refresh_match_scan(doc);
+        }
+
         // 본문: 구분 모드에 따라 표 뷰 / 텍스트 뷰로 분기.
         let row_base = self.row_base;
         let col_base = self.col_base;
+
+        // 스크롤 마커 거터. `match_rows`가 비어 있지 않을 때만(검색 중 + 매치
+        // 있음) 데이터 영역 오른쪽에 얇은 세로 거터를 뗀다. **egui는
+        // SidePanel을 CentralPanel보다 먼저 등록해야** 남은 영역이 본문에
+        // 돌아가므로, CentralPanel 앞에 둔다.
+        if self
+            .doc()
+            .is_some_and(|d| show_gutter(&d.match_rows))
+        {
+            if let Some(doc) = self.docs.get_mut(self.active) {
+                render_match_gutter(ctx, doc);
+            }
+        }
+
         // 클립보드 캐시는 render_table이 복사/붙여넣기에 쓰므로 가변 대여를
         // doc과 분리해 넘긴다(App 전체를 넘기면 doc과 동시 대여가 불가능).
         let clipboard = &mut self.clipboard_cache;
@@ -1626,8 +1654,7 @@ fn search_from(
 /// "대소문자 무시 + 초대형 파일" 조합에서의 스캔 속도뿐이다. match_case 스캔은
 /// 벤치가 증명한 빠른 경로를 그대로 쓴다.
 ///
-/// (호출부는 다음 태스크의 렌더 루프다 — 여기서는 구현·테스트만 한다.)
-#[allow(dead_code)]
+/// (호출부는 `refresh_match_scan` — 렌더 진입 직전 프레임당 한 번, needs_rescan일 때만.)
 fn scan_all_matches(doc: &Document) -> Vec<u32> {
     let query = &doc.find_query;
     if query.is_empty() {
@@ -1679,7 +1706,6 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
 /// offset을 얻고, 인덱스 snapshot의 offset 배열에 이진탐색해 행 번호로 바꾼다.
 /// 같은 행에 여러 히트가 연속으로 나오면 한 번만 담는다. 그 후보 행만
 /// `find_in_line_scoped`로 정밀 판정한다(whole_word/cell·인코딩 정합성).
-#[allow(dead_code)]
 fn scan_view_memmem(
     doc: &Document,
     query: &str,
@@ -1733,6 +1759,88 @@ fn scan_view_memmem(
     // 걸렀으므로 비연속으로 같은 행이 다시 나올 일은 없다(offset이 단조 증가하고
     // 한 행의 바이트 범위는 연속이므로 같은 행 히트는 반드시 인접한다).
     out
+}
+
+/// 이 프레임에 `scan_all_matches`를 다시 돌려야 하는가. **비싼 스캔(최악
+/// 0.85초/2GB)을 매 프레임 부르지 않도록** 이 판정이 참일 때만 부른다.
+///
+/// `update()` 안에 인라인으로 두지 않고 순수 함수로 뽑는 것은 `find_keys_live`/
+/// `needs_big_op_confirm`와 같은 규율이다 — 게이트 식을 테스트에 따로 베껴
+/// 적으면 실제 가드를 지우거나 뒤집어도 그 테스트는 자기 사본만 보고 통과한다.
+/// 그래서 렌더 루프와 테스트가 **이 함수 하나**를 부른다.
+///
+/// 참이 되는 경우:
+/// - 검색어가 비어 있지 않은데 `match_query`가 현재 (검색어, 옵션)과 다르거나
+///   None일 때(검색어/옵션 변경, 또는 편집·정렬·바꾸기가 무효화한 뒤).
+/// - 검색어가 그대로여도 문서 행 수가 스캔 당시(`match_scanned_lines`)와 다를
+///   때 — 뷰 모드 부분 인덱싱이 진행되며 아직 못 본 행이 생긴 경우다.
+///
+/// 검색어가 **비어 있으면** 재스캔이 아니라 캐시를 비우는 것이므로 여기서는
+/// false를 준다(호출부가 clear를 담당한다 — 그쪽 분기가 먼저다).
+fn needs_rescan(doc: &Document) -> bool {
+    if doc.find_query.is_empty() {
+        return false;
+    }
+    let key_matches = doc
+        .match_query
+        .as_ref()
+        .is_some_and(|(q, o)| q == &doc.find_query && o == &doc.find_opts);
+    if !key_matches {
+        return true;
+    }
+    // 검색어·옵션은 그대로. 그래도 행 수가 늘었으면(인덱싱 진행) 재스캔.
+    doc.match_scanned_lines != doc_line_count(doc)
+}
+
+/// 활성 문서의 스크롤 마커 스캔 캐시를 이 프레임에 맞게 갱신한다. 렌더 진입
+/// 직전(CentralPanel을 그리기 전)에 한 번 부른다.
+///
+/// - 검색어가 비면 캐시를 비운다(마커·거터가 사라진다).
+/// - `needs_rescan`이 참이면 전체 스캔을 다시 돌려 캐시를 채운다.
+/// - 둘 다 아니면 아무것도 하지 않는다(캐시된 `match_rows`를 그대로 쓴다).
+fn refresh_match_scan(doc: &mut Document) {
+    if doc.find_query.is_empty() {
+        doc.match_rows.clear();
+        doc.match_query = None;
+        doc.match_scanned_lines = 0;
+        return;
+    }
+    if needs_rescan(doc) {
+        doc.match_rows = scan_all_matches(doc);
+        doc.match_query = Some((doc.find_query.clone(), doc.find_opts.clone()));
+        doc.match_scanned_lines = doc_line_count(doc);
+    }
+}
+
+/// 스크롤 마커 거터를 그릴지 여부. `match_rows`가 비어 있으면(검색 안 함 또는
+/// 매치 없음) 데이터 폭을 아끼기 위해 그리지 않는다 — 검색 중이고 매치가
+/// 있을 때만 나타난다. 표시 조건을 순수 함수로 뽑아 테스트가 실제 조건을
+/// 부르게 한다(인라인 복붙 금지).
+fn show_gutter(match_rows: &[u32]) -> bool {
+    !match_rows.is_empty()
+}
+
+/// 거터 세로 폭을 전체 논리 행 수에 매핑한다. 논리 행 `row`의 눈금 y 좌표.
+///
+/// `line_count`가 0이면(빈 문서) top을 준다. `row`는 클램프하지 않는다 —
+/// 호출부(`marker_y`)는 항상 유효 행만 넘긴다. 역함수는 `row_at_y`.
+fn marker_y(row: usize, line_count: usize, top: f32, height: f32) -> f32 {
+    if line_count == 0 {
+        return top;
+    }
+    top + (row as f32 / line_count as f32) * height
+}
+
+/// 거터 클릭 y → 논리 행 번호. `marker_y`의 역함수. 거터 위/아래 밖을 클릭해도
+/// 유효 행(`0..line_count-1`)으로 클램프한다 — 거터 끝을 살짝 넘겨 클릭해도
+/// 첫/마지막 행으로 점프하게(에디터 관례).
+fn row_at_y(y: f32, line_count: usize, top: f32, height: f32) -> usize {
+    if line_count == 0 || height <= 0.0 {
+        return 0;
+    }
+    let frac = ((y - top) / height).clamp(0.0, 1.0);
+    let row = (frac * line_count as f32) as usize;
+    row.min(line_count - 1)
 }
 
 /// 현재 매치 한 곳을 치환하고 다음 매치로 옮긴다. 현재 매치가 없으면
@@ -2040,6 +2148,7 @@ fn build_extracted_doc(
         find_focus_pending: false,
         match_rows: Vec::new(),
         match_query: None,
+        match_scanned_lines: 0,
         pending_scroll_row: None,
     }
 }
@@ -3045,6 +3154,67 @@ fn effective_cell_rect(
     column_as_rect(col, data_start, line_count)
 }
 
+/// 표 셀 렌더에 필요한 찾기 하이라이트 컨텍스트. `render_table`이 프레임 시작에
+/// 한 번 스냅샷해 두고 셀마다 `paint_table_cell`에 참조로 넘긴다(인자 수를 줄여
+/// 셀 그리기 함수를 단순하게 유지).
+struct CellFind<'a> {
+    /// 검색 중인가(검색어가 비어 있지 않은가). false면 기존 `Label` 경로 그대로.
+    searching: bool,
+    query: &'a str,
+    opts: &'a crate::find::FindOptions,
+    font_id: &'a egui::FontId,
+    text_color: egui::Color32,
+}
+
+/// 표 셀 하나의 텍스트(+찾기 하이라이트)를 그린다. 뷰 전용 모드와 편집 모드의
+/// 비편집 셀이 **같은 그리기 규칙**을 쓰도록 한 곳에 모은다.
+///
+/// - `find.searching`이 false면 기존 `egui::Label` + truncate 경로 그대로
+///   (회귀·성능 방지 — 셀이 많다). 검색 중일 때만 galley로 바꿔 부분 음영.
+/// - `current_row`가 true면(= 이 셀의 논리 행이 last_match 행) 셀 배경 전체를
+///   `find_current_bg`로 먼저 칠한다(설계 판단: "행 전체 선택"과 일관). 그 위에
+///   개별 매치의 옅은 음영이 겹쳐도, current가 이미 진하므로 무해하다.
+/// - **셀 텍스트에 delim=None으로** `find_in_line_scoped`를 부른다: 셀은 이미
+///   필드로 쪼갠 뒤이므로 Partial/WholeWord는 셀 안 부분 매치, WholeCell은
+///   delim=None의 "행(=여기선 셀) 전체 == query" 규칙이 그대로 "셀==query"가
+///   된다 — 세 scope가 모두 셀 단위로 올바르게 동작한다(다음 사람이 헷갈리지
+///   않도록 남기는 주석 — E2-4).
+fn paint_table_cell(
+    ui: &mut egui::Ui,
+    cell_rect: egui::Rect,
+    text: String,
+    current_row: bool,
+    find: &CellFind,
+) {
+    // current 행이면 셀 배경 전체를 진한 보라로(행 전체 강조).
+    if current_row {
+        ui.painter()
+            .rect_filled(gapless_cell_rect(ui, cell_rect), 0.0, crate::theme::find_current_bg());
+    }
+    // 검색 중이 아니면 기존 Label 경로 그대로.
+    if !find.searching {
+        ui.add(egui::Label::new(text).truncate());
+        return;
+    }
+    let len = line_char_len(&text);
+    let galley =
+        ui.fonts(|f| f.layout_no_wrap(text.clone(), find.font_id.clone(), find.text_color));
+    let origin = egui::pos2(cell_rect.left(), cell_rect.center().y - galley.size().y * 0.5);
+    let x_of = |c: usize| -> f32 {
+        origin.x
+            + galley
+                .pos_from_ccursor(egui::text::CCursor::new(c.min(len)))
+                .min
+                .x
+    };
+    let painter = ui.painter().with_clip_rect(cell_rect);
+    // 셀 텍스트에 delim=None(위 주석). current 셀 배경은 이미 위에서 칠했으므로
+    // 여기서는 개별 매치의 옅은 음영만 그린다(current를 다시 덮지 않는다).
+    let matches = crate::find::find_in_line_scoped(&text, find.query, find.opts, None);
+    paint_match_shades(&painter, cell_rect, &x_of, &matches, None);
+    painter.galley(origin, galley.clone(), find.text_color);
+}
+
 /// Shift+클릭으로 선택을 확장할 때의 새 사각 선택. **앵커는 유지하고 끝점만**
 /// 옮긴다(Windows 표준 동작).
 ///
@@ -3132,6 +3302,28 @@ fn render_table(
     // logical = data_start + view_row).
     let cur_sel = doc.cell_sel;
     let editing_cell = doc.editing_cell;
+
+    // 찾기 하이라이트 스냅샷. 검색어가 비어 있으면 셀은 기존 `Label` 경로를
+    // 그대로 써 회귀·성능을 지키고(셀이 많으므로 이 분기가 중요), 검색 중일
+    // 때만 galley로 부분 음영을 그린다.
+    let find_query = doc.find_query.clone();
+    let find_opts = doc.find_opts.clone();
+    let searching = !find_query.is_empty();
+    // current match 강조는 **셀 배경 전체**로 한다(설계 판단 — 리포트 참조):
+    // 표 모드 last_match.col은 행 전체 기준 char 인덱스라 셀 경계로 정밀 매핑하려면
+    // 인용/구분자를 거슬러야 하는데, `focus_match`가 이미 매치 행을 "행 전체 선택"
+    // 으로 강조하는 것과 일관되게, current 매치가 있는 **논리 행의 모든 셀**을
+    // 진한 보라 배경으로 칠한다. 이 값은 그 논리 행 번호다.
+    let current_match_row = doc.last_match.map(|m| m.line);
+    let font_id = text_font_id();
+    let cell_text_color = ui.visuals().text_color();
+    let cell_find = CellFind {
+        searching,
+        query: &find_query,
+        opts: &find_opts,
+        font_id: &font_id,
+        text_color: cell_text_color,
+    };
     // 편집 중 텍스트는 클로저 안에서 &mut로 써야 하므로 로컬 버퍼에 복사했다가
     // 클로저 종료 후 doc.cell_edit_text에 되돌린다(편집 중일 때만 복사).
     let edit_text: RefCell<String> = RefCell::new(if doc.editing_cell.is_some() {
@@ -3295,11 +3487,16 @@ fn render_table(
                             );
                         }
 
-                        // ---- 뷰 전용 모드: 기존 동작 그대로(라벨만) ----
+                        // ---- 뷰 전용 모드 ----
                         if !editing {
-                            ui.add(
-                                egui::Label::new(fields.get(c).cloned().unwrap_or_default())
-                                    .truncate(),
+                            let current_row =
+                                current_match_row.is_some() && logical == current_match_row;
+                            paint_table_cell(
+                                ui,
+                                cell_rect,
+                                fields.get(c).cloned().unwrap_or_default(),
+                                current_row,
+                                &cell_find,
                             );
                             return;
                         }
@@ -3350,12 +3547,16 @@ fn render_table(
                             }
                         }
 
-                        ui.add(
-                            egui::Label::new(fields.get(c).cloned().unwrap_or_default())
-                                .truncate(),
+                        let current_row = current_match_row == Some(lrow);
+                        paint_table_cell(
+                            ui,
+                            cell_rect,
+                            fields.get(c).cloned().unwrap_or_default(),
+                            current_row,
+                            &cell_find,
                         );
 
-                        // 셀 전체를 클릭/드래그 대상으로. Label 뒤에 interact를 걸어
+                        // 셀 전체를 클릭/드래그 대상으로. 셀 뒤에 interact를 걸어
                         // 셀 칸 어디를 눌러도 반응하게 한다.
                         // sense는 `focusable: false`를 명시한 TABLE_CELL_SENSE다 —
                         // `Sense::click_and_drag()`는 focusable: true라 그려진 셀마다
@@ -4026,6 +4227,54 @@ fn sel_span_on_line(
     Some((c0, c1))
 }
 
+/// 한 줄(또는 표 셀)에 찾기 매치 음영을 그린다. **선택 음영과 글자 사이**에
+/// 그려야 하므로 호출부는 선택 음영 → 이 함수 → `painter.galley` 순으로 부른다.
+///
+/// char↔x 매핑은 **호출부가 넘긴 galley 하나**로만 한다 — 편집 모드가 캐럿/
+/// 선택을 그릴 때 쓰는 그 galley를 그대로 받으므로, 음영이 글자와 어긋날 수
+/// 없다(CJK/탭에서 반복됐던 정렬 버그 방지). `x_of`도 그 galley의
+/// `pos_from_ccursor`를 쓰는 호출부의 클로저를 그대로 받는다.
+///
+/// `matches`는 이 줄에서 찾은 (col, len) 목록(char 인덱스). `current`가 Some이면
+/// 그 (col, len)에 해당하는 매치는 `find_current_bg`(진한 보라)로, 나머지는
+/// `find_match_bg`(옅은 보라)로 그린다 — current를 나중에(위에) 덮어 더 진하게.
+fn paint_match_shades(
+    painter: &egui::Painter,
+    cell_rect: egui::Rect,
+    x_of: &dyn Fn(usize) -> f32,
+    matches: &[(usize, usize)],
+    current: Option<(usize, usize)>,
+) {
+    // 1) 전체 매치를 옅은 보라로.
+    for &(col, len) in matches {
+        let x0 = x_of(col);
+        let x1 = x_of(col + len);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, cell_rect.top()),
+                egui::pos2(x1, cell_rect.bottom()),
+            ),
+            0.0,
+            crate::theme::find_match_bg(),
+        );
+    }
+    // 2) current 매치가 이 줄에 있으면 그 위에 진한 보라로 덮어 그린다.
+    if let Some((cc, cl)) = current {
+        if matches.iter().any(|&(col, len)| col == cc && len == cl) {
+            let x0 = x_of(cc);
+            let x1 = x_of(cc + cl);
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x0, cell_rect.top()),
+                    egui::pos2(x1, cell_rect.bottom()),
+                ),
+                0.0,
+                crate::theme::find_current_bg(),
+            );
+        }
+    }
+}
+
 /// 편집 모드 텍스트 줄이 쓰는 상호작용 sense.
 ///
 /// `Sense::click_and_drag()`와 click/drag는 같지만 `focusable`이 다르다:
@@ -4062,6 +4311,89 @@ const TABLE_CELL_SENSE: egui::Sense = egui::Sense {
     focusable: false,
 };
 
+/// 스크롤 마커 거터. 데이터 영역 오른쪽에 얇은 세로 바를 그려, 문서 전체
+/// (`doc.match_rows`)의 매치 위치를 보라 눈금으로 표시한다 — EMEditor의 우측
+/// 마커 바와 같은 방식이다. `Table::body`가 `ScrollAreaOutput`을 삼켜 스크롤
+/// 트랙 rect를 노출하지 않으므로 기본 스크롤바 위에 겹칠 수 없어, 별도 거터를
+/// 직접 만든다(설계 S-7).
+///
+/// `refresh_match_scan`이 이미 `match_rows`를 갱신했고, 호출부가 비어 있지
+/// 않을 때만(`show_gutter`) 이 함수를 부른다.
+///
+/// **성능(S-8/E2-6): 픽셀 양자화.** `match_rows`는 수백만이 될 수 있으나 거터는
+/// 기껏 수백 픽셀 높이다. 같은 정수 y 픽셀에 여러 눈금을 그려도 화면상 구분이
+/// 안 되므로, `match_rows`가 행 오름차순인 성질을 이용해 **마지막으로 그린 정수
+/// y**를 기억하고 같은 y는 건너뛴다(O(n) 순회 + 최대 거터높이만큼만 draw 호출).
+/// 이렇게 하면 200만 매치라도 draw 호출은 거터 픽셀 수 이하로 묶인다.
+fn render_match_gutter(ctx: &egui::Context, doc: &mut Document) {
+    let line_count = doc_line_count(doc);
+    // 거터 배경은 데이터 영역과 같은 순백 — 눈금 보라만 도드라지게 한다.
+    let frame = egui::Frame::none().fill(crate::theme::data_bg());
+    egui::SidePanel::right("find_marker_gutter")
+        .exact_width(14.0)
+        .resizable(false)
+        .frame(frame)
+        .show(ctx, |ui| {
+            let rect = ui.max_rect();
+            let top = rect.top();
+            let height = rect.height();
+            // 거터 전체를 클릭 대상으로. 클릭 y를 논리 행으로 역산해 스크롤 요청.
+            let resp = ui.interact(rect, ui.id().with("gutter"), egui::Sense::click());
+
+            let painter = ui.painter().with_clip_rect(rect);
+            let marker = crate::theme::find_marker();
+            // 눈금은 2px 높이, 거터 가로 폭 안쪽으로 살짝 여백을 둔다.
+            let x0 = rect.left() + 2.0;
+            let x1 = rect.right() - 2.0;
+            let mut last_px: Option<i32> = None;
+            for &r in &doc.match_rows {
+                let y = marker_y(r as usize, line_count, top, height);
+                let py = y.round() as i32;
+                // 같은 정수 y는 한 번만(양자화). match_rows가 오름차순이라
+                // last_px 비교만으로 충분하다.
+                if last_px == Some(py) {
+                    continue;
+                }
+                last_px = Some(py);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + 2.0)),
+                    0.0,
+                    marker,
+                );
+            }
+            // current match 행은 거터에도 진한 눈금으로(다른 눈금보다 도드라지게).
+            if let Some(m) = doc.last_match {
+                if m.line < line_count {
+                    let y = marker_y(m.line, line_count, top, height);
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), y - 1.0),
+                            egui::pos2(rect.right(), y + 3.0),
+                        ),
+                        0.0,
+                        crate::theme::find_current_bg(),
+                    );
+                }
+            }
+
+            // 거터 클릭 → 그 위치로 점프. 마커는 **논리 행**이지만 스크롤은 화면
+            // 행 기준이므로, 표 모드에서는 정렬 permutation을 거쳐 변환한다
+            // (`focus_match`와 같은 규율). 텍스트 모드는 논리 행이 곧 화면 행이다.
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if resp.clicked() {
+                    let logical = row_at_y(pos.y, line_count, top, height);
+                    doc.pending_scroll_row = Some(match doc.sep {
+                        SeparatorMode::None => logical,
+                        SeparatorMode::Char(_) => {
+                            let data_start = if doc.has_header { 1 } else { 0 };
+                            logical_to_screen_row(doc, logical, data_start)
+                        }
+                    });
+                }
+            }
+        });
+}
+
 /// 텍스트 모드 렌더: 라인번호 + 줄 전체(구분 안 함).
 ///
 /// 뷰 전용 모드(`doc.edit == None`)에서는 기존과 동일하게 `Label` + truncate로
@@ -4093,6 +4425,13 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
     let font_id = text_font_id();
     let text_color = ui.visuals().text_color();
     let caret_color = ui.visuals().strong_text_color();
+
+    // 찾기 하이라이트 스냅샷. 검색어가 비어 있으면 뷰 모드는 기존 `Label`
+    // 경로를 그대로 써 회귀를 피하므로, "검색 중인가"를 미리 판정해 둔다.
+    let find_query = doc.find_query.clone();
+    let find_opts = doc.find_opts.clone();
+    let searching = !find_query.is_empty();
+    let last_match = doc.last_match;
 
     // 클릭/드래그로 잡은 위치. anchor는 누름 시작, head는 확장 끝점.
     let drag_anchor: Cell<Option<crate::edit::TextPos>> = Cell::new(None);
@@ -4174,9 +4513,40 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                 });
                 let line = logical_line(doc, logical).unwrap_or_default();
                 row.col(|ui| {
-                    // ---- 뷰 전용 모드: 기존 동작 그대로(라벨만) ----
+                    // ---- 뷰 전용 모드 ----
                     if !editing {
-                        ui.add(egui::Label::new(line).truncate());
+                        // 검색 중이 아니면 기존 `Label` 경로 그대로(픽셀 단위 회귀
+                        // 방지). 검색 중일 때만 galley로 바꿔 부분 음영을 그린다 —
+                        // 음영·글자만, 캐럿/선택/상호작용은 없다(뷰 모드엔 없으므로).
+                        if !searching {
+                            ui.add(egui::Label::new(line).truncate());
+                            return;
+                        }
+                        let cell_rect = ui.max_rect();
+                        let len = line_char_len(&line);
+                        let galley = ui.fonts(|f| {
+                            f.layout_no_wrap(line.clone(), font_id.clone(), text_color)
+                        });
+                        let origin = egui::pos2(
+                            cell_rect.left(),
+                            cell_rect.center().y - galley.size().y * 0.5,
+                        );
+                        let x_of = |c: usize| -> f32 {
+                            origin.x
+                                + galley
+                                    .pos_from_ccursor(egui::text::CCursor::new(c.min(len)))
+                                    .min
+                                    .x
+                        };
+                        let painter = ui.painter().with_clip_rect(cell_rect);
+                        // 텍스트 모드는 delim=None. current는 이 논리 행의 last_match.
+                        let matches =
+                            crate::find::find_in_line_scoped(&line, &find_query, &find_opts, None);
+                        let current = last_match
+                            .filter(|m| m.line == logical)
+                            .map(|m| (m.col, m.len));
+                        paint_match_shades(&painter, cell_rect, &x_of, &matches, current);
+                        painter.galley(origin, galley.clone(), text_color);
                         return;
                     }
 
@@ -4223,6 +4593,15 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                                 sel_shade(),
                             );
                         }
+                    }
+                    // 1.5) 찾기 매치 음영을 선택 음영과 글자 **사이**에.
+                    if searching {
+                        let matches =
+                            crate::find::find_in_line_scoped(&line, &find_query, &find_opts, None);
+                        let current = last_match
+                            .filter(|m| m.line == logical)
+                            .map(|m| (m.col, m.len));
+                        paint_match_shades(&painter, cell_rect, &x_of, &matches, current);
                     }
                     // 2) 글자.
                     painter.galley(origin, galley.clone(), text_color);
@@ -6913,6 +7292,152 @@ mod tests {
         let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
         apply_edit_sort(doc, &[spec], delim, 1);
         assert!(doc.match_query.is_none(), "정렬이 match_query를 무효화");
+    }
+
+    // ---- E2: 재스캔 트리거 / 거터 매핑 ----
+
+    /// 검색어가 바뀌면(캐시 키 불일치) 재스캔이 필요하다.
+    #[test]
+    fn needs_rescan_true_on_query_change() {
+        let (mut app, _d) = edit_doc(b"h,v\nhit,x\n", true);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "hit".to_owned();
+        // 아직 스캔한 적 없음(match_query None) → 재스캔 필요.
+        assert!(needs_rescan(doc));
+        // 다른 검색어로 스캔했던 것처럼 캐시를 채운다.
+        doc.match_query = Some(("other".to_owned(), doc.find_opts.clone()));
+        doc.match_scanned_lines = doc_line_count(doc);
+        assert!(needs_rescan(doc), "검색어가 바뀌면 재스캔");
+    }
+
+    /// query/opts/행수가 모두 그대로면 재스캔하지 않는다(캐시 재사용).
+    #[test]
+    fn needs_rescan_false_when_unchanged() {
+        let (mut app, _d) = edit_doc(b"h,v\nhit,x\n", true);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "hit".to_owned();
+        doc.match_query = Some(("hit".to_owned(), doc.find_opts.clone()));
+        doc.match_scanned_lines = doc_line_count(doc);
+        assert!(!needs_rescan(doc), "변화 없으면 재스캔하지 않는다");
+        // 옵션만 바꿔도 재스캔(가드 반전 시 여기가 깨진다).
+        doc.find_opts.match_case = !doc.find_opts.match_case;
+        assert!(needs_rescan(doc), "옵션이 바뀌면 재스캔");
+    }
+
+    /// 검색어가 비면 `needs_rescan`은 false(재스캔이 아니라 clear가 맞다 —
+    /// clear는 `refresh_match_scan`이 담당). 그리고 `refresh_match_scan`이
+    /// 비운 검색어에서 캐시를 실제로 지우는지도 확인한다.
+    #[test]
+    fn needs_rescan_false_and_refresh_clears_when_query_empty() {
+        let (mut app, _d) = edit_doc(b"h,v\nhit,x\n", true);
+        let doc = app.doc_mut().unwrap();
+        // 이전 검색의 캐시가 남아 있는 상태.
+        doc.find_query.clear();
+        doc.match_rows = vec![0, 1];
+        doc.match_query = Some(("hit".to_owned(), doc.find_opts.clone()));
+        doc.match_scanned_lines = 2;
+        assert!(!needs_rescan(doc), "빈 검색어는 재스캔 대상이 아니다");
+        refresh_match_scan(doc);
+        assert!(doc.match_rows.is_empty(), "빈 검색어면 캐시를 비운다");
+        assert!(doc.match_query.is_none());
+        assert_eq!(doc.match_scanned_lines, 0);
+    }
+
+    /// 검색어·옵션이 그대로여도 행 수가 늘면(뷰 모드 부분 인덱싱 진행) 재스캔.
+    /// 인덱서 완료 훅 없이 행 수 증가만으로 재스캔되는지 확인한다.
+    #[test]
+    fn needs_rescan_true_when_line_count_grows() {
+        let mut doc = scan_view_doc(&["hit", "no", "hit again"], Encoding::Utf8, SeparatorMode::None);
+        doc.find_query = "hit".to_owned();
+        doc.match_query = Some(("hit".to_owned(), doc.find_opts.clone()));
+        // 스캔 당시엔 행이 2개뿐이었던 것처럼(인덱싱이 덜 끝난 상태).
+        doc.match_scanned_lines = 2;
+        assert!(needs_rescan(&doc), "행 수가 늘면 재스캔이 필요하다");
+    }
+
+    /// `refresh_match_scan`이 검색어가 있을 때 실제로 스캔해 `match_rows`를
+    /// 채우고, 두 번째 호출(변화 없음)에서는 다시 스캔하지 않는지(캐시 재사용).
+    #[test]
+    fn refresh_match_scan_fills_and_caches() {
+        let mut doc =
+            scan_view_doc(&["hit", "no", "hit"], Encoding::Utf8, SeparatorMode::None);
+        doc.find_query = "hit".to_owned();
+        refresh_match_scan(&mut doc);
+        assert_eq!(doc.match_rows, vec![0, 2]);
+        assert_eq!(doc.match_query, Some(("hit".to_owned(), doc.find_opts.clone())));
+        assert_eq!(doc.match_scanned_lines, 3);
+        // 캐시를 흉내로 지워 재스캔이 다시 채우지 않음을 확인(변화 없으면 skip).
+        doc.match_rows = vec![99];
+        refresh_match_scan(&mut doc);
+        assert_eq!(doc.match_rows, vec![99], "변화 없으면 재스캔하지 않는다");
+    }
+
+    /// 거터 표시 조건: match_rows가 비면 감춘다. 순수 함수로 테스트(인라인 복붙 금지).
+    #[test]
+    fn gutter_hidden_when_no_matches() {
+        assert!(!show_gutter(&[]), "매치가 없으면 거터를 감춘다");
+        assert!(show_gutter(&[0]), "매치가 있으면 거터를 보인다");
+        assert!(show_gutter(&[3, 7, 100]));
+    }
+
+    /// marker_y: 첫 행은 top, 마지막 행은 bottom 근처.
+    #[test]
+    fn marker_y_maps_first_row_to_top_last_to_bottom() {
+        let (top, height, n) = (10.0_f32, 200.0_f32, 100);
+        assert_eq!(marker_y(0, n, top, height), top, "0행은 거터 맨 위");
+        // 마지막 행(99)은 bottom(top+height=210)에 가깝되 넘지 않는다.
+        let y_last = marker_y(n - 1, n, top, height);
+        assert!(y_last < top + height, "마지막 행은 bottom 아래로 넘지 않는다");
+        assert!(y_last > top + height - height / n as f32 - 0.1, "그러나 bottom 근처");
+        // 빈 문서(line_count 0)는 top.
+        assert_eq!(marker_y(0, 0, top, height), top);
+    }
+
+    /// row_at_y는 marker_y의 역함수 — 여러 행에 대해 왕복 항등.
+    #[test]
+    fn row_at_y_inverts_marker_y() {
+        let (top, height, n) = (10.0_f32, 200.0_f32, 50);
+        for r in [0usize, 1, 7, 25, 48, 49] {
+            let y = marker_y(r, n, top, height);
+            // 눈금 두께(2px)만큼의 오차를 피하려고 마커 y 정중앙에서 역산한다.
+            assert_eq!(row_at_y(y, n, top, height), r, "행 {r} 왕복이 어긋난다");
+        }
+    }
+
+    /// 거터 위/아래 밖을 클릭해도 유효 행으로 클램프한다.
+    #[test]
+    fn row_at_y_clamps_out_of_range() {
+        let (top, height, n) = (10.0_f32, 200.0_f32, 40);
+        assert_eq!(row_at_y(top - 999.0, n, top, height), 0, "위쪽 밖 → 첫 행");
+        assert_eq!(
+            row_at_y(top + height + 999.0, n, top, height),
+            n - 1,
+            "아래쪽 밖 → 마지막 행"
+        );
+        // 빈 문서/0 높이는 0으로(패닉 없음).
+        assert_eq!(row_at_y(50.0, 0, top, height), 0);
+        assert_eq!(row_at_y(50.0, n, top, 0.0), 0);
+    }
+
+    /// 표 모드 셀 매치 판정: 셀 텍스트에 delim=None으로 `find_in_line_scoped`를
+    /// 부르면 세 scope가 모두 셀 단위로 올바르게 동작한다(E2-4의 핵심 의존).
+    /// 이 논리가 깨지면 표 모드 하이라이트가 어긋나므로 얇게라도 고정한다.
+    #[test]
+    fn table_cell_scope_with_none_delim() {
+        use crate::find::{find_in_line_scoped, FindOptions, MatchScope};
+        // 셀 텍스트 "hitting"에서 needle "hit":
+        let cell = "hitting";
+        // Partial: 셀 안 부분 매치(col 0, len 3).
+        let partial = FindOptions { match_case: true, scope: MatchScope::Partial };
+        assert_eq!(find_in_line_scoped(cell, "hit", &partial, None), vec![(0, 3)]);
+        // WholeWord: "hitting"의 "hit"는 단어 일부라 매치 없음.
+        let word = FindOptions { match_case: true, scope: MatchScope::WholeWord };
+        assert!(find_in_line_scoped(cell, "hit", &word, None).is_empty());
+        // WholeCell + delim=None: 셀 전체 == needle일 때만 → "hitting" != "hit" → 없음.
+        let whole = FindOptions { match_case: true, scope: MatchScope::WholeCell };
+        assert!(find_in_line_scoped(cell, "hit", &whole, None).is_empty());
+        // 셀 전체가 정확히 needle이면 WholeCell 매치.
+        assert_eq!(find_in_line_scoped("hit", "hit", &whole, None), vec![(0, 3)]);
     }
 
     /// 뷰 모드에서도 찾기 자체는 된다(mmap + 인덱스 경로).

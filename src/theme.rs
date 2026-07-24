@@ -71,6 +71,28 @@ pub fn accent() -> Color32 {
     Color32::from_rgb(0, 120, 215)
 }
 
+/// 전체 매치 음영(옅은 보라). 순백 데이터 배경 위에 덧그리므로 알파를 낮게
+/// 유지해 글자가 그대로 읽히게 한다 — 선택 음영(`sel_shade`, 알파 48)과 같은
+/// 계열의 낮은 알파다. current(`find_current_bg`)보다 **확실히 옅어야** 두
+/// 강조가 구분된다.
+pub fn find_match_bg() -> Color32 {
+    Color32::from_rgba_unmultiplied(150, 90, 200, 64)
+}
+
+/// 현재 매치 음영(진한 보라). Find Next/Prev로 점프한 그 매치 하나만 이 색으로
+/// 덮어 그려, 화면의 다른 옅은 매치들과 한눈에 구분되게 한다. `find_match_bg`
+/// 위에 겹쳐 그리므로 그보다 확실히 진하다(알파 ~2배 + 채도 높음).
+pub fn find_current_bg() -> Color32 {
+    Color32::from_rgba_unmultiplied(140, 55, 190, 140)
+}
+
+/// 스크롤 마커 거터의 매치 눈금(보라). 2px로 얇으므로 잘 보이도록 알파를 높게
+/// 둔다. 여러 행이 한 픽셀에 겹치면 누적 알파로 진해져 밀집 구간이 드러난다
+/// (의도된 동작 — S-7).
+pub fn find_marker() -> Color32 {
+    Color32::from_rgba_unmultiplied(150, 70, 200, 200)
+}
+
 /// 폰트 후보를 순서대로 시도해 처음 읽히는 것을 등록하고 그 키를 돌려준다.
 /// 못 읽으면 `None`(해당 폰트는 건너뛴다 — 크래시 없음).
 fn load_font(fonts: &mut FontDefinitions, key: &str, paths: &[&str]) -> Option<String> {
