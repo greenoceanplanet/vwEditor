@@ -1744,6 +1744,22 @@ fn logical_to_screen_row(doc: &Document, logical: usize, data_start: usize) -> u
     }
 }
 
+/// 거터 클릭 한 번이 남겨야 할 스크롤 요청: (정렬, 목표 화면 행).
+/// 정렬은 **항상 Center**다 — Page Up/Down이 `Align::TOP`으로 바꿔 놨을 수
+/// 있으므로 거터 클릭마다 매번 되돌려야 한다(`focus_match`와 같은 이유).
+/// 목표 행은 표 모드(구분자 있음)에서는 정렬 permutation을 거쳐 화면 행으로
+/// 바꾸고, 텍스트 모드는 논리 행이 곧 화면 행이다.
+fn gutter_click_target(doc: &Document, logical: usize, sep: SeparatorMode) -> (egui::Align, usize) {
+    let row = match sep {
+        SeparatorMode::None => logical,
+        SeparatorMode::Char(_) => {
+            let data_start = if doc.has_header { 1 } else { 0 };
+            logical_to_screen_row(doc, logical, data_start)
+        }
+    };
+    (egui::Align::Center, row)
+}
+
 /// 찾은 매치를 화면에 반영한다 — 선택 표시 + 스크롤 요청.
 ///
 /// 텍스트 모드는 매치 구간을 그대로 선택(`text_sel`)하고 캐럿을 매치 끝에
@@ -5365,16 +5381,11 @@ fn render_match_gutter(ctx: &egui::Context, doc: &mut Document) {
             if let Some(pos) = resp.interact_pointer_pos() {
                 if resp.clicked() {
                     let logical = row_at_y(pos.y, line_count, top, height);
-                    // 거터 클릭도 찾기와 같은 중앙 정렬이다(`focus_match`와 같은
-                    // 이유로 매번 명시한다 — Page 키가 TOP으로 바꿔 놨을 수 있다).
-                    doc.pending_scroll_align = egui::Align::Center;
-                    doc.pending_scroll_row = Some(match doc.sep {
-                        SeparatorMode::None => logical,
-                        SeparatorMode::Char(_) => {
-                            let data_start = if doc.has_header { 1 } else { 0 };
-                            logical_to_screen_row(doc, logical, data_start)
-                        }
-                    });
+                    // 거터 클릭도 찾기와 같은 중앙 정렬이다(`gutter_click_target` 참조 —
+                    // Page 키가 TOP으로 바꿔 놨을 수 있어 매번 되돌려야 한다).
+                    let (align, row) = gutter_click_target(doc, logical, doc.sep);
+                    doc.pending_scroll_align = align;
+                    doc.pending_scroll_row = Some(row);
                 }
             }
         });
@@ -10888,5 +10899,196 @@ mod tests {
         assert_eq!(visible_row_count(0.0), 0);
         // 음수(창이 접힌 극단)에서도 패닉하지 않는다.
         assert_eq!(visible_row_count(-100.0), 0);
+    }
+
+    /// **뷰 전용**(편집 모드 진입 없이) 텍스트 문서에서 Page Down 두 번이
+    /// 실제로 서로 다른 자리로 나아가는가.
+    ///
+    /// `render_records_first_visible_row_and_page_size`는 `find_test_doc`으로
+    /// 문서를 만드는데, 그 헬퍼가 `enter_edit_mode`를 부르므로 `editing`이
+    /// 항상 참이다 — `render_text`의 `if !editing { return; }` 이전에 있는
+    /// `first_visible_row` 기록이 조기 반환 **뒤**로 옮겨져도 이 테스트들은
+    /// 걸러내지 못한다(뷰 전용 경로 자체가 실행되지 않으므로). 그래서 여기서는
+    /// `enter_edit_mode`를 부르지 않고 실제 `.txt` 파일을 뷰 모드 그대로 열어
+    /// 그 경로를 직접 태운다.
+    #[test]
+    fn view_only_text_pages_advance_across_two_page_downs() {
+        let content: Vec<u8> = (0..500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        let p = temp_ext(&content, "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        app.doc_mut().unwrap().indexer.take().unwrap().join().unwrap();
+        assert!(
+            app.doc().unwrap().edit.is_none(),
+            "사전 조건: 편집 모드에 들어가지 않은 뷰 전용 문서"
+        );
+
+        let mut clip = String::new();
+        let mut input = egui::RawInput::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        input.screen_rect = Some(screen);
+        let draw = |app: &mut App, clip: &mut String| {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_text(ui, app.doc_mut().unwrap(), 0, clip);
+                });
+            });
+        };
+        draw(&mut app, &mut clip);
+        assert!(
+            app.doc().unwrap().edit.is_none(),
+            "렌더 후에도 뷰 전용 상태 유지(편집 모드로 넘어가지 않음)"
+        );
+
+        // 첫 Page Down.
+        let first_target = {
+            let doc = app.doc_mut().unwrap();
+            apply_page_scroll(doc, PageDir::Down);
+            doc.pending_scroll_row.unwrap()
+        };
+        assert!(first_target > 0, "사전 조건: 실제로 움직일 목표가 생겼다");
+        for _ in 0..40 {
+            draw(&mut app, &mut clip);
+        }
+        let first_observed = app.doc().unwrap().first_visible_row;
+        assert_eq!(
+            app.doc().unwrap().pending_scroll_row,
+            None,
+            "뷰 전용 렌더도 스크롤 요청을 소비해야 한다"
+        );
+
+        // 두 번째 Page Down — `first_visible_row`가 조기 반환 뒤로 밀려
+        // 0에 고정돼 있다면 여기서 다시 같은(작은) 목표를 요청하게 된다.
+        let second_target = {
+            let doc = app.doc_mut().unwrap();
+            apply_page_scroll(doc, PageDir::Down);
+            doc.pending_scroll_row.unwrap()
+        };
+        for _ in 0..40 {
+            draw(&mut app, &mut clip);
+        }
+        let second_observed = app.doc().unwrap().first_visible_row;
+
+        assert!(
+            second_target > first_target,
+            "두 번째 Page Down의 목표는 첫 번째보다 더 아래여야 한다 \
+             (first_target={first_target}, second_target={second_target})"
+        );
+        assert!(
+            second_observed > first_observed,
+            "뷰 전용 모드에서도 실제로 화면이 두 번째 페이지로 나아가야 한다 \
+             (first_observed={first_observed}, second_observed={second_observed})"
+        );
+    }
+
+    /// `render_table`의 (1) `scroll_align` 사용(Align::TOP으로 정확히
+    /// 스크롤하는가 — `render_table.rs:4372`의 하드코딩 Center 뮤턴트를
+    /// 잡는다)과 (2) 관측 write-back(`first_visible_row`/`visible_rows`
+    /// 기록 — 그 블록을 통째로 지우는 뮤턴트를 잡는다)을 한 번에 검증한다.
+    /// `render_records_first_visible_row_and_page_size`(텍스트 모드)와 같은
+    /// 골격을 표 모드로 옮긴 것이다.
+    #[test]
+    fn render_table_scrolls_to_aligned_row_and_records_observation() {
+        // 헤더 없이 500행. has_header=false로 두면 화면 행 = 논리 행이라
+        // 목표 계산이 단순해진다.
+        let content: Vec<u8> = (0..500)
+            .map(|i| format!("r{i},v{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        let p = temp(&content);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.indexer.take().unwrap().join().unwrap();
+            doc.has_header = false;
+        }
+
+        let mut clip = String::new();
+        let mut input = egui::RawInput::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        input.screen_rect = Some(screen);
+        let draw = |app: &mut App, clip: &mut String| {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let doc = app.doc_mut().unwrap();
+                    render_table(ui, doc, b',', 0, 0, clip);
+                });
+            });
+        };
+        draw(&mut app, &mut clip);
+        {
+            let doc = app.doc().unwrap();
+            assert_eq!(doc.first_visible_row, 0, "처음에는 맨 위를 보고 있다");
+            assert!(
+                doc.visible_rows > 0 && doc.visible_rows < 100,
+                "작은 창의 한 화면 행 수가 기록되어야 한다(got {})",
+                doc.visible_rows
+            );
+        }
+
+        // Page Up/Down과 같은 정렬(TOP)로 200행에 스크롤을 요청한다.
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.pending_scroll_row = Some(200);
+            doc.pending_scroll_align = egui::Align::TOP;
+        }
+        for _ in 0..40 {
+            draw(&mut app, &mut clip);
+        }
+        let doc = app.doc().unwrap();
+        assert_eq!(
+            doc.pending_scroll_row, None,
+            "render_table이 스크롤 요청을 소비한다"
+        );
+        // `Align::TOP`은 목표 행의 위 경계를 화면 위에 맞춘다. `body.rows`가
+        // 위쪽에 걸친 행까지 그리므로 관측되는 첫 행은 199 또는 200이다
+        // (픽셀 반올림 — 정확히 200으로 고정하지 않는다). `Align::Center`로
+        // 하드코딩된 뮤턴트라면 이 범위를 크게 벗어난다.
+        assert!(
+            (199..=200).contains(&doc.first_visible_row),
+            "TOP 정렬 스크롤 후 화면 첫 행이 목표 근처(199 또는 200)여야 한다 \
+             (got {})",
+            doc.first_visible_row
+        );
+    }
+
+    /// 거터 클릭은 정렬을 **항상 Center로 되돌린다** — Page 키가 남긴 TOP을
+    /// 그대로 두면 거터 클릭으로 점프한 자리가 화면 맨 위에 붙어 버린다.
+    /// `render_match_gutter`는 실제 클릭을 시뮬레이션하기보다(SidePanel
+    /// 클릭 좌표 산출이 간접적이고 깨지기 쉽다) 그 결정을 뽑아낸 순수 함수
+    /// `gutter_click_target`으로 검증한다 — `page_keys_live`/
+    /// `classify_cell_hit`와 같은 이 코드베이스의 표준 처방.
+    #[test]
+    fn gutter_click_target_always_resets_align_to_center() {
+        let (mut app, _delim) = edit_doc(b"a,b\n1,2\n3,4\n5,6\n", false);
+        let doc = app.doc_mut().unwrap();
+        // Page Down이 TOP을 남겼다고 가정.
+        doc.pending_scroll_align = egui::Align::TOP;
+        let (align, _row) = gutter_click_target(doc, 1, doc.sep);
+        assert_eq!(
+            align,
+            egui::Align::Center,
+            "거터 클릭은 이전 정렬(TOP)과 무관하게 항상 Center로 되돌려야 한다"
+        );
+    }
+
+    /// 표 모드(구분자 있음)에서 거터 클릭의 논리 행 → 화면 행 변환이
+    /// `logical_to_screen_row`와 일치하는가(정렬 permutation을 거치는 경로).
+    #[test]
+    fn gutter_click_target_maps_logical_row_in_table_mode() {
+        let (mut app, delim) = edit_doc(b"h1,h2\na,1\nb,2\nc,3\n", true);
+        let doc = app.doc_mut().unwrap();
+        assert_eq!(doc.sep, SeparatorMode::Char(delim));
+        let (_align, row) = gutter_click_target(doc, 2, doc.sep);
+        // has_header=true → data_start=1 → 논리 2행은 화면 1행.
+        assert_eq!(row, 1);
     }
 }
