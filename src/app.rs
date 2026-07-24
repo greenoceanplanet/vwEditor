@@ -1772,8 +1772,19 @@ fn scan_view_memmem(
 /// 참이 되는 경우:
 /// - 검색어가 비어 있지 않은데 `match_query`가 현재 (검색어, 옵션)과 다르거나
 ///   None일 때(검색어/옵션 변경, 또는 편집·정렬·바꾸기가 무효화한 뒤).
-/// - 검색어가 그대로여도 문서 행 수가 스캔 당시(`match_scanned_lines`)와 다를
-///   때 — 뷰 모드 부분 인덱싱이 진행되며 아직 못 본 행이 생긴 경우다.
+/// - 검색어가 그대로여도 문서 행 수가 스캔 당시(`match_scanned_lines`)와
+///   다르고, **또한** 지금이 "행 수가 더 안 늘어날 시점"일 때 — 편집 모드(버퍼
+///   전체를 이미 로드했으니 늘 그 시점)이거나, 뷰 모드 인덱서가 `Phase::Complete`에
+///   도달했을 때.
+///
+/// 왜 행 수 증가만으로는 부족한가(성능 버그였던 지점). `spawn_indexer`는 8MB
+/// 청크마다 offset 배열을 갱신하고 repaint를 요청한다(`indexer.rs`). 2GB 파일이면
+/// 청크가 ~256개라, 인덱싱 도중 매 청크가 행 수를 늘린다. 행 수 증가만 보고
+/// 재스캔했다면 검색이 켜진 채로 큰 파일을 열 때마다 `scan_all_matches`(최악
+/// 0.85초/2GB)를 ~256번 UI 스레드에서 돌리게 된다 — 재스캔 게이트가 막으려던
+/// 바로 그 폭주다. 그래서 인덱싱이 **진행 중**일 때는 행 수가 늘어도 재스캔하지
+/// 않고(검색은 그때까지 인덱싱된 접두부만 반영), `Phase::Complete`로 전이하는
+/// 프레임에 딱 한 번 재스캔해 전체를 따라잡는다.
 ///
 /// 검색어가 **비어 있으면** 재스캔이 아니라 캐시를 비우는 것이므로 여기서는
 /// false를 준다(호출부가 clear를 담당한다 — 그쪽 분기가 먼저다).
@@ -1788,8 +1799,17 @@ fn needs_rescan(doc: &Document) -> bool {
     if !key_matches {
         return true;
     }
-    // 검색어·옵션은 그대로. 그래도 행 수가 늘었으면(인덱싱 진행) 재스캔.
-    doc.match_scanned_lines != doc_line_count(doc)
+    // 검색어·옵션은 그대로. 행 수가 안 바뀌었으면 볼 것도 없이 재스캔 불필요.
+    if doc.match_scanned_lines == doc_line_count(doc) {
+        return false;
+    }
+    // 행 수가 늘었다 — 그래도 인덱싱이 아직 진행 중이면(뷰 모드, Phase가
+    // Complete가 아님) 재스캔하지 않는다. 편집 모드는 인덱서가 없으니(버퍼가
+    // 이미 전체) 이 게이트를 안 탄다 — 행 수 변화는 곧 실제 버퍼 변경이고,
+    // `invalidate_match_scan`이 그 경로에서 이미 match_query를 None으로 지워
+    // 위 key_matches 분기에서 걸러진다. 그래도 대칭성과 방어적 정확성을 위해
+    // edit 모드는 "완료 상태"로 취급한다.
+    doc.edit.is_some() || doc.index.status().phase == Phase::Complete
 }
 
 /// 활성 문서의 스크롤 마커 스캔 캐시를 이 프레임에 맞게 갱신한다. 렌더 진입
@@ -7343,16 +7363,93 @@ mod tests {
         assert_eq!(doc.match_scanned_lines, 0);
     }
 
-    /// 검색어·옵션이 그대로여도 행 수가 늘면(뷰 모드 부분 인덱싱 진행) 재스캔.
-    /// 인덱서 완료 훅 없이 행 수 증가만으로 재스캔되는지 확인한다.
+    /// 검색어·옵션이 그대로여도 행 수가 늘었고, 인덱싱이 이미 `Phase::Complete`면
+    /// 재스캔한다. `scan_view_doc`은 `build_extracted_doc`을 통해 Complete로
+    /// 만들어지므로(동기로 다 채운 추출본), 이 시나리오를 그대로 대표한다 —
+    /// 인덱싱이 끝난 뒤 "아직 못 본 행"이 있었다면 그건 완료 시점의 캐치업 재스캔.
     #[test]
     fn needs_rescan_true_when_line_count_grows() {
         let mut doc = scan_view_doc(&["hit", "no", "hit again"], Encoding::Utf8, SeparatorMode::None);
+        assert_eq!(doc.index.status().phase, Phase::Complete, "scan_view_doc은 Complete 문서");
         doc.find_query = "hit".to_owned();
         doc.match_query = Some(("hit".to_owned(), doc.find_opts.clone()));
-        // 스캔 당시엔 행이 2개뿐이었던 것처럼(인덱싱이 덜 끝난 상태).
+        // 스캔 당시엔 행이 2개뿐이었던 것처럼(그 사이 인덱싱이 마저 끝난 상태).
         doc.match_scanned_lines = 2;
-        assert!(needs_rescan(&doc), "행 수가 늘면 재스캔이 필요하다");
+        assert!(needs_rescan(&doc), "완료 상태에서 행 수가 늘면 재스캔이 필요하다");
+    }
+
+    /// **핵심 회귀 테스트(E2-perf).** 인덱싱이 아직 진행 중(Phase::Indexing)이면
+    /// 행 수가 늘어도 재스캔하지 않는다 — 이게 없으면 8MB 청크마다(2GB 파일 기준
+    /// ~256번) `scan_all_matches`(최악 0.85초)가 UI 스레드에서 반복 실행된다.
+    /// `Phase::Complete`로 전이하는 순간에는 그 누적분을 한 번에 따라잡아야
+    /// 하므로 그때는 참이어야 한다.
+    #[test]
+    fn needs_rescan_false_while_indexing_true_on_complete_transition() {
+        let mut doc = scan_view_doc(&["hit", "no", "hit again"], Encoding::Utf8, SeparatorMode::None);
+        doc.find_query = "hit".to_owned();
+        doc.match_query = Some(("hit".to_owned(), doc.find_opts.clone()));
+        doc.match_scanned_lines = 2; // 인덱서가 아직 다 못 본 시점의 캐시.
+
+        // 인덱싱 진행 중 — 행 수가 스캔 당시보다 늘었어도(3 != 2) 재스캔 금지.
+        doc.index.set_phase(Phase::Indexing);
+        assert!(
+            !needs_rescan(&doc),
+            "인덱싱 도중에는 행 수 증가만으로 재스캔 폭주를 일으키면 안 된다"
+        );
+        // 같은 상태에서 Priming/Paused도 마찬가지로 "완료 아님" 취급.
+        doc.index.set_phase(Phase::Priming);
+        assert!(!needs_rescan(&doc), "Priming도 완료가 아니므로 재스캔 보류");
+        doc.index.set_phase(Phase::Paused);
+        assert!(!needs_rescan(&doc), "일시정지도 완료가 아니므로 재스캔 보류");
+
+        // Complete로 전이 — 이제 딱 한 번 재스캔해 누적분을 따라잡는다.
+        doc.index.set_phase(Phase::Complete);
+        assert!(
+            needs_rescan(&doc),
+            "Complete 전이 프레임에서는 밀린 재스캔을 한 번 수행해야 한다"
+        );
+    }
+
+    /// 인덱싱이 진행 중이어도 검색어/옵션 자체가 바뀌면(캐시 키 불일치) 그건
+    /// 여전히 즉시 재스캔해야 한다 — 이번 게이트는 "행 수 증가" 트리거만
+    /// 완료 시점으로 미루는 것이지, 쿼리 변경 트리거까지 막으면 안 된다.
+    #[test]
+    fn needs_rescan_true_on_query_change_even_while_indexing() {
+        let mut doc = scan_view_doc(&["hit", "no", "hit again"], Encoding::Utf8, SeparatorMode::None);
+        doc.index.set_phase(Phase::Indexing);
+        doc.find_query = "hit".to_owned();
+        doc.match_query = Some(("other".to_owned(), doc.find_opts.clone()));
+        doc.match_scanned_lines = doc_line_count(&doc);
+        assert!(
+            needs_rescan(&doc),
+            "인덱싱 도중이라도 검색어 변경은 즉시 재스캔해야 한다"
+        );
+    }
+
+    /// 완전히 인덱싱된(Complete) 작은 뷰 모드 문서는 프레임을 반복해도(=매번
+    /// `refresh_match_scan` 재호출) 재스캔이 없다 — 안정 상태 수렴 확인.
+    #[test]
+    fn view_mode_complete_doc_settles_to_no_rescan_across_frames() {
+        let mut doc = scan_view_doc(&["hit", "no", "hit again"], Encoding::Utf8, SeparatorMode::None);
+        doc.find_query = "hit".to_owned();
+        for frame in 0..5 {
+            refresh_match_scan(&mut doc);
+            assert!(!needs_rescan(&doc), "프레임 {frame}: 안정 상태는 재스캔 없음");
+        }
+        assert_eq!(doc.match_rows, vec![0, 2]);
+    }
+
+    /// 편집 모드 문서도(인덱서가 없는 상태) 프레임을 반복하면 재스캔 없이
+    /// 수렴한다 — 버퍼가 안 바뀌는 한 `match_scanned_lines`가 그대로 유지된다.
+    #[test]
+    fn edit_mode_doc_settles_to_no_rescan_across_frames() {
+        let (mut app, _delim) = edit_doc(b"h,v\nhit,1\nno,2\nhit,3\n", true);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "hit".to_owned();
+        for frame in 0..5 {
+            refresh_match_scan(doc);
+            assert!(!needs_rescan(doc), "프레임 {frame}: 편집 모드도 안정 상태는 재스캔 없음");
+        }
     }
 
     /// `refresh_match_scan`이 검색어가 있을 때 실제로 스캔해 `match_rows`를
