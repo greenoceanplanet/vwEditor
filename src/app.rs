@@ -2283,6 +2283,28 @@ fn find_ci_ascii_all(hay: &[u8], needle_lower: &[u8]) -> Vec<usize> {
 /// 경우는 **0개**다. 반대로 소문자화만 보는 조건에는 그런 구멍이 1,453개
 /// 있었다(`ß`, `à`, `á`, …). 한글 음절 11,172자·CJK 통합한자·가나는 전부 통과한다.
 ///
+/// **구멍: 1글자씩 봐서는 다다자 확장의 "조각"을 못 잡는다.** 위 검증은 각 문자를
+/// **홀로** 봤을 때 다른 한 문자가 그리로 접혀 오는지만 본다. 그런데
+/// `char::to_lowercase()`는 **여러 문자로 확장**되기도 한다 — U+0130
+/// `İ`(LATIN CAPITAL LETTER I WITH DOT ABOVE)의 소문자화는 **두 글자**
+/// `i`+U+0307(COMBINING DOT ABOVE)이다. `i`는 ASCII라 통과, U+0307은 대소문자가
+/// 없어(`lo==up==self`) 통과 — 그래서 needle `"i\u{0307}"`가 이 판정을
+/// 문자 단위로는 전부 통과해 버린다. 하지만 브루트포스(`find::folded`)는
+/// 문서의 `İ` 한 글자를 접어 정확히 이 두 글자 시퀀스를 만들어 내므로, 그 행은
+/// 브루트포스는 매치이고 바이트 경로는 (`İ`의 UTF-8 바이트 `0xC4 0xB0`가
+/// `i`+U+0307의 바이트 `0x69 0xCC 0x87`와 전혀 다르므로) 못 잡는다 → 위음성.
+///
+/// **막는 법.** "다다자 확장에 등장하는 문자"의 집합을 전 유니코드에서 구하면
+/// U+0307 단 하나뿐이다(`multichar_lower_expansion_pieces_are_exactly_u0307`가
+/// 이 사실 자체를 전수 검증한다) — 그래서 U+0307을 needle에서 거부하면 이
+/// 구멍이 완전히 막힌다. 다른 다다자 확장이 훗날 추가되더라도(유니코드
+/// 데이터는 버전마다 바뀔 수 있음) 이 함수가 쓰는 상수가 아니라 그 테스트가
+/// 먼저 깨져 알려준다.
+///
+/// **왜 한글/한자/가나는 안전한가.** 이들은 애초에 대소문자 매핑이 없어(위 전수
+/// 검증 1) 다다자 확장의 결과물도, 조각도 될 수 없다 — 이 배제 규칙 추가가
+/// `인도네시아` 같은 needle을 막지 않는다.
+///
 /// **알려진 한계(이 함수 밖, 기존 동작).** 비ASCII → **ASCII**로 접히는 문자가
 /// 유니코드 전체에 딱 하나 있다: U+212A KELVIN SIGN(`K`) → `k`. 그래서 ASCII
 /// needle `k`로 U+212A가 든 행을 찾으면 브루트포스는 매치, 바이트 경로는
@@ -2296,8 +2318,13 @@ fn find_ci_ascii_all(hay: &[u8], needle_lower: &[u8]) -> Vec<usize> {
 /// 곳이 갈린다.
 fn query_is_case_foldable_by_bytes(query: &str) -> bool {
     query.chars().all(|c| {
-        c.is_ascii()
-            || (c.to_lowercase().eq(std::iter::once(c)) && c.to_uppercase().eq(std::iter::once(c)))
+        // U+0307: 다른 문자(U+0130)의 다다자 소문자 확장 "조각"으로만 등장하는
+        // 유일한 문자(전수 검증: 아래 테스트 참조) — 단독으로는 캐이스리스라
+        // 이 검사가 없으면 통과해 버린다.
+        c != '\u{0307}'
+            && (c.is_ascii()
+                || (c.to_lowercase().eq(std::iter::once(c))
+                    && c.to_uppercase().eq(std::iter::once(c))))
     })
 }
 
@@ -8442,6 +8469,38 @@ mod tests {
         }
     }
 
+    /// **K-1 회귀(리뷰가 찾은 위음성).** needle `"i\u{0307}"`(U+0130 `İ`의
+    /// 다다자 소문자 확장과 바이트가 똑같은 시퀀스)로 검색하면, 문서의 `İ`는
+    /// 브루트포스 기준 매치인데 고친 전(fastpath=true, U+0307 예외 없이)에는
+    /// 바이트 경로가 그 행을 놓쳤다. `scan_all_matches`가 실제로 브루트포스와
+    /// 같은 행 집합을 내는지 Partial/WholeCell 둘 다 확인한다.
+    #[test]
+    fn scan_all_matches_i_with_combining_dot_above_needle_matches_brute_force() {
+        let needle = "i\u{307}";
+        assert_eq!(needle.as_bytes(), [0x69, 0xCC, 0x87]);
+        let lines: &[&str] = &["İ,x", "i\u{307},y", "z,w"];
+        for scope in
+            [crate::find::MatchScope::Partial, crate::find::MatchScope::WholeCell]
+        {
+            let mut doc = scan_view_doc(lines, Encoding::Utf8, SeparatorMode::Char(b','));
+            doc.find_query = needle.to_owned();
+            doc.find_opts = crate::find::FindOptions { match_case: false, scope };
+            // 고치기 전에는 이 지점에서 바이트 경로가 위음성으로 행 0을 놓쳤다.
+            assert_scan_equals_brute(&doc);
+            let got = scan_all_matches(&doc);
+            assert_eq!(got, vec![0, 1], "İ가 있는 행 0을 놓치면 안 된다 (scope={scope:?})");
+        }
+    }
+
+    /// **fastpath 회귀 방지.** 위 needle이 이제 폴백으로 빠졌는지, 즉 고친
+    /// 판정이 이 needle을 더 이상 빠른 경로에 들여보내지 않는지 직접 확인한다
+    /// — `assert_scan_equals_brute` 하나만으로는 "폴백이라서 우연히 맞았다"와
+    /// "빠른 경로인데 우연히 맞았다"를 구분하지 못한다.
+    #[test]
+    fn bytefast_ci_ok_rejects_i_with_combining_dot_above() {
+        assert!(!bytefast_ci_ok("i\u{307}", Encoding::Utf8));
+    }
+
     #[test]
     fn scan_ignore_case_matches_brute_force() {
         // ignore_case에서 프리필터가 무엇을 거르든 최종 결과 == 브루트포스.
@@ -8861,34 +8920,102 @@ mod tests {
     /// 집합을 만들고, 판정을 통과한 비ASCII 문자 중 그 집합에 든 것이 **0개**임을
     /// 확인한다. 소문자화만 보는(대문자화를 빼는) 판정으로 되돌리면 1,453개가
     /// 나와 이 테스트가 깨진다 — 뮤테이션 감지 지점이다.
+    ///
+    /// **1글자 확장만으로는 불충분하다(K 리뷰가 찾은 구멍).** 위 루프는
+    /// `to_lowercase()`가 **정확히 한 글자**로 접히는 경우만 `fold_targets`에
+    /// 넣는다 — U+0130 `İ`처럼 **두 글자**(`i`+U+0307)로 접히는 문자는 원래
+    /// 여기서 통째로 빠졌다. 그래서 아래에서 **다다자 확장 전체**를 needle
+    /// 문자열로 만들어 판정에 넣어 본다: 확장의 모든 글자가 개별적으로는
+    /// 판정을 통과하더라도, "이 시퀀스 자체가 다른 문자의 접힘 결과"라면 그
+    /// needle은 거부돼야 한다(그러지 않으면 brute force가 원본 문자를 접어
+    /// 만드는 것과 같은 바이트 시퀀스를 바이트 경로가 찾아내지 못한다).
     #[test]
     fn foldable_judgment_has_no_incoming_fold_targets() {
         use std::collections::HashSet;
         let mut fold_targets: HashSet<char> = HashSet::new();
+        // 다다자(멀티 글자) 소문자 확장 전체를 문자열로 모은 것 — 이 시퀀스를
+        // needle으로 쓰면 판정이 반드시 거부해야 한다(그 시퀀스가 원본 문자
+        // 하나의 접힘 결과이므로).
+        let mut multichar_expansions: Vec<(char, String)> = Vec::new();
         for cp in 0u32..=0x10FFFF {
             let Some(c) = char::from_u32(cp) else { continue };
-            let mut lo = c.to_lowercase();
-            if let (Some(first), None) = (lo.next(), lo.next()) {
-                if first != c {
-                    fold_targets.insert(first);
+            let lo: String = c.to_lowercase().collect();
+            let mut it = lo.chars();
+            match (it.next(), it.next()) {
+                (Some(first), None) => {
+                    if first != c {
+                        fold_targets.insert(first);
+                    }
                 }
+                (Some(_), Some(_)) => {
+                    // 2글자 이상으로 접히는 문자 — 시퀀스 전체를 별도로 검사한다.
+                    multichar_expansions.push((c, lo));
+                }
+                _ => {}
             }
         }
         let mut holes = Vec::new();
         for cp in 0x80u32..=0x10FFFF {
             let Some(c) = char::from_u32(cp) else { continue };
             if query_is_case_foldable_by_bytes(&c.to_string()) && fold_targets.contains(&c) {
-                holes.push(c);
+                holes.push(c.to_string());
+            }
+        }
+        // 다다자 확장 시퀀스 자체가 needle로 들어왔을 때 판정을 통과하면 구멍이다
+        // — brute force는 원본 문자(예: İ)를 접어 이 시퀀스를 만들어 매치시키는데
+        // 바이트 경로는 원본 문자의 바이트를 볼 수 없다.
+        for (src, expansion) in &multichar_expansions {
+            if query_is_case_foldable_by_bytes(expansion) {
+                holes.push(format!(
+                    "U+{:04X}({src})의 확장 {:?}가 판정을 통과한다",
+                    *src as u32, expansion
+                ));
             }
         }
         assert!(
             holes.is_empty(),
-            "판정을 통과했는데 다른 문자가 접혀 오는 비ASCII가 {}개 있다: {:?}",
+            "판정을 통과했는데 다른 문자의 접힘 결과인 구멍이 {}개 있다: {:?}",
             holes.len(),
             &holes[..holes.len().min(10)]
         );
         // 판정이 무의미하게 전부 거짓이 아님(한글은 통과해야 한다).
         assert!(query_is_case_foldable_by_bytes("인도네시아"));
+    }
+
+    /// 위 강화된 테스트가 실제로 **K-1의 구멍을 잡아내는지** 직접 재현한다 —
+    /// U+0130의 다다자 확장 `"i\u{0307}"`가 판정을 통과하면(수정 전 동작) 이
+    /// 단정이 실패해야 하고, 수정 후(U+0307 거부)에는 통과해야 한다.
+    #[test]
+    fn multichar_lower_expansion_i_with_dot_above_is_rejected() {
+        let expansion = "\u{130}".chars().next().unwrap().to_lowercase().collect::<String>();
+        assert_eq!(expansion, "i\u{307}", "U+0130의 소문자 확장이 예상과 다르다");
+        assert!(
+            !query_is_case_foldable_by_bytes(&expansion),
+            "İ의 다다자 확장 자체가 빠른 경로를 통과하면 안 된다 — brute force와 어긋난다"
+        );
+    }
+
+    /// U+0307이 "다다자 확장에 등장하는 유일한 문자"라는 전제를 전수 검증한다 —
+    /// `query_is_case_foldable_by_bytes`가 U+0307 하나만 특별 취급해도 되는 이유.
+    /// 이 전제가 깨지면(유니코드 데이터 변경 등) 이 테스트가 먼저 실패한다.
+    #[test]
+    fn multichar_lower_expansion_pieces_are_exactly_u0307() {
+        use std::collections::HashSet;
+        let mut pieces: HashSet<char> = HashSet::new();
+        for cp in 0u32..=0x10FFFF {
+            let Some(c) = char::from_u32(cp) else { continue };
+            let lo: Vec<char> = c.to_lowercase().collect();
+            if lo.len() >= 2 {
+                for &piece in &lo {
+                    pieces.insert(piece);
+                }
+            }
+        }
+        assert_eq!(
+            pieces,
+            HashSet::from(['\u{0307}', 'i']),
+            "다다자 소문자 확장에 등장하는 문자 집합이 예상과 다르다: {pieces:?}"
+        );
     }
 
     /// `bytefast_ci_ok` 판정. 바이트로 접히는 needle + UTF-8/CP949만 참.
