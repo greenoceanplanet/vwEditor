@@ -18,6 +18,21 @@ pub struct SortState {
     pub spec_count: usize,
 }
 
+/// Find All로 확정된 하이라이트 스냅샷. 이 값 하나에 "무엇을 어떤 옵션으로 찾아
+/// 어느 행이 걸렸는지"를 통째로 얼려 둔다. 라이브 입력과 분리하는 것이 핵심이라,
+/// query/opts를 스냅샷 안에 함께 담아 렌더가 라이브 `find_query`/`find_opts`를
+/// 전혀 참조하지 않게 한다 — 사용자가 검색어를 고쳐도 이 스냅샷은 다음 Find
+/// All까지 그대로다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Highlight {
+    /// Find All을 누른 순간의 검색어.
+    pub query: String,
+    /// 그 순간의 옵션.
+    pub opts: crate::find::FindOptions,
+    /// 매치가 있는 논리 행 번호(스크롤 마커 거터용, 행 오름차순).
+    pub rows: Vec<u32>,
+}
+
 pub struct Document {
     pub source: Arc<Source>,
     pub index: LineIndex,
@@ -84,21 +99,13 @@ pub struct Document {
     /// 준다 — 매 프레임 `request_focus()`를 부르면 다른 위젯을 클릭해도
     /// 포커스가 즉시 되돌아와 아무것도 조작할 수 없게 된다.
     pub find_focus_pending: bool,
-    /// 스크롤 마커용: 검색어가 있는 논리 행 번호(전체 문서). 마커만 이걸 쓴다.
-    /// 전체 매치 하이라이트는 보이는 행만 즉석 계산하므로 이 목록을 쓰지 않는다.
-    /// (읽는 쪽은 스크롤 마커 거터 렌더 `render_match_gutter`다.)
-    pub match_rows: Vec<u32>,
-    /// `match_rows`가 어떤 (검색어, 옵션)으로 만들어졌는지. 현재 find_query/
-    /// find_opts와 다르거나 None이면 재스캔(다음 태스크의 렌더 루프가 판단).
-    /// 편집/정렬/바꾸기/undo로 버퍼가 바뀌면 `invalidate_match_scan`이 None으로
-    /// 지운다.
-    pub match_query: Option<(String, crate::find::FindOptions)>,
-    /// `match_rows`를 만들 때 문서가 몇 개 논리 행이었는지. 뷰 모드는 인덱싱이
-    /// 진행되며 행 수가 늘어나므로(부분 인덱싱), 검색어/옵션이 그대로여도 행 수가
-    /// 달라졌으면 스캔이 아직 못 본 행이 생겼다는 뜻이라 재스캔해야 한다. 이
-    /// 값을 `needs_rescan`이 캐시 키의 일부로 함께 본다 — 인덱서 완료 신호를
-    /// 따로 훅하지 않아도 행 수 증가만으로 자연히 재스캔된다(pause/resume도 포함).
-    pub match_scanned_lines: usize,
+    /// Find All로 확정된 하이라이트 스냅샷. None이면 하이라이트 없음. 라이브
+    /// 입력(`find_query`/`find_opts`)과 **독립**이라, 사용자가 검색어를 고쳐도 이
+    /// 스냅샷은 다음 Find All까지 그대로다. 렌더(표/텍스트/거터)는 라이브 검색어가
+    /// 아니라 오직 이 필드를 보고 하이라이트를 그린다 — 그래서 입력란에 타이핑해도
+    /// 아무 스캔도 일어나지 않는다. (갱신 지점은 `apply_find_action`의
+    /// `FindAction::All`과 추출뿐이다.)
+    pub highlight: Option<Highlight>,
     /// 찾은 매치가 보이도록 스크롤할 화면 행 번호. 본문 렌더가 소비한다.
     ///
     /// **왜 그 자리에서 곧바로 스크롤하지 않는가.** 본문은 `TableBuilder`
@@ -390,9 +397,7 @@ impl App {
             last_match: None,
             find_status: String::new(),
             find_focus_pending: false,
-            match_rows: Vec::new(),
-            match_query: None,
-            match_scanned_lines: 0,
+            highlight: None,
             pending_scroll_row: None,
         });
     }
@@ -1118,25 +1123,21 @@ impl eframe::App for App {
             }
         }
 
-        // 스크롤 마커 스캔 캐시 갱신. **본문을 그리기 전에** 부른다 — 거터가
-        // 방금 갱신된 `match_rows`를 그리고, 본문 하이라이트가 최신 검색어를
-        // 반영해야 하기 때문이다. `refresh_match_scan`이 needs_rescan일 때만
-        // 비싼 스캔을 돌리므로(query/opts/행수 불변이면 skip) 매 프레임 값싸다.
-        if let Some(doc) = self.doc_mut() {
-            refresh_match_scan(doc);
-        }
+        // (자동 스캔 없음.) 하이라이트는 오직 Find All/추출이 만든 `doc.highlight`
+        // 스냅샷이다 — 매 프레임 문서를 스캔하지 않으므로, 입력란에 타이핑하거나
+        // 옵션을 바꿔도 큰 파일이 먹통이 되지 않는다.
 
         // 본문: 구분 모드에 따라 표 뷰 / 텍스트 뷰로 분기.
         let row_base = self.row_base;
         let col_base = self.col_base;
 
-        // 스크롤 마커 거터. `match_rows`가 비어 있지 않을 때만(검색 중 + 매치
-        // 있음) 데이터 영역 오른쪽에 얇은 세로 거터를 뗀다. **egui는
-        // SidePanel을 CentralPanel보다 먼저 등록해야** 남은 영역이 본문에
-        // 돌아가므로, CentralPanel 앞에 둔다.
+        // 스크롤 마커 거터. Find All 스냅샷(`highlight`)이 있고 매치 행이 있을
+        // 때만 데이터 영역 오른쪽에 얇은 세로 거터를 뗀다. **egui는 SidePanel을
+        // CentralPanel보다 먼저 등록해야** 남은 영역이 본문에 돌아가므로,
+        // CentralPanel 앞에 둔다.
         if self
             .doc()
-            .is_some_and(|d| show_gutter(&d.match_rows))
+            .is_some_and(|d| show_gutter(d.highlight.as_ref()))
         {
             if let Some(doc) = self.docs.get_mut(self.active) {
                 render_match_gutter(ctx, doc);
@@ -1366,8 +1367,6 @@ fn undo_once(doc: &mut Document) {
         return;
     }
     e.dirty = true;
-    // 버퍼가 되돌려졌으니 스크롤 마커 스캔 캐시도 무효화한다.
-    invalidate_match_scan(doc);
     let Some(e) = doc.edit.as_mut() else { return };
     let len = e.lines.len();
     // 표 모드 상태: 되돌리기로 행이 줄면 낡은 인덱스가 남는다.
@@ -1400,6 +1399,9 @@ fn undo_once(doc: &mut Document) {
 /// 인텐트만 받아 두었다가 클로저가 끝난 뒤 적용한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FindAction {
+    /// 전체 문서를 스캔해 하이라이트 스냅샷(`doc.highlight`)을 만든다. 하이라이트가
+    /// 갱신되는 **유일한** 지점이다 — 다른 어떤 동작도 스냅샷을 새로 만들지 않는다.
+    All,
     Next,
     Prev,
     ReplaceOne,
@@ -1427,13 +1429,6 @@ fn doc_delimiter(doc: &Document) -> Option<u8> {
         SeparatorMode::Char(d) => Some(d),
         SeparatorMode::None => None,
     }
-}
-
-/// 버퍼/내용이 바뀌었을 때 스크롤 마커 스캔 캐시를 무효화한다. `match_query`를
-/// None으로 지우면 다음 렌더 프레임(다음 태스크)이 재스캔하게 된다. 편집/정렬/
-/// 바꾸기/undo 등 버퍼를 바꾸는 지점마다 `e.dirty = true`와 함께 부른다.
-fn invalidate_match_scan(doc: &mut Document) {
-    doc.match_query = None;
 }
 
 /// 다음/이전 찾기의 기준 위치. 마지막으로 찾은 자리가 있으면 거기서,
@@ -1585,6 +1580,20 @@ fn focus_match(doc: &mut Document, m: crate::find::Match) {
 }
 
 /// 찾기 패널의 한 동작을 수행한다. 편집 버퍼가 필요한 동작(바꾸기)은
+/// Find All이 남길 상태 문구. 매치가 하나도 없으면 "Not found", 있으면 매치
+/// **행** 수를 밝힌다("N matching rows" — 한 행에 여러 번 나와도 1이므로 "rows"로
+/// 오해를 막는다). `render_find_panel` 안에 인라인으로 두면 렌더 결과만 보는
+/// 테스트가 이 판정을 구동하지 못하므로 순수 함수로 뽑는다(코드베이스 관례).
+fn find_all_status(match_row_count: usize) -> String {
+    if match_row_count == 0 {
+        "Not found".to_owned()
+    } else if match_row_count == 1 {
+        "1 matching row".to_owned()
+    } else {
+        format!("{match_row_count} matching rows")
+    }
+}
+
 /// 뷰 모드에서 조용히 무시된다 — UI가 이미 그 버튼을 비활성화하지만,
 /// 단축키 경로도 같은 함수를 지나므로 여기서 한 번 더 막는다.
 fn apply_find_action(doc: &mut Document, act: FindAction) {
@@ -1593,6 +1602,20 @@ fn apply_find_action(doc: &mut Document, act: FindAction) {
         return;
     }
     match act {
+        // 지금 입력된 검색어/옵션으로 전체를 스캔해 하이라이트 스냅샷을 만든다.
+        // 이것이 하이라이트가 갱신되는 **유일한** 지점이다. Find All은 하이라이트만
+        // 만들고 커서(`last_match`)는 옮기지 않는다 — 그건 Find Next의 몫이다
+        // (설계 판단, 리포트 참조). 사용자는 Find All로 전체를 물들인 뒤 Find
+        // Next로 순회한다.
+        FindAction::All => {
+            let rows = scan_all_matches(doc);
+            doc.find_status = find_all_status(rows.len());
+            doc.highlight = Some(Highlight {
+                query: doc.find_query.clone(),
+                opts: doc.find_opts.clone(),
+                rows,
+            });
+        }
         FindAction::Next | FindAction::Prev => {
             let found = search_from(doc, find_origin(doc, act == FindAction::Next), act == FindAction::Next);
             match found {
@@ -1653,7 +1676,8 @@ fn search_from(
 /// "대소문자 무시 + 초대형 파일" 조합에서의 스캔 속도뿐이다. match_case 스캔은
 /// 벤치가 증명한 빠른 경로를 그대로 쓴다.
 ///
-/// (호출부는 `refresh_match_scan` — 렌더 진입 직전 프레임당 한 번, needs_rescan일 때만.)
+/// (호출부는 Find All(`apply_find_action`의 `FindAction::All`)과 추출뿐이다 —
+/// 매 프레임 자동 호출은 없앴다. 사용자가 명시적으로 눌렀을 때만 돈다.)
 fn scan_all_matches(doc: &Document) -> Vec<u32> {
     let query = &doc.find_query;
     if query.is_empty() {
@@ -1760,83 +1784,12 @@ fn scan_view_memmem(
     out
 }
 
-/// 이 프레임에 `scan_all_matches`를 다시 돌려야 하는가. **비싼 스캔(최악
-/// 0.85초/2GB)을 매 프레임 부르지 않도록** 이 판정이 참일 때만 부른다.
-///
-/// `update()` 안에 인라인으로 두지 않고 순수 함수로 뽑는 것은 `find_keys_live`/
-/// `needs_big_op_confirm`와 같은 규율이다 — 게이트 식을 테스트에 따로 베껴
-/// 적으면 실제 가드를 지우거나 뒤집어도 그 테스트는 자기 사본만 보고 통과한다.
-/// 그래서 렌더 루프와 테스트가 **이 함수 하나**를 부른다.
-///
-/// 참이 되는 경우:
-/// - 검색어가 비어 있지 않은데 `match_query`가 현재 (검색어, 옵션)과 다르거나
-///   None일 때(검색어/옵션 변경, 또는 편집·정렬·바꾸기가 무효화한 뒤).
-/// - 검색어가 그대로여도 문서 행 수가 스캔 당시(`match_scanned_lines`)와
-///   다르고, **또한** 지금이 "행 수가 더 안 늘어날 시점"일 때 — 편집 모드(버퍼
-///   전체를 이미 로드했으니 늘 그 시점)이거나, 뷰 모드 인덱서가 `Phase::Complete`에
-///   도달했을 때.
-///
-/// 왜 행 수 증가만으로는 부족한가(성능 버그였던 지점). `spawn_indexer`는 8MB
-/// 청크마다 offset 배열을 갱신하고 repaint를 요청한다(`indexer.rs`). 2GB 파일이면
-/// 청크가 ~256개라, 인덱싱 도중 매 청크가 행 수를 늘린다. 행 수 증가만 보고
-/// 재스캔했다면 검색이 켜진 채로 큰 파일을 열 때마다 `scan_all_matches`(최악
-/// 0.85초/2GB)를 ~256번 UI 스레드에서 돌리게 된다 — 재스캔 게이트가 막으려던
-/// 바로 그 폭주다. 그래서 인덱싱이 **진행 중**일 때는 행 수가 늘어도 재스캔하지
-/// 않고(검색은 그때까지 인덱싱된 접두부만 반영), `Phase::Complete`로 전이하는
-/// 프레임에 딱 한 번 재스캔해 전체를 따라잡는다.
-///
-/// 검색어가 **비어 있으면** 재스캔이 아니라 캐시를 비우는 것이므로 여기서는
-/// false를 준다(호출부가 clear를 담당한다 — 그쪽 분기가 먼저다).
-fn needs_rescan(doc: &Document) -> bool {
-    if doc.find_query.is_empty() {
-        return false;
-    }
-    let key_matches = doc
-        .match_query
-        .as_ref()
-        .is_some_and(|(q, o)| q == &doc.find_query && o == &doc.find_opts);
-    if !key_matches {
-        return true;
-    }
-    // 검색어·옵션은 그대로. 행 수가 안 바뀌었으면 볼 것도 없이 재스캔 불필요.
-    if doc.match_scanned_lines == doc_line_count(doc) {
-        return false;
-    }
-    // 행 수가 늘었다 — 그래도 인덱싱이 아직 진행 중이면(뷰 모드, Phase가
-    // Complete가 아님) 재스캔하지 않는다. 편집 모드는 인덱서가 없으니(버퍼가
-    // 이미 전체) 이 게이트를 안 탄다 — 행 수 변화는 곧 실제 버퍼 변경이고,
-    // `invalidate_match_scan`이 그 경로에서 이미 match_query를 None으로 지워
-    // 위 key_matches 분기에서 걸러진다. 그래도 대칭성과 방어적 정확성을 위해
-    // edit 모드는 "완료 상태"로 취급한다.
-    doc.edit.is_some() || doc.index.status().phase == Phase::Complete
-}
-
-/// 활성 문서의 스크롤 마커 스캔 캐시를 이 프레임에 맞게 갱신한다. 렌더 진입
-/// 직전(CentralPanel을 그리기 전)에 한 번 부른다.
-///
-/// - 검색어가 비면 캐시를 비운다(마커·거터가 사라진다).
-/// - `needs_rescan`이 참이면 전체 스캔을 다시 돌려 캐시를 채운다.
-/// - 둘 다 아니면 아무것도 하지 않는다(캐시된 `match_rows`를 그대로 쓴다).
-fn refresh_match_scan(doc: &mut Document) {
-    if doc.find_query.is_empty() {
-        doc.match_rows.clear();
-        doc.match_query = None;
-        doc.match_scanned_lines = 0;
-        return;
-    }
-    if needs_rescan(doc) {
-        doc.match_rows = scan_all_matches(doc);
-        doc.match_query = Some((doc.find_query.clone(), doc.find_opts.clone()));
-        doc.match_scanned_lines = doc_line_count(doc);
-    }
-}
-
-/// 스크롤 마커 거터를 그릴지 여부. `match_rows`가 비어 있으면(검색 안 함 또는
-/// 매치 없음) 데이터 폭을 아끼기 위해 그리지 않는다 — 검색 중이고 매치가
-/// 있을 때만 나타난다. 표시 조건을 순수 함수로 뽑아 테스트가 실제 조건을
-/// 부르게 한다(인라인 복붙 금지).
-fn show_gutter(match_rows: &[u32]) -> bool {
-    !match_rows.is_empty()
+/// 스크롤 마커 거터를 그릴지 여부. Find All 스냅샷(`highlight`)이 없거나 매치
+/// 행이 비어 있으면(검색 안 함 또는 매치 없음) 데이터 폭을 아끼기 위해 그리지
+/// 않는다 — 스냅샷이 있고 매치가 있을 때만 나타난다. 표시 조건을 순수 함수로
+/// 뽑아 테스트가 실제 조건을 부르게 한다(인라인 복붙 금지).
+fn show_gutter(highlight: Option<&Highlight>) -> bool {
+    highlight.is_some_and(|h| !h.rows.is_empty())
 }
 
 /// 거터 세로 폭을 전체 논리 행 수에 매핑한다. 논리 행 `row`의 눈금 y 좌표.
@@ -1922,10 +1875,6 @@ fn replace_one(doc: &mut Document) {
         e.lines[m.line] = new;
         e.dirty = true;
     }
-    if changed {
-        // 버퍼가 바뀌었으니 스크롤 마커 스캔 캐시를 무효화한다.
-        invalidate_match_scan(doc);
-    }
     // 다음 매치로. 치환문 길이만큼 자리가 밀렸으므로 치환 **끝** 자리를
     // 기준으로 삼아야 방금 넣은 글자를 다시 잡지 않는다(치환문이 검색어를
     // 포함하는 경우 — "a" → "aa" — 무한 제자리걸음이 된다). 변경이 없었어도
@@ -2004,8 +1953,6 @@ fn replace_all_in_doc(doc: &mut Document) {
         e.lines[i] = text;
     }
     e.dirty = true;
-    // 버퍼가 바뀌었으므로 스크롤 마커 스캔 캐시를 무효화한다(다음 프레임 재스캔).
-    invalidate_match_scan(doc);
     // 치환이 끝나면 이전 매치 위치는 의미가 없다(그 자리 글자가 바뀌었다).
     doc.last_match = None;
     // 그래머: 1개면 단수, 그 외(0 포함)는 복수(Minor 4, replace_one과 일관).
@@ -2071,6 +2018,13 @@ const EXTRACT_LOCKED_STATUS: &str = "Close the open dialog first";
 /// 지워도(항상 활성, 또는 버튼 자체를 지워도) 렌더 결과만 보는 테스트로는
 /// 잡아낼 수 없다.
 fn extract_button_enabled(find_query: &str) -> bool {
+    !find_query.is_empty()
+}
+
+/// Find All 버튼을 활성화할지. 검색어가 비면 스캔할 게 없으므로 비활성이다
+/// (추출 버튼과 같은 규칙). `render_find_panel` 안에 인라인으로 두면 지우거나
+/// 뒤집어도 렌더 결과만 보는 테스트로는 잡히지 않으므로 순수 함수로 뽑는다.
+fn find_all_button_enabled(find_query: &str) -> bool {
     !find_query.is_empty()
 }
 
@@ -2156,8 +2110,10 @@ fn build_extracted_doc(
         text_caret: crate::edit::TextPos { line: 0, col: 0 },
         text_drag_active: false,
         pending_column_op: None,
-        // 찾기 패널은 새 탭에서 닫힌 채 시작한다(검색어도 물려받지 않는다 —
-        // 추출본은 이미 그 검색어로 걸러진 결과라 다시 찾을 이유가 적다).
+        // 찾기 패널은 새 탭에서 닫힌 채 시작한다. 검색어/옵션과 하이라이트는
+        // 호출부(`extract_matching_rows`)가 원본에서 물려받아 채운다 — 열자마자
+        // 하이라이트가 보이고, 사용자가 패널을 열면 그 검색어로 바로 Find Next를
+        // 할 수 있다. 여기서는 기본값(빈 검색어)으로 두고 호출부가 덮어쓴다.
         show_find: false,
         find_query: String::new(),
         replace_text: String::new(),
@@ -2165,9 +2121,9 @@ fn build_extracted_doc(
         last_match: None,
         find_status: String::new(),
         find_focus_pending: false,
-        match_rows: Vec::new(),
-        match_query: None,
-        match_scanned_lines: 0,
+        // 하이라이트는 호출부(`extract_matching_rows`)가 새 문서 기준으로
+        // `scan_all_matches`를 돌려 채운다. 여기서는 빈 상태로 둔다.
+        highlight: None,
         pending_scroll_row: None,
     }
 }
@@ -2293,7 +2249,12 @@ impl App {
             .as_ref()
             .map(|e| e.newline)
             .unwrap_or(crate::edit::Newline::Lf);
-        let new_doc = build_extracted_doc(
+        // 원본의 검색어/옵션을 새 탭에 물려준다 — 추출본은 "그 검색어로 Find
+        // All을 한 셈"이므로 열자마자 하이라이트가 보여야 하고, 사용자가 새
+        // 탭에서 곧바로 Find Next도 할 수 있어야 한다.
+        let carry_query = doc.find_query.clone();
+        let carry_opts = doc.find_opts.clone();
+        let mut new_doc = build_extracted_doc(
             &lines,
             doc.enc,
             doc.sep,
@@ -2301,6 +2262,18 @@ impl App {
             newline,
             extracted_label(doc),
         );
+        // 새 문서 기준으로 전체를 다시 스캔해 하이라이트 스냅샷을 채운다. 새
+        // 문서에서는 (헤더를 뺀) 모든 데이터 행이 매치이지만, 셀 안 부분 매치
+        // 위치까지 원본과 똑같이 그리려면 실제 스캔이 가장 단순·정확하다 —
+        // "추출 = 새 탭에 Find All을 자동으로 한 셈"을 그대로 코드로 옮긴다.
+        new_doc.find_query = carry_query.clone();
+        new_doc.find_opts = carry_opts.clone();
+        let hl_rows = scan_all_matches(&new_doc);
+        new_doc.highlight = Some(Highlight {
+            query: carry_query,
+            opts: carry_opts,
+            rows: hl_rows,
+        });
         let n = hits.len();
 
         // 안내 문구는 **원본 탭**에 남긴다. 곧 활성 탭이 새 탭으로 바뀌지만,
@@ -2352,11 +2325,10 @@ fn find_opts_changed(before: &crate::find::FindOptions, after: &crate::find::Fin
 
 /// 찾기 상태 문구. `find_status`(Replace 결과나 "Not found" 등)가 있으면 그걸
 /// 우선한다 — 사용자가 방금 누른 버튼의 결과이므로 매치 개수보다 관심사가
-/// 급하다. `find_status`가 비어 있고 검색어가 있으면 매치 **행** 수를 보여
-/// 준다. `match_rows.len()`은 매치가 있는 행의 개수이지 매치 총 개수가
-/// 아니므로("한 행에 여러 번 나와도 1"), 문구에 "rows"를 명시해 오해를 막는다.
-/// 검색어가 없으면 아무것도 보이지 않는다(빈 검색어로 "0 rows"를 띄우는 것은
-/// 소음이다).
+/// 급하다. `find_status`가 비어 있고 하이라이트 스냅샷이 있으면 매치 **행** 수를
+/// 보여 준다. 이 개수는 매치가 있는 행의 개수이지 매치 총 개수가 아니므로("한
+/// 행에 여러 번 나와도 1"), 문구에 "rows"를 명시해 오해를 막는다. 스냅샷이 없으면
+/// 아무것도 보이지 않는다(스냅샷 없이 "0 rows"를 띄우는 것은 소음이다).
 fn find_count_text(match_rows_len: usize, find_status: &str, has_query: bool) -> String {
     if !find_status.is_empty() {
         find_status.to_owned()
@@ -2432,11 +2404,12 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
 
             ui.separator();
 
-            // 옵션이 바뀌면 이전 매치는 그 옵션 기준이 아니므로 버린다 —
-            // 그대로 두면 "Match case를 켰는데 다음 찾기가 예전 자리에서
-            // 이어진다"처럼 기준이 뒤섞인다. E2의 `needs_rescan`이 opts 변경을
-            // 감지해 마커/하이라이트용 재스캔은 알아서 하므로 여기서는
-            // last_match/find_status만 리셋한다.
+            // 옵션이 바뀌면 이전 매치(Find Next 커서)는 그 옵션 기준이 아니므로
+            // 버린다 — 그대로 두면 "Match case를 켰는데 다음 찾기가 예전 자리에서
+            // 이어진다"처럼 기준이 뒤섞인다. **`highlight` 스냅샷은 건드리지
+            // 않는다**(확정된 동작: 하이라이트는 다음 Find All까지 유지). 옵션을
+            // 바꿔도 자동 스캔이 없으므로 여기서는 last_match/find_status만
+            // 리셋한다 — 하이라이트를 새 옵션으로 맞추려면 Find All을 다시 누른다.
             let before = doc.find_opts.clone();
             let mut scope = doc.find_opts.scope;
             ui.horizontal(|ui| {
@@ -2466,6 +2439,13 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
                 if ui.button("Find Next").clicked() {
                     action = Some(FindAction::Next);
                 }
+                // Find All: 전체를 스캔해 하이라이트 스냅샷을 만든다. 하이라이트가
+                // 갱신되는 유일한 버튼이다. 검색어가 비면 비활성(찾을 게 없다).
+                ui.add_enabled_ui(find_all_button_enabled(&doc.find_query), |ui| {
+                    if ui.button("Find All").clicked() {
+                        action = Some(FindAction::All);
+                    }
+                });
                 ui.add_enabled_ui(editing, |ui| {
                     if ui.button("Replace").clicked() {
                         action = Some(FindAction::ReplaceOne);
@@ -2483,11 +2463,11 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
                 });
             });
 
-            let count_text = find_count_text(
-                doc.match_rows.len(),
-                &doc.find_status,
-                !doc.find_query.is_empty(),
-            );
+            // 매치 개수는 라이브 검색어가 아니라 Find All 스냅샷 기준이다 — 타이핑
+            // 중에는 스캔하지 않으므로 스냅샷이 없으면 개수를 보이지 않는다(있으면
+            // 그 스냅샷의 매치 행 수). `find_status`가 있으면 그쪽이 우선한다.
+            let hl_rows = doc.highlight.as_ref().map(|h| h.rows.len()).unwrap_or(0);
+            let count_text = find_count_text(hl_rows, &doc.find_status, doc.highlight.is_some());
             if !count_text.is_empty() {
                 ui.label(crate::theme::chrome_text(count_text));
             }
@@ -3067,8 +3047,6 @@ fn apply_edit_sort(doc: &mut Document, specs: &[SortSpec], delim: u8, data_start
     // 편집 모드 정렬은 permutation이 남지 않는다(이미 lines에 반영됨).
     doc.sort = None;
     doc.sort_job = None;
-    // 행 순서가 바뀌었으니 스크롤 마커 스캔 캐시를 무효화한다.
-    invalidate_match_scan(doc);
 }
 
 /// 툴바의 정렬 컨트롤. 컬럼이 선택돼 있고 인덱싱이 완료(Phase::Complete)일 때만
@@ -3396,12 +3374,18 @@ fn render_table(
     let cur_sel = doc.cell_sel;
     let editing_cell = doc.editing_cell;
 
-    // 찾기 하이라이트 스냅샷. 검색어가 비어 있으면 셀은 기존 `Label` 경로를
-    // 그대로 써 회귀·성능을 지키고(셀이 많으므로 이 분기가 중요), 검색 중일
-    // 때만 galley로 부분 음영을 그린다.
-    let find_query = doc.find_query.clone();
-    let find_opts = doc.find_opts.clone();
-    let searching = !find_query.is_empty();
+    // 찾기 하이라이트 스냅샷. **라이브 `find_query`가 아니라 Find All 스냅샷
+    // (`doc.highlight`)만** 본다 — 그래서 입력란에 타이핑해도 여기서 아무 스캔도
+    // 일어나지 않는다. 스냅샷이 없으면 셀은 기존 `Label` 경로를 그대로 써
+    // 회귀·성능을 지키고(셀이 많으므로 이 분기가 중요), 스냅샷이 있을 때만 galley로
+    // 부분 음영을 그린다(보이는 행만이라 값싸다).
+    let find_query = doc.highlight.as_ref().map(|h| h.query.clone()).unwrap_or_default();
+    let find_opts = doc
+        .highlight
+        .as_ref()
+        .map(|h| h.opts.clone())
+        .unwrap_or_default();
+    let searching = doc.highlight.is_some();
     // current match 강조는 **셀 배경 전체**로 한다(설계 판단 — 리포트 참조):
     // 표 모드 last_match.col은 행 전체 기준 char 인덱스라 셀 경계로 정밀 매핑하려면
     // 인용/구분자를 거슬러야 하는데, `focus_match`가 이미 매치 행을 "행 전체 선택"
@@ -3907,8 +3891,6 @@ fn commit_editing_cell(doc: &mut Document, delim: u8) {
     e.undo
         .push(crate::edit::EditOp::Replace(vec![(lrow, before)]));
     e.dirty = true;
-    // 셀 값이 바뀌었으니 스크롤 마커 스캔 캐시를 무효화한다.
-    invalidate_match_scan(doc);
 }
 
 /// [r0..=r1] 범위 각 행의 **현재** 전체 텍스트를 `EditOp::Replace`로 만든다.
@@ -4116,11 +4098,6 @@ fn apply_cell_menu_action_confirmed(
         }
     }
 
-    // Copy만 버퍼를 바꾸지 않는다. 그 외 셀 메뉴 동작은 버퍼를 바꿀 수 있으므로
-    // 스크롤 마커 스캔 캐시를 무효화한다(no-op였어도 재스캔 결과는 같다).
-    if act != CellMenuAction::Copy {
-        invalidate_match_scan(doc);
-    }
 }
 
 /// 텍스트 모드 우클릭 컨텍스트 메뉴 동작. `CellMenuAction`과 같은 이유로
@@ -4404,22 +4381,25 @@ const TABLE_CELL_SENSE: egui::Sense = egui::Sense {
     focusable: false,
 };
 
-/// 스크롤 마커 거터. 데이터 영역 오른쪽에 얇은 세로 바를 그려, 문서 전체
-/// (`doc.match_rows`)의 매치 위치를 보라 눈금으로 표시한다 — EMEditor의 우측
+/// 스크롤 마커 거터. 데이터 영역 오른쪽에 얇은 세로 바를 그려, Find All 스냅샷
+/// (`doc.highlight.rows`)의 매치 위치를 보라 눈금으로 표시한다 — EMEditor의 우측
 /// 마커 바와 같은 방식이다. `Table::body`가 `ScrollAreaOutput`을 삼켜 스크롤
 /// 트랙 rect를 노출하지 않으므로 기본 스크롤바 위에 겹칠 수 없어, 별도 거터를
 /// 직접 만든다(설계 S-7).
 ///
-/// `refresh_match_scan`이 이미 `match_rows`를 갱신했고, 호출부가 비어 있지
-/// 않을 때만(`show_gutter`) 이 함수를 부른다.
+/// 호출부(`update()`)가 `show_gutter`로 스냅샷이 있고 매치가 있을 때만 이 함수를
+/// 부른다. 스냅샷이 없으면(하이라이트 없음) 애초에 그려지지 않는다.
 ///
-/// **성능(S-8/E2-6): 픽셀 양자화.** `match_rows`는 수백만이 될 수 있으나 거터는
+/// **성능(S-8/E2-6): 픽셀 양자화.** `highlight.rows`는 수백만이 될 수 있으나 거터는
 /// 기껏 수백 픽셀 높이다. 같은 정수 y 픽셀에 여러 눈금을 그려도 화면상 구분이
-/// 안 되므로, `match_rows`가 행 오름차순인 성질을 이용해 **마지막으로 그린 정수
+/// 안 되므로, `rows`가 행 오름차순인 성질을 이용해 **마지막으로 그린 정수
 /// y**를 기억하고 같은 y는 건너뛴다(O(n) 순회 + 최대 거터높이만큼만 draw 호출).
 /// 이렇게 하면 200만 매치라도 draw 호출은 거터 픽셀 수 이하로 묶인다.
 fn render_match_gutter(ctx: &egui::Context, doc: &mut Document) {
     let line_count = doc_line_count(doc);
+    // 스냅샷의 매치 행. 호출부가 `show_gutter`로 Some을 보장했지만, 방어적으로
+    // 비어 있으면 빈 슬라이스로 순회해 아무 눈금도 그리지 않는다.
+    let rows: Vec<u32> = doc.highlight.as_ref().map(|h| h.rows.clone()).unwrap_or_default();
     // 거터 배경은 데이터 영역과 같은 순백 — 눈금 보라만 도드라지게 한다.
     let frame = egui::Frame::none().fill(crate::theme::data_bg());
     egui::SidePanel::right("find_marker_gutter")
@@ -4439,10 +4419,10 @@ fn render_match_gutter(ctx: &egui::Context, doc: &mut Document) {
             let x0 = rect.left() + 2.0;
             let x1 = rect.right() - 2.0;
             let mut last_px: Option<i32> = None;
-            for &r in &doc.match_rows {
+            for &r in &rows {
                 let y = marker_y(r as usize, line_count, top, height);
                 let py = y.round() as i32;
-                // 같은 정수 y는 한 번만(양자화). match_rows가 오름차순이라
+                // 같은 정수 y는 한 번만(양자화). rows가 오름차순이라
                 // last_px 비교만으로 충분하다.
                 if last_px == Some(py) {
                     continue;
@@ -4519,11 +4499,17 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
     let text_color = ui.visuals().text_color();
     let caret_color = ui.visuals().strong_text_color();
 
-    // 찾기 하이라이트 스냅샷. 검색어가 비어 있으면 뷰 모드는 기존 `Label`
-    // 경로를 그대로 써 회귀를 피하므로, "검색 중인가"를 미리 판정해 둔다.
-    let find_query = doc.find_query.clone();
-    let find_opts = doc.find_opts.clone();
-    let searching = !find_query.is_empty();
+    // 찾기 하이라이트 스냅샷. **라이브 `find_query`가 아니라 Find All 스냅샷
+    // (`doc.highlight`)만** 본다 — 입력란 타이핑이 스캔을 유발하지 않게 하는 핵심.
+    // 스냅샷이 없으면 뷰 모드는 기존 `Label` 경로를 그대로 써 회귀를 피하므로,
+    // "하이라이트가 있는가"를 미리 판정해 둔다.
+    let find_query = doc.highlight.as_ref().map(|h| h.query.clone()).unwrap_or_default();
+    let find_opts = doc
+        .highlight
+        .as_ref()
+        .map(|h| h.opts.clone())
+        .unwrap_or_default();
+    let searching = doc.highlight.is_some();
     let last_match = doc.last_match;
 
     // 클릭/드래그로 잡은 위치. anchor는 누름 시작, head는 확장 끝점.
@@ -5108,12 +5094,6 @@ fn apply_text_intent(
         }
     }
 
-    // 버퍼를 바꾸는 인텐트였으면 스크롤 마커 스캔 캐시를 무효화한다(다음 프레임
-    // 재스캔). no-op였어도 재스캔 결과가 같을 뿐이라 정확성에는 문제가 없고,
-    // 무효화는 mutating 인텐트에만 걸리므로 매 커서 이동에 재스캔이 돌지 않는다.
-    if mutating {
-        invalidate_match_scan(doc);
-    }
 }
 
 /// 텍스트 편집 전 스냅샷: 영향을 받을 수 있는 줄 구간 `[start, ..]`의 원본.
@@ -7366,188 +7346,167 @@ mod tests {
         assert!(scan_all_matches(&doc).is_empty());
     }
 
+    // ---- F: Find All 하이라이트 스냅샷 / 상태 전이 ----
+
+    /// `apply_find_action(doc, FindAction::All)`이 하이라이트 스냅샷을 만든다:
+    /// `rows`가 `scan_all_matches`와 같고, query/opts가 **호출 시점 값으로 얼려진다**.
     #[test]
-    fn edit_invalidates_match_query() {
-        // 버퍼를 바꾸는 경로에서 match_query가 None이 되는지(재스캔 트리거).
-        // 셀 편집과 정렬 두 경로를 확인한다.
-        let (mut app, delim) = edit_doc(b"h,v\nCharlie,3\nAlice,1\n", true);
-        let doc = app.doc_mut().unwrap();
-        // 캐시가 채워진 것처럼 흉내낸다.
-        doc.match_query = Some(("h".to_owned(), crate::find::FindOptions::default()));
-        // 셀 편집 커밋 → 무효화.
-        doc.editing_cell = Some((1, 0));
-        doc.cell_edit_text = "X".into();
-        commit_editing_cell(doc, delim);
-        assert!(doc.match_query.is_none(), "셀 편집이 match_query를 무효화");
-
-        // 정렬 경로도.
-        doc.match_query = Some(("h".to_owned(), crate::find::FindOptions::default()));
-        let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
-        apply_edit_sort(doc, &[spec], delim, 1);
-        assert!(doc.match_query.is_none(), "정렬이 match_query를 무효화");
-    }
-
-    // ---- E2: 재스캔 트리거 / 거터 매핑 ----
-
-    /// 검색어가 바뀌면(캐시 키 불일치) 재스캔이 필요하다.
-    #[test]
-    fn needs_rescan_true_on_query_change() {
-        let (mut app, _d) = edit_doc(b"h,v\nhit,x\n", true);
-        let doc = app.doc_mut().unwrap();
+    fn find_all_sets_highlight_snapshot() {
+        let mut doc = scan_view_doc(&["hit", "no", "hit"], Encoding::Utf8, SeparatorMode::None);
         doc.find_query = "hit".to_owned();
-        // 아직 스캔한 적 없음(match_query None) → 재스캔 필요.
-        assert!(needs_rescan(doc));
-        // 다른 검색어로 스캔했던 것처럼 캐시를 채운다.
-        doc.match_query = Some(("other".to_owned(), doc.find_opts.clone()));
-        doc.match_scanned_lines = doc_line_count(doc);
-        assert!(needs_rescan(doc), "검색어가 바뀌면 재스캔");
+        let opts_at_call = doc.find_opts.clone();
+        let expected_rows = scan_all_matches(&doc);
+        apply_find_action(&mut doc, FindAction::All);
+        let hl = doc.highlight.as_ref().expect("Find All이 하이라이트를 만든다");
+        assert_eq!(hl.rows, expected_rows, "rows는 scan_all_matches와 같아야 한다");
+        assert_eq!(hl.query, "hit", "query는 호출 시점 검색어로 얼려진다");
+        assert_eq!(hl.opts, opts_at_call, "opts는 호출 시점 옵션으로 얼려진다");
+        assert_eq!(doc.find_status, "2 matching rows");
     }
 
-    /// query/opts/행수가 모두 그대로면 재스캔하지 않는다(캐시 재사용).
+    /// 빈 검색어로 Find All → 하이라이트는 만들어지지 않고(None 유지), 상태 문구만
+    /// 안내로 채워진다. `apply_find_action`의 빈 검색어 가드가 담당한다.
     #[test]
-    fn needs_rescan_false_when_unchanged() {
-        let (mut app, _d) = edit_doc(b"h,v\nhit,x\n", true);
-        let doc = app.doc_mut().unwrap();
-        doc.find_query = "hit".to_owned();
-        doc.match_query = Some(("hit".to_owned(), doc.find_opts.clone()));
-        doc.match_scanned_lines = doc_line_count(doc);
-        assert!(!needs_rescan(doc), "변화 없으면 재스캔하지 않는다");
-        // 옵션만 바꿔도 재스캔(가드 반전 시 여기가 깨진다).
-        doc.find_opts.match_case = !doc.find_opts.match_case;
-        assert!(needs_rescan(doc), "옵션이 바뀌면 재스캔");
-    }
-
-    /// 검색어가 비면 `needs_rescan`은 false(재스캔이 아니라 clear가 맞다 —
-    /// clear는 `refresh_match_scan`이 담당). 그리고 `refresh_match_scan`이
-    /// 비운 검색어에서 캐시를 실제로 지우는지도 확인한다.
-    #[test]
-    fn needs_rescan_false_and_refresh_clears_when_query_empty() {
-        let (mut app, _d) = edit_doc(b"h,v\nhit,x\n", true);
-        let doc = app.doc_mut().unwrap();
-        // 이전 검색의 캐시가 남아 있는 상태.
+    fn find_all_empty_query_no_highlight() {
+        let mut doc = scan_view_doc(&["a", "b"], Encoding::Utf8, SeparatorMode::None);
         doc.find_query.clear();
-        doc.match_rows = vec![0, 1];
-        doc.match_query = Some(("hit".to_owned(), doc.find_opts.clone()));
-        doc.match_scanned_lines = 2;
-        assert!(!needs_rescan(doc), "빈 검색어는 재스캔 대상이 아니다");
-        refresh_match_scan(doc);
-        assert!(doc.match_rows.is_empty(), "빈 검색어면 캐시를 비운다");
-        assert!(doc.match_query.is_none());
-        assert_eq!(doc.match_scanned_lines, 0);
+        apply_find_action(&mut doc, FindAction::All);
+        assert!(doc.highlight.is_none(), "빈 검색어면 하이라이트를 만들지 않는다");
+        assert_eq!(doc.find_status, "Enter text to find");
     }
 
-    /// 검색어·옵션이 그대로여도 행 수가 늘었고, 인덱싱이 이미 `Phase::Complete`면
-    /// 재스캔한다. `scan_view_doc`은 `build_extracted_doc`을 통해 Complete로
-    /// 만들어지므로(동기로 다 채운 추출본), 이 시나리오를 그대로 대표한다 —
-    /// 인덱싱이 끝난 뒤 "아직 못 본 행"이 있었다면 그건 완료 시점의 캐치업 재스캔.
+    /// **자동 스캔이 사라졌음을 증명하는 핵심 테스트.** 하이라이트를 만든 뒤
+    /// `find_query`를 바꿔도(그리고 옵션을 바꿔도) `highlight`는 그대로다 — 렌더를
+    /// 돌리지 않으므로 스캔이 없어야 하고, 그 불변성으로 확인한다.
     #[test]
-    fn needs_rescan_true_when_line_count_grows() {
-        let mut doc = scan_view_doc(&["hit", "no", "hit again"], Encoding::Utf8, SeparatorMode::None);
-        assert_eq!(doc.index.status().phase, Phase::Complete, "scan_view_doc은 Complete 문서");
+    fn typing_query_does_not_change_highlight() {
+        let mut doc = scan_view_doc(&["hit", "no", "hit"], Encoding::Utf8, SeparatorMode::None);
         doc.find_query = "hit".to_owned();
-        doc.match_query = Some(("hit".to_owned(), doc.find_opts.clone()));
-        // 스캔 당시엔 행이 2개뿐이었던 것처럼(그 사이 인덱싱이 마저 끝난 상태).
-        doc.match_scanned_lines = 2;
-        assert!(needs_rescan(&doc), "완료 상태에서 행 수가 늘면 재스캔이 필요하다");
-    }
+        apply_find_action(&mut doc, FindAction::All);
+        let before = doc.highlight.clone().expect("스냅샷이 있어야 한다");
 
-    /// **핵심 회귀 테스트(E2-perf).** 인덱싱이 아직 진행 중(Phase::Indexing)이면
-    /// 행 수가 늘어도 재스캔하지 않는다 — 이게 없으면 8MB 청크마다(2GB 파일 기준
-    /// ~256번) `scan_all_matches`(최악 0.85초)가 UI 스레드에서 반복 실행된다.
-    /// `Phase::Complete`로 전이하는 순간에는 그 누적분을 한 번에 따라잡아야
-    /// 하므로 그때는 참이어야 한다.
-    #[test]
-    fn needs_rescan_false_while_indexing_true_on_complete_transition() {
-        let mut doc = scan_view_doc(&["hit", "no", "hit again"], Encoding::Utf8, SeparatorMode::None);
-        doc.find_query = "hit".to_owned();
-        doc.match_query = Some(("hit".to_owned(), doc.find_opts.clone()));
-        doc.match_scanned_lines = 2; // 인덱서가 아직 다 못 본 시점의 캐시.
-
-        // 인덱싱 진행 중 — 행 수가 스캔 당시보다 늘었어도(3 != 2) 재스캔 금지.
-        doc.index.set_phase(Phase::Indexing);
-        assert!(
-            !needs_rescan(&doc),
-            "인덱싱 도중에는 행 수 증가만으로 재스캔 폭주를 일으키면 안 된다"
-        );
-        // 같은 상태에서 Priming/Paused도 마찬가지로 "완료 아님" 취급.
-        doc.index.set_phase(Phase::Priming);
-        assert!(!needs_rescan(&doc), "Priming도 완료가 아니므로 재스캔 보류");
-        doc.index.set_phase(Phase::Paused);
-        assert!(!needs_rescan(&doc), "일시정지도 완료가 아니므로 재스캔 보류");
-
-        // Complete로 전이 — 이제 딱 한 번 재스캔해 누적분을 따라잡는다.
-        doc.index.set_phase(Phase::Complete);
-        assert!(
-            needs_rescan(&doc),
-            "Complete 전이 프레임에서는 밀린 재스캔을 한 번 수행해야 한다"
-        );
-    }
-
-    /// 인덱싱이 진행 중이어도 검색어/옵션 자체가 바뀌면(캐시 키 불일치) 그건
-    /// 여전히 즉시 재스캔해야 한다 — 이번 게이트는 "행 수 증가" 트리거만
-    /// 완료 시점으로 미루는 것이지, 쿼리 변경 트리거까지 막으면 안 된다.
-    #[test]
-    fn needs_rescan_true_on_query_change_even_while_indexing() {
-        let mut doc = scan_view_doc(&["hit", "no", "hit again"], Encoding::Utf8, SeparatorMode::None);
-        doc.index.set_phase(Phase::Indexing);
-        doc.find_query = "hit".to_owned();
-        doc.match_query = Some(("other".to_owned(), doc.find_opts.clone()));
-        doc.match_scanned_lines = doc_line_count(&doc);
-        assert!(
-            needs_rescan(&doc),
-            "인덱싱 도중이라도 검색어 변경은 즉시 재스캔해야 한다"
-        );
-    }
-
-    /// 완전히 인덱싱된(Complete) 작은 뷰 모드 문서는 프레임을 반복해도(=매번
-    /// `refresh_match_scan` 재호출) 재스캔이 없다 — 안정 상태 수렴 확인.
-    #[test]
-    fn view_mode_complete_doc_settles_to_no_rescan_across_frames() {
-        let mut doc = scan_view_doc(&["hit", "no", "hit again"], Encoding::Utf8, SeparatorMode::None);
-        doc.find_query = "hit".to_owned();
-        for frame in 0..5 {
-            refresh_match_scan(&mut doc);
-            assert!(!needs_rescan(&doc), "프레임 {frame}: 안정 상태는 재스캔 없음");
+        // 검색어를 여러 번 바꾼다 — 스냅샷은 절대 따라 움직이면 안 된다.
+        for q in ["h", "hi", "hix", "완전히 다른 것", ""] {
+            doc.find_query = q.to_owned();
+            assert_eq!(doc.highlight.as_ref(), Some(&before), "검색어 변경이 하이라이트를 바꾸면 안 된다");
         }
-        assert_eq!(doc.match_rows, vec![0, 2]);
+        // 옵션을 바꿔도 마찬가지.
+        doc.find_opts.match_case = !doc.find_opts.match_case;
+        assert_eq!(doc.highlight.as_ref(), Some(&before), "옵션 변경도 하이라이트를 바꾸면 안 된다");
     }
 
-    /// 편집 모드 문서도(인덱서가 없는 상태) 프레임을 반복하면 재스캔 없이
-    /// 수렴한다 — 버퍼가 안 바뀌는 한 `match_scanned_lines`가 그대로 유지된다.
+    /// Find Next/Prev를 여러 번 해도 `highlight`는 그대로고 `last_match`만 바뀐다.
     #[test]
-    fn edit_mode_doc_settles_to_no_rescan_across_frames() {
-        let (mut app, _delim) = edit_doc(b"h,v\nhit,1\nno,2\nhit,3\n", true);
-        let doc = app.doc_mut().unwrap();
+    fn find_next_preserves_highlight() {
+        let mut doc = scan_view_doc(&["hit", "no", "hit"], Encoding::Utf8, SeparatorMode::None);
         doc.find_query = "hit".to_owned();
-        for frame in 0..5 {
-            refresh_match_scan(doc);
-            assert!(!needs_rescan(doc), "프레임 {frame}: 편집 모드도 안정 상태는 재스캔 없음");
+        apply_find_action(&mut doc, FindAction::All);
+        let snapshot = doc.highlight.clone().expect("스냅샷이 있어야 한다");
+
+        apply_find_action(&mut doc, FindAction::Next);
+        let first = doc.last_match;
+        assert!(first.is_some(), "Find Next가 매치를 잡는다");
+        assert_eq!(doc.highlight.as_ref(), Some(&snapshot), "Find Next가 하이라이트를 건드리면 안 된다");
+
+        apply_find_action(&mut doc, FindAction::Next);
+        assert_ne!(doc.last_match, first, "두 번째 Next는 커서를 옮긴다");
+        assert_eq!(doc.highlight.as_ref(), Some(&snapshot), "커서가 움직여도 하이라이트는 그대로");
+    }
+
+    /// 옵션(find_opts)을 바꿔도 하이라이트는 유지된다(확정 동작 5). `apply_find_action`이
+    /// 하이라이트를 안 건드리므로, 옵션만 다른 상태에서 Next를 눌러도 스냅샷은 그대로다.
+    #[test]
+    fn option_change_keeps_highlight() {
+        let mut doc = scan_view_doc(&["hit", "no", "hit"], Encoding::Utf8, SeparatorMode::None);
+        doc.find_query = "hit".to_owned();
+        apply_find_action(&mut doc, FindAction::All);
+        let snapshot = doc.highlight.clone().expect("스냅샷이 있어야 한다");
+        // 옵션을 바꾼다(패널의 옵션 리셋 로직은 last_match만 건드리고 highlight는 두므로,
+        // 여기서는 상태 전이의 핵심인 apply_find_action이 하이라이트를 보존함을 본다).
+        doc.find_opts.match_case = !doc.find_opts.match_case;
+        apply_find_action(&mut doc, FindAction::Next);
+        assert_eq!(doc.highlight.as_ref(), Some(&snapshot), "옵션을 바꿔도 하이라이트는 다음 Find All까지 유지");
+    }
+
+    /// 추출하면 새 탭 문서의 `highlight`가 Some이고, 새 문서의 데이터 행들이
+    /// 매치로 잡힌다. 원본 탭의 highlight도 그대로다(추출이 원본을 안 건드림).
+    #[test]
+    fn extract_carries_highlight_to_new_tab() {
+        let (mut app, _d) = edit_doc(b"h,v\nhit,1\nno,2\nhit,3\n", true);
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.find_query = "hit".to_owned();
+            // 원본에 먼저 Find All을 해 두어, 추출이 원본 스냅샷을 안 건드리는지도 본다.
+            apply_find_action(doc, FindAction::All);
         }
+        let orig_hl = app.doc().unwrap().highlight.clone().expect("원본 스냅샷");
+        let before_tabs = app.docs.len();
+        app.extract_matching_rows();
+        assert_eq!(app.docs.len(), before_tabs + 1, "추출은 새 탭을 연다");
+
+        // 새 탭(활성)의 하이라이트.
+        let new_doc = app.doc().unwrap();
+        let hl = new_doc.highlight.as_ref().expect("추출본에 하이라이트가 실려 있다");
+        assert_eq!(hl.query, "hit");
+        // 새 문서: 헤더 + 매치 데이터 2행. 데이터 행(1,2)이 모두 매치로 잡힌다.
+        assert_eq!(hl.rows, vec![1, 2], "추출본의 데이터 행이 전부 매치");
+        assert_eq!(new_doc.find_query, "hit", "새 탭은 검색어를 물려받는다");
+
+        // 원본 탭(index 0)의 스냅샷은 그대로.
+        assert_eq!(app.docs[0].highlight.as_ref(), Some(&orig_hl), "추출이 원본 하이라이트를 안 건드린다");
     }
 
-    /// `refresh_match_scan`이 검색어가 있을 때 실제로 스캔해 `match_rows`를
-    /// 채우고, 두 번째 호출(변화 없음)에서는 다시 스캔하지 않는지(캐시 재사용).
+    /// Find All이 만든 `highlight.rows`가 브루트포스 `matching_lines`와 같은 행
+    /// 집합이다. (`scan_all_matches_*` 테스트가 스캔 자체는 이미 커버하므로, 여기서는
+    /// **apply_find_action이 그 스캔 결과를 그대로 스냅샷에 싣는지**를 확인한다.)
     #[test]
-    fn refresh_match_scan_fills_and_caches() {
-        let mut doc =
-            scan_view_doc(&["hit", "no", "hit"], Encoding::Utf8, SeparatorMode::None);
+    fn find_all_matches_brute_force() {
+        let mut doc = scan_view_doc(
+            &["a,b,c", "hit,x", "y,hit", "no"],
+            Encoding::Utf8,
+            SeparatorMode::Char(b','),
+        );
         doc.find_query = "hit".to_owned();
-        refresh_match_scan(&mut doc);
-        assert_eq!(doc.match_rows, vec![0, 2]);
-        assert_eq!(doc.match_query, Some(("hit".to_owned(), doc.find_opts.clone())));
-        assert_eq!(doc.match_scanned_lines, 3);
-        // 캐시를 흉내로 지워 재스캔이 다시 채우지 않음을 확인(변화 없으면 skip).
-        doc.match_rows = vec![99];
-        refresh_match_scan(&mut doc);
-        assert_eq!(doc.match_rows, vec![99], "변화 없으면 재스캔하지 않는다");
+        let brute: Vec<u32> = crate::find::matching_lines(
+            doc_line_count(&doc),
+            &doc.find_query,
+            &doc.find_opts,
+            doc_delimiter(&doc),
+            |i| logical_line(&doc, i),
+        )
+        .into_iter()
+        .map(|i| i as u32)
+        .collect();
+        apply_find_action(&mut doc, FindAction::All);
+        assert_eq!(doc.highlight.unwrap().rows, brute, "스냅샷 rows가 브루트포스와 같아야 한다");
     }
 
-    /// 거터 표시 조건: match_rows가 비면 감춘다. 순수 함수로 테스트(인라인 복붙 금지).
+    /// 거터 표시 조건: 스냅샷이 없거나 매치가 비면 감춘다. 순수 함수로 테스트
+    /// (인라인 복붙 금지 — 실제 `show_gutter`를 부른다).
     #[test]
     fn gutter_hidden_when_no_matches() {
-        assert!(!show_gutter(&[]), "매치가 없으면 거터를 감춘다");
-        assert!(show_gutter(&[0]), "매치가 있으면 거터를 보인다");
-        assert!(show_gutter(&[3, 7, 100]));
+        assert!(!show_gutter(None), "스냅샷이 없으면 거터를 감춘다");
+        let empty = Highlight { query: "x".into(), opts: Default::default(), rows: vec![] };
+        assert!(!show_gutter(Some(&empty)), "매치가 없으면 거터를 감춘다");
+        let one = Highlight { query: "x".into(), opts: Default::default(), rows: vec![0] };
+        assert!(show_gutter(Some(&one)), "매치가 있으면 거터를 보인다");
+        let many = Highlight { query: "x".into(), opts: Default::default(), rows: vec![3, 7, 100] };
+        assert!(show_gutter(Some(&many)));
+    }
+
+    /// Find All 상태 문구: 0개면 Not found, 1개면 단수, 그 외 복수.
+    #[test]
+    fn find_all_status_variants() {
+        assert_eq!(find_all_status(0), "Not found");
+        assert_eq!(find_all_status(1), "1 matching row");
+        assert_eq!(find_all_status(5), "5 matching rows");
+    }
+
+    /// Find All 버튼 활성 조건: 검색어가 있어야 한다. 순수 함수로 테스트.
+    #[test]
+    fn find_all_button_enabled_only_when_query_present() {
+        assert!(!find_all_button_enabled(""), "검색어가 비면 비활성");
+        assert!(find_all_button_enabled("hit"), "검색어가 있으면 활성");
     }
 
     /// marker_y: 첫 행은 top, 마지막 행은 bottom 근처.
