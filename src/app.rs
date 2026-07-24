@@ -1890,9 +1890,11 @@ fn search_from(
 ///   케이스(`ab`↔`Ab`)를 놓쳐 **위음성**이 생기므로 채택하지 않는다. 대신
 ///   **hay와 needle 바이트를 둘 다 ASCII 소문자로 접어** 비교한다
 ///   (`find_ci_ascii`) — 접기는 ASCII 범위에서 바이트 단위로 정확히 정의되므로
-///   `Ab`/`aB`/`AB`/`ab`를 전부 잡는다. 조건은 `bytefast_ci_ok`(순수 ASCII
-///   needle + 단일 바이트 인코딩)이고, 그 밖(비ASCII needle, UTF-16, Whole word)은
-///   종전대로 행 단위 `find_in_line_scoped` 폴백이다.
+///   `Ab`/`aB`/`AB`/`ab`를 전부 잡는다. 조건은 `bytefast_ci_ok`(바이트로 접히는
+///   needle + 단일 바이트 인코딩)이고, 그 밖(유니코드 접기가 필요한 `É`/`İ`
+///   needle, UTF-16, Whole word)은 종전대로 행 단위 `find_in_line_scoped`
+///   폴백이다. **한글처럼 대소문자가 없는 비ASCII needle은 빠른 경로를 탄다**
+///   — `query_is_case_foldable_by_bytes` 주석 참조.
 ///
 /// 어느 경로든 최종 결과는 반드시 `matching_lines` 브루트포스와 **같은 행 집합**
 /// 이다. 빠른 경로는 "확정" 또는 "정밀 판정 필요"만 판단하고, 애매한 것을
@@ -1938,9 +1940,10 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
             let needle_has_delim = delim.is_some_and(|d| needle_bytes.contains(&d));
             // ignore_case 바이트 빠른 경로(Task H). `e.lines`는 **항상 UTF-8**
             // 문자열이므로 문서 인코딩이 무엇이든 CP949 트레일 바이트 문제가 없다 —
-            // UTF-8 연속 바이트는 ≥0x80이라 ASCII needle과 겹칠 수 없어 바로
-            // 확정해도 된다. 그래서 `bytefast_ci_ok`의 인코딩 인자로 문서 인코딩이
-            // 아니라 `Encoding::Utf8`을 넘긴다(버퍼의 실제 인코딩이 판정 근거다).
+            // UTF-8은 self-synchronizing이라 needle이 ASCII든 한글이든 히트가 문자
+            // 중간에 걸릴 수 없다(`bytefast_ci_confirms` 주석의 논증). 그래서
+            // `bytefast_ci_ok`의 인코딩 인자로 문서 인코딩이 아니라
+            // `Encoding::Utf8`을 넘긴다(버퍼의 실제 인코딩이 판정 근거다).
             let ci_ok = !opts.match_case && bytefast_ci_ok(query, Encoding::Utf8);
             let needle_lower: Vec<u8> = query.bytes().map(ascii_lower).collect();
             let ci_partial = ci_ok && scope == crate::find::MatchScope::Partial;
@@ -2134,7 +2137,9 @@ fn ascii_lower(b: u8) -> u8 {
 /// **왜 양쪽을 다 접는가.** 예전 판단은 "needle의 대문자 변형 하나로 memmem을
 /// 돌린다"였고 그건 `Ab` 같은 혼합 대소문자를 놓쳤다(위음성). hay와 needle을
 /// **둘 다** ASCII 소문자로 접으면 `Ab`/`aB`/`AB`/`ab`가 전부 같은 바이트열이
-/// 되므로 ASCII 범위에서 정확하다.
+/// 되므로 ASCII 범위에서 정확하다. 비ASCII 바이트(≥0x80)는 `ascii_lower`가
+/// 건드리지 않으므로 **그대로 리터럴 비교**된다 — 한글처럼 대소문자가 없는
+/// needle에서는 그게 곧 정답이다(`query_is_case_foldable_by_bytes` 참조).
 ///
 /// 첫 바이트는 `memchr2`(소문자/대문자 두 바이트)로 건너뛰어 스캔한다 —
 /// 벤치에서 순진한 바이트 루프보다 눈에 띄게 빨랐다(374ms vs 408ms/2GB).
@@ -2193,16 +2198,75 @@ fn find_ci_ascii_all(hay: &[u8], needle_lower: &[u8]) -> Vec<usize> {
     out
 }
 
+/// needle의 모든 문자가 **바이트 접기(`ascii_lower`)만으로 대소문자 무시 비교가
+/// 성립하는가**.
+///
+/// **왜 `is_ascii()`로는 너무 좁은가.** 예전 판정은 "비ASCII가 하나라도 있으면
+/// 폴백"이었다. 그 근거("유니코드 접기는 바이트로 안전하지 않다")는 옳지만
+/// 대상을 지나치게 넓게 잡았다 — **대소문자 개념이 아예 없는 문자**는 접어도
+/// 자기 자신이라, ignore_case여도 바이트 비교가 match_case와 **완전히 같은
+/// 질문**이 된다. 전 유니코드 프로브로 확인한 사실:
+/// - 한글 음절(U+AC00~U+D7A3) 11,172자 중 `to_lowercase()`로 바뀌는 것: **0개**
+/// - 그 밖의 비ASCII 중 바뀌는 것: 1,462자(`À`→`à`, `É`, `İ`, `Σ` 등 라틴/그리스/키릴)
+///
+/// 그래서 한글·한자·가나·숫자·기호로 이뤄진 needle은 빠른 경로를 타도 된다.
+/// 실제로 이 함수가 걸러야 하는 것은 **바이트로 접을 수 없는** 비ASCII
+/// 대소문자 문자뿐이다.
+///
+/// 판정:
+/// - ASCII 문자는 `ascii_lower`가 바이트 단위로 정확히 접으므로 항상 참
+///   (`A`~`Z`는 거짓이 아니다 — 예전과 똑같이 빠른 경로를 탄다).
+/// - 비ASCII 문자는 **소문자화도 대문자화도 자기 자신일 때만** 참.
+///
+/// **왜 소문자화만 보면 안 되는가(반드시 양방향).** 브루트포스
+/// (`find::eq_scoped` / `find::folded`)는 hay와 needle을 **둘 다** 접어 비교한다.
+/// 그래서 needle이 `é`(이미 소문자 — `to_lowercase()`가 자기 자신)여도, 파일의
+/// `É`가 접혀 `é`가 되므로 브루트포스는 매치라고 답한다. 반면 바이트 경로는
+/// `ascii_lower`가 비ASCII를 건드리지 않아 `É`(0xC3 0x89)와 `é`(0xC3 0xA9)를
+/// 다른 바이트로 본다 → **위음성 = 계약 위반**. 대문자화까지 자기 자신이어야
+/// "이 문자로 접혀 오는 다른 문자가 없다"가 보장된다.
+///
+/// **전 유니코드 전수 검증(프로브).** 이 조건(`is_ascii() || (lo==self &&
+/// up==self)`)을 통과하는 비ASCII 문자 중, 다른 문자가 소문자화로 그 문자가 되는
+/// 경우는 **0개**다. 반대로 소문자화만 보는 조건에는 그런 구멍이 1,453개
+/// 있었다(`ß`, `à`, `á`, …). 한글 음절 11,172자·CJK 통합한자·가나는 전부 통과한다.
+///
+/// **알려진 한계(이 함수 밖, 기존 동작).** 비ASCII → **ASCII**로 접히는 문자가
+/// 유니코드 전체에 딱 하나 있다: U+212A KELVIN SIGN(`K`) → `k`. 그래서 ASCII
+/// needle `k`로 U+212A가 든 행을 찾으면 브루트포스는 매치, 바이트 경로는
+/// 비매치다(위음성). **K-1 이전부터 있던 구멍이고 이 판정과 무관하다** —
+/// 막으려면 `k`/`K`가 든 모든 ASCII needle을 폴백으로 보내야 하는데, 흔한 글자
+/// 하나 때문에 빠른 경로를 통째로 잃는 대가가 유니코드 호환 문자 하나보다
+/// 훨씬 크다. 의도적으로 남겨 두고 여기 기록한다.
+///
+/// 빈 문자열은 참이다(모든 문자가 조건을 만족 — 공허참). 빈 needle을 막는 것은
+/// `bytefast_ci_ok`의 `!query.is_empty()`이고, 그 책임을 여기 겹쳐 두면 판정 두
+/// 곳이 갈린다.
+fn query_is_case_foldable_by_bytes(query: &str) -> bool {
+    query.chars().all(|c| {
+        c.is_ascii()
+            || (c.to_lowercase().eq(std::iter::once(c)) && c.to_uppercase().eq(std::iter::once(c)))
+    })
+}
+
 /// ignore_case에서 ASCII 바이트 접기 빠른 경로를 쓸 수 있는가.
 ///
-/// - **needle이 순수 ASCII일 때만.** 비ASCII가 하나라도 있으면 유니코드 대소문자
-///   접기(그리스·키릴·터키어 `İ` 등 1:N 확장)가 필요한데 바이트로는 표현되지
-///   않는다 → 행 단위 폴백(`find_in_line_scoped`)이 정답이다.
+/// - **needle이 바이트로 접히는 문자로만 이뤄졌을 때만**
+///   (`query_is_case_foldable_by_bytes`). ASCII 전부와, 대소문자가 없는 비ASCII
+///   (한글·한자·가나·숫자·기호)가 여기 해당한다. `É`/`İ`/`Σ`처럼 유니코드 접기가
+///   필요한 문자가 하나라도 있으면 바이트로는 표현되지 않으므로 행 단위
+///   폴백(`find_in_line_scoped`)이 정답이다.
 /// - **인코딩이 단일 바이트 계열일 때만.** UTF-16은 코드유닛이 2바이트라 원바이트
 ///   경계·탐색이 코드유닛 중간에 걸린다 — match_case 경로와 **같은**
 ///   `is_single_byte_enc` 판정을 재사용한다(판정을 두 벌로 만들면 갈린다).
+///
+/// **비ASCII needle이 통과해도 계약은 그대로다.** 히트를 바이트만으로 "확정"해도
+/// 되는지는 여전히 `bytefast_ci_confirms`(UTF-8만)가 따로 결정한다 — CP949는
+/// 통과해도 후보로만 보고 정밀 판정을 거친다. 그리고 needle이 문서 인코딩으로
+/// 손실 없이 옮겨지는지는 `needle_roundtrips`가 막는다(CP949에 없는 문자가
+/// `?`로 바뀌어 다른 질문이 되는 것을 방지).
 fn bytefast_ci_ok(query: &str, enc: Encoding) -> bool {
-    !query.is_empty() && query.is_ascii() && is_single_byte_enc(enc)
+    !query.is_empty() && query_is_case_foldable_by_bytes(query) && is_single_byte_enc(enc)
 }
 
 /// ignore_case 빠른 경로의 히트를 **바이트만으로 확정해도 되는가**(정밀 판정
@@ -2211,6 +2275,14 @@ fn bytefast_ci_ok(query: &str, enc: Encoding) -> bool {
 /// - **UTF-8: 확정해도 된다.** UTF-8 멀티바이트 시퀀스의 연속 바이트는 항상
 ///   ≥0x80이라 ASCII 바이트(0x00~0x7F)와 **절대** 겹치지 않는다. 따라서 ASCII
 ///   needle의 바이트열이 한글/이모지 문자 중간에 우연히 걸릴 수 없다.
+///
+///   **비ASCII needle(한글 등)도 마찬가지다** — UTF-8은 self-synchronizing이다.
+///   연속 바이트는 0x80~0xBF, 문자 첫 바이트는 ASCII(<0x80) 또는 0xC2~0xF4라
+///   두 집합이 겹치지 않는다. needle이 유효한 UTF-8 문자열이면 그 **첫 바이트**는
+///   반드시 문자 첫 바이트이므로, 히트가 다른 문자 **중간에서 시작될 수 없다**.
+///   끝도 같다 — needle의 마지막 문자가 needle 안에서 완결되므로 히트 다음
+///   바이트는 연속 바이트일 수 없다. 즉 UTF-8 히트는 항상 문자 경계에 정렬된다.
+///   (`scan_hangul_needle_matches_brute_force`가 인접 한글 데이터로 이를 증명한다.)
 /// - **CP949: 확정하면 안 된다.** CP949 트레일 바이트는 0x41~0xFE라 ASCII
 ///   대문자(0x41~0x5A)와 **겹친다**. 한글 한 글자의 트레일 바이트가 `A`(0x41)와
 ///   같은 값일 수 있어, ASCII needle `a`를 ignore_case로 찾으면 그 트레일
@@ -2545,9 +2617,10 @@ fn scan_view_cell_bytes(
 /// **디코딩을 하지 않는 것**이다.
 ///
 /// **needle 인코딩.** `save::encode_bytes`로 문서 인코딩에 맞춰 바이트를 얻는다
-/// (Task G의 교훈 — UTF-8 바이트를 CP949 파일에 그대로 쓰면 위음성). 여기서는
-/// needle이 순수 ASCII임을 `bytefast_ci_ok`가 보장하므로 UTF-8/CP949에서 같은
-/// 바이트가 나오지만, match_case 경로와 같은 길을 쓴다.
+/// (Task G의 교훈 — UTF-8 바이트를 CP949 파일에 그대로 쓰면 위음성). ASCII
+/// needle은 UTF-8/CP949에서 같은 바이트라 무해하지만, **비ASCII needle(한글)은
+/// 반드시 필요하다** — CP949 파일에서 `인도네시아`의 UTF-8 바이트를 찾으면
+/// 한 행도 안 걸린다. 손실 여부는 바로 아래 `needle_roundtrips`가 막는다.
 fn scan_view_ci_bytes(
     doc: &Document,
     query: &str,
@@ -2558,9 +2631,9 @@ fn scan_view_ci_bytes(
         return None;
     }
     // needle이 문서 인코딩으로 손실 없이 옮겨지지 않으면(대체 문자) 프리필터가
-    // 브루트포스와 다른 질문을 하게 된다 → 폴백. (`bytefast_ci_ok`가 ASCII만
-    // 통과시키므로 지금은 늘 참이지만, 가드를 여기 두어야 조건이 완화돼도
-    // 계약이 깨지지 않는다.)
+    // 브루트포스와 다른 질문을 하게 된다 → 폴백. `bytefast_ci_ok`가 비ASCII
+    // needle(한글·한자)도 통과시키므로 이 가드가 **실제로** 걸리는 지점이다 —
+    // CP949로 표현할 수 없는 한자·이모지 needle이 여기서 폴백으로 빠진다.
     if !needle_roundtrips(query, doc.enc) {
         return None;
     }
@@ -8146,6 +8219,67 @@ mod tests {
         assert!(doc.edit.is_none(), "뷰 모드에서 버퍼가 생기지 않는다");
     }
 
+    // ---- 실사용 파일 성능 측정(수동) ----
+
+    /// **수동 실행 전용.** 대용량 실파일로 `scan_all_matches`의 실제 시간을 잰다.
+    /// 파일이 있는 머신에서만 의미가 있으므로 `#[ignore]`이고, 없으면 조용히
+    /// 건너뛴다. 대상 파일은 `TV_PERF_FILE` 환경변수로 바꿀 수 있다.
+    ///
+    /// 실행(앱 exe를 건드리지 않도록 별도 target 디렉터리 권장):
+    /// `$env:CARGO_TARGET_DIR="...\perf"; cargo test --release
+    ///  perf_real_file_hangul_extract -- --ignored --nocapture`
+    ///
+    /// K-1 측정 기준값(899MB / 1540만 행 TSV, needle `인도네시아`, Whole cell,
+    /// ignore_case, 12,047행): `is_ascii()` 판정일 때 **229.3초** →
+    /// `query_is_case_foldable_by_bytes` 판정일 때 **0.27초**.
+    #[test]
+    #[ignore]
+    fn perf_real_file_hangul_extract() {
+        let default = r"(대용량 실파일)";
+        let path_buf = std::path::PathBuf::from(
+            std::env::var("TV_PERF_FILE").unwrap_or_else(|_| default.to_owned()),
+        );
+        let path = path_buf.as_path();
+        if !path.exists() {
+            eprintln!("파일 없음 — 건너뜀: {}", path.display());
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let src = crate::source::open(path).unwrap();
+        let total = src.len();
+        let offsets = crate::indexer::scan_offsets(src.as_bytes(), 0, Encoding::Utf8);
+        let index = LineIndex::new(total);
+        let n = offsets.len();
+        index.replace_offsets(offsets);
+        index.set_bytes_done(total);
+        index.set_phase(Phase::Complete);
+        eprintln!("인덱싱 {n} 행 / {total} 바이트 — {:?}", t0.elapsed());
+
+        let mut doc = build_extracted_doc(
+            &[],
+            Encoding::Utf8,
+            SeparatorMode::Char(b'\t'),
+            true,
+            crate::edit::Newline::Lf,
+            "perf".to_owned(),
+        );
+        doc.source = std::sync::Arc::new(src);
+        doc.index = index;
+        doc.find_query = "인도네시아".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: false,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        // 빠른 경로를 타는지 먼저 확인(K-1 이전이면 false → 폴백).
+        eprintln!(
+            "bytefast_ci_ok = {}",
+            bytefast_ci_ok(&doc.find_query, doc.enc)
+        );
+        let t1 = std::time::Instant::now();
+        let rows = scan_all_matches(&doc);
+        eprintln!("scan_all_matches: {} 행, {:?}", rows.len(), t1.elapsed());
+    }
+
     // ---- scan_all_matches (E1-5) ----
 
     /// 뷰 모드 인메모리 문서를 만드는 헬퍼(`build_extracted_doc` 재사용).
@@ -8580,30 +8714,146 @@ mod tests {
         assert!(find_ci_ascii_all(b"xyz", &needle).is_empty());
     }
 
-    /// `bytefast_ci_ok` 판정. ASCII needle + UTF-8/CP949만 참.
+    /// `query_is_case_foldable_by_bytes`: needle이 바이트 접기만으로 대소문자
+    /// 무시 비교가 성립하는가. ASCII 전부 + 대소문자가 없는 비ASCII만 참.
+    #[test]
+    fn query_is_case_foldable_by_bytes_judgment() {
+        // ASCII는 대문자든 소문자든 `ascii_lower`가 바이트로 접는다 → 참.
+        assert!(query_is_case_foldable_by_bytes("hit"));
+        assert!(query_is_case_foldable_by_bytes("HIT"));
+        assert!(query_is_case_foldable_by_bytes("Hit_0-9!"));
+        // 한글은 대소문자가 없다 → 참. (사용자 실사용 needle)
+        assert!(query_is_case_foldable_by_bytes("인도네시아"));
+        assert!(query_is_case_foldable_by_bytes("가나다"));
+        // 한자·가나도 마찬가지.
+        assert!(query_is_case_foldable_by_bytes("大韓民國"));
+        assert!(query_is_case_foldable_by_bytes("こんにちは"));
+        // ASCII + 한글 혼합도 참(모든 문자가 조건을 만족).
+        assert!(query_is_case_foldable_by_bytes("한글AB"));
+        // 유니코드 접기가 필요한 비ASCII는 거짓.
+        assert!(!query_is_case_foldable_by_bytes("É")); // 라틴 악센트
+        assert!(!query_is_case_foldable_by_bytes("À"));
+        assert!(!query_is_case_foldable_by_bytes("İ")); // 1:N 확장(i + U+0307)
+        assert!(!query_is_case_foldable_by_bytes("Σ")); // 그리스
+        assert!(!query_is_case_foldable_by_bytes("Ж")); // 키릴
+        // **양방향이어야 한다.** 이미 소문자인 비ASCII도 거짓 — 파일의 `É`가
+        // 접혀 `é`가 되므로 브루트포스는 매치라고 답하는데 바이트 경로는 못
+        // 잡는다(위음성). 소문자화만 보는 판정이면 여기서 깨진다.
+        assert!(!query_is_case_foldable_by_bytes("é"));
+        assert!(!query_is_case_foldable_by_bytes("à"));
+        assert!(!query_is_case_foldable_by_bytes("σ"));
+        assert!(!query_is_case_foldable_by_bytes("ß")); // 대문자화가 1:N("SS")
+        // 한 글자라도 위반하면 전체가 거짓.
+        assert!(!query_is_case_foldable_by_bytes("인도네시아É"));
+        assert!(!query_is_case_foldable_by_bytes("인도네시아é"));
+        // 빈 문자열은 공허참(빈 needle은 `bytefast_ci_ok`가 따로 막는다).
+        assert!(query_is_case_foldable_by_bytes(""));
+    }
+
+    /// **전수 근거 1.** 한글 음절 영역(U+AC00~U+D7A3) 11,172자와 CJK 통합한자·
+    /// 가나는 **하나도** 대소문자 매핑을 갖지 않는다 — K-1의 판정이 기대는
+    /// 사실이므로 못박는다. 반대로 라틴 확장에는 접히는 문자가 실제로 존재한다
+    /// (판정이 무의미하게 항상 참이 아님을 증명).
+    #[test]
+    fn hangul_and_cjk_never_case_fold() {
+        for c in '\u{AC00}'..='\u{D7A3}' {
+            assert!(
+                query_is_case_foldable_by_bytes(&c.to_string()),
+                "한글 음절 {c}(U+{:04X})가 접힌다 — 판정의 전제가 깨졌다",
+                c as u32
+            );
+        }
+        for c in ('\u{4E00}'..='\u{9FFF}').chain('\u{3040}'..='\u{30FF}') {
+            assert!(
+                query_is_case_foldable_by_bytes(&c.to_string()),
+                "CJK/가나 {c}(U+{:04X})가 접힌다",
+                c as u32
+            );
+        }
+        // 비ASCII 중 실제로 접히는 문자가 있어야 판정이 의미를 갖는다.
+        let folding = ('\u{00C0}'..='\u{024F}')
+            .filter(|&c| !query_is_case_foldable_by_bytes(&c.to_string()))
+            .count();
+        assert!(folding > 100, "라틴 확장에 접히는 문자가 {folding}개뿐 — 판정이 의심스럽다");
+    }
+
+    /// **전수 근거 2 (판정의 안전성 그 자체).** 이 판정을 통과한 비ASCII 문자로
+    /// **다른 문자가 접혀 오는 일이 없어야** 바이트 비교가 브루트포스와 같은
+    /// 질문이 된다(needle `é`가 파일의 `É`를 놓치는 위음성 방지).
+    ///
+    /// 전 유니코드(U+0000~U+10FFFF)를 훑어 "소문자화하면 c가 되는 다른 문자"의
+    /// 집합을 만들고, 판정을 통과한 비ASCII 문자 중 그 집합에 든 것이 **0개**임을
+    /// 확인한다. 소문자화만 보는(대문자화를 빼는) 판정으로 되돌리면 1,453개가
+    /// 나와 이 테스트가 깨진다 — 뮤테이션 감지 지점이다.
+    #[test]
+    fn foldable_judgment_has_no_incoming_fold_targets() {
+        use std::collections::HashSet;
+        let mut fold_targets: HashSet<char> = HashSet::new();
+        for cp in 0u32..=0x10FFFF {
+            let Some(c) = char::from_u32(cp) else { continue };
+            let mut lo = c.to_lowercase();
+            if let (Some(first), None) = (lo.next(), lo.next()) {
+                if first != c {
+                    fold_targets.insert(first);
+                }
+            }
+        }
+        let mut holes = Vec::new();
+        for cp in 0x80u32..=0x10FFFF {
+            let Some(c) = char::from_u32(cp) else { continue };
+            if query_is_case_foldable_by_bytes(&c.to_string()) && fold_targets.contains(&c) {
+                holes.push(c);
+            }
+        }
+        assert!(
+            holes.is_empty(),
+            "판정을 통과했는데 다른 문자가 접혀 오는 비ASCII가 {}개 있다: {:?}",
+            holes.len(),
+            &holes[..holes.len().min(10)]
+        );
+        // 판정이 무의미하게 전부 거짓이 아님(한글은 통과해야 한다).
+        assert!(query_is_case_foldable_by_bytes("인도네시아"));
+    }
+
+    /// `bytefast_ci_ok` 판정. 바이트로 접히는 needle + UTF-8/CP949만 참.
     #[test]
     fn bytefast_ci_ok_conditions() {
         assert!(bytefast_ci_ok("hit", Encoding::Utf8));
         assert!(bytefast_ci_ok("hit", Encoding::Cp949));
-        // 비ASCII needle은 유니코드 접기가 필요해 폴백.
-        assert!(!bytefast_ci_ok("가나", Encoding::Utf8));
+        // 유니코드 접기가 필요한 needle은 폴백.
         assert!(!bytefast_ci_ok("İ", Encoding::Utf8));
+        assert!(!bytefast_ci_ok("É", Encoding::Utf8));
         // UTF-16은 코드유닛이 2바이트라 바이트 경계가 성립하지 않는다.
         assert!(!bytefast_ci_ok("hit", Encoding::Utf16Le));
         assert!(!bytefast_ci_ok("hit", Encoding::Utf16Be));
+        assert!(!bytefast_ci_ok("가나", Encoding::Utf16Le));
         // 빈 needle은 빠른 경로 대상이 아니다.
         assert!(!bytefast_ci_ok("", Encoding::Utf8));
     }
 
+    /// **K-1의 핵심 회귀.** 한글 needle이 ignore_case 빠른 경로를 **타야** 한다.
+    /// 예전 판정(`query.is_ascii()`)이면 이 단정이 전부 깨진다 —
+    /// 그게 1540만 행을 통째로 디코딩하게 만든 원인이었다.
+    #[test]
+    fn bytefast_ci_ok_allows_hangul_needle() {
+        assert!(bytefast_ci_ok("인도네시아", Encoding::Utf8));
+        assert!(bytefast_ci_ok("인도네시아", Encoding::Cp949));
+        assert!(bytefast_ci_ok("가나", Encoding::Utf8));
+        assert!(bytefast_ci_ok("한글AB", Encoding::Utf8));
+        // 그러나 인코딩 조건은 그대로다.
+        assert!(!bytefast_ci_ok("인도네시아", Encoding::Utf16Le));
+    }
+
     /// 뮤테이션 감지: 판정이 무의미하게 항상 같은 값을 주지 않음을 못박는다.
-    /// `query.is_ascii()`를 빼면 (한글, UTF-8)이 true가 되고, `is_single_byte_enc`를
-    /// 빼면 (ASCII, UTF-16)이 true가 된다 — 두 단정이 각각 그걸 잡는다.
+    /// `query_is_case_foldable_by_bytes`를 빼면 (`É`, UTF-8)이 true가 되고,
+    /// `is_single_byte_enc`를 빼면 (ASCII, UTF-16)이 true가 된다 —
+    /// 두 단정이 각각 그걸 잡는다.
     #[test]
     fn bytefast_ci_ok_distinguishes_each_condition() {
         assert_ne!(
             bytefast_ci_ok("hit", Encoding::Utf8),
-            bytefast_ci_ok("가나", Encoding::Utf8),
-            "needle ASCII 여부가 판정을 가른다"
+            bytefast_ci_ok("É", Encoding::Utf8),
+            "needle이 바이트로 접히는지가 판정을 가른다"
         );
         assert_ne!(
             bytefast_ci_ok("hit", Encoding::Utf8),
@@ -8698,27 +8948,75 @@ mod tests {
         }
     }
 
-    /// 한글(비ASCII) needle이면 빠른 경로를 타지 않고 폴백으로 가되 결과는 정확.
-    /// `İ` 같은 1:N 확장 needle도 마찬가지다 — 바이트 접기로는 표현되지 않는다.
+    /// **K-1 계약 테스트.** 한글 needle이 이제 ignore_case 빠른 경로를 타는데,
+    /// 결과는 여전히 브루트포스와 같은 행 집합이어야 한다.
+    ///
+    /// **한글이 인접한 데이터**를 일부러 넣는다 — UTF-8 self-synchronizing 논증
+    /// (`bytefast_ci_confirms` 주석)이 실제로 성립하는지, 즉 needle 바이트열이
+    /// 다른 한글 문자 **중간**에 걸려 위양성을 내지 않는지 확인한다.
+    /// UTF-8·CP949 둘 다, 따옴표 행(폴백)도 섞는다.
     #[test]
-    fn scan_ignore_case_hangul_needle_falls_back() {
-        let lines = &["가나,x", "다라,가나", "가나다,y", "İabc,z", "iabc,w"];
+    fn scan_hangul_needle_matches_brute_force() {
+        let lines = &[
+            "대한민국,인도네시아,인도",     // 인접 한글 — `인도`가 `인도네시아` 안에도 있다
+            "인도,x",                       // 셀 전체가 `인도`
+            "인도네시아,y",                 // 셀 전체가 `인도네시아`
+            "x,인도네시아공화국",           // 부분 걸침(WholeCell 제외)
+            "가나,다라",                    // 매치 없음
+            "\"인도,네시아\",z",            // 따옴표 안 delim → 폴백
+            "\"인\"도,z",                   // 표시값 `인도` — 바이트엔 `인도`가 없다
+            "\"인도\",w",                   // 따옴표 셀
+            "간,갇,갈",                     // 한글 바이트가 촘촘한 행
+            "한글AB,ab한글",                // 한글 + ASCII 혼합
+        ];
         for enc in [Encoding::Utf8, Encoding::Cp949] {
-            for needle in ["가나", "İ"] {
-                // CP949는 `İ`를 표현하지 못하므로 UTF-8에서만 그 케이스를 본다.
-                if enc == Encoding::Cp949 && needle == "İ" {
-                    continue;
-                }
+            for needle in ["인도", "인도네시아", "가나", "한글AB", "한글ab"] {
+                // 빠른 경로를 **타는지** 먼저 못박는다(안 타면 이 테스트가 폴백만 본다).
+                assert!(
+                    bytefast_ci_ok(needle, enc),
+                    "한글 needle {needle:?}는 {enc:?}에서 빠른 경로를 타야 한다"
+                );
                 for scope in [
                     crate::find::MatchScope::Partial,
                     crate::find::MatchScope::WholeCell,
                 ] {
-                    assert!(!bytefast_ci_ok(needle, enc), "비ASCII needle은 폴백이어야 한다");
                     let mut doc = scan_view_doc(lines, enc, SeparatorMode::Char(b','));
                     doc.find_query = needle.to_owned();
                     doc.find_opts = crate::find::FindOptions { match_case: false, scope };
                     assert_scan_equals_brute(&doc);
                 }
+            }
+        }
+        // 빠른 경로가 실제로 행을 내는지(항상 빈 Vec이면 계약 테스트가 무의미).
+        let mut doc = scan_view_doc(lines, Encoding::Utf8, SeparatorMode::Char(b','));
+        doc.find_query = "인도네시아".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: false,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        let got = scan_all_matches(&doc);
+        assert_eq!(got, vec![0, 2], "셀 전체가 `인도네시아`인 행만");
+    }
+
+    /// 유니코드 접기가 필요한 needle(`İ`/`É`)은 여전히 폴백을 타되 결과는 정확.
+    /// 바이트 접기로는 1:N 확장·악센트 접기를 표현할 수 없기 때문이다.
+    #[test]
+    fn scan_accented_needle_falls_back() {
+        let lines = &["İabc,z", "iabc,w", "Éa,x", "éa,y", "가나,다라"];
+        for needle in ["İ", "É", "é"] {
+            assert!(
+                !bytefast_ci_ok(needle, Encoding::Utf8),
+                "접히는 비ASCII needle {needle:?}는 폴백이어야 한다"
+            );
+            for scope in [
+                crate::find::MatchScope::Partial,
+                crate::find::MatchScope::WholeCell,
+            ] {
+                let mut doc =
+                    scan_view_doc(lines, Encoding::Utf8, SeparatorMode::Char(b','));
+                doc.find_query = needle.to_owned();
+                doc.find_opts = crate::find::FindOptions { match_case: false, scope };
+                assert_scan_equals_brute(&doc);
             }
         }
     }
