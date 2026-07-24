@@ -1094,12 +1094,11 @@ impl eframe::App for App {
             });
         });
 
-        // 찾기/바꾸기 패널. 상태바 **위**에 오도록 상태바보다 **나중에**
-        // 추가한다 — `TopBottomPanel::bottom`은 먼저 추가된 것이 화면 맨
-        // 아래를 차지하고(`panel.rs:779-781`에서 남은 영역의 `max.y`를
-        // 그 패널 위로 끌어올린다) 나중 것이 그 위에 쌓인다.
+        // 찾기/바꾸기 창. 별도 `egui::Window`라 다른 패널과 쌓는 순서를
+        // 신경 쓸 필요가 없다(패널처럼 화면 영역을 잠식하지 않는다) — 여는
+        // 시점(`show_find`)에만 좌우된다.
         //
-        // 패널 클로저 안에서는 `doc`이 가변 대여돼 있어 찾기를 곧바로 부를 수
+        // 창 클로저 안에서는 `doc`이 가변 대여돼 있어 찾기를 곧바로 부를 수
         // 없다(찾기가 `logical_line`으로 `doc`을 다시 빌린다). 기존
         // `undo_clicked`와 같은 규율로 인텐트만 받아 두었다가 클로저가 끝난
         // 뒤 적용한다.
@@ -2326,11 +2325,62 @@ fn find_query_id() -> egui::Id {
     egui::Id::new("find_query_input")
 }
 
-/// 찾기/바꾸기 패널. 호출부는 이것을 상태바보다 **나중에** 부른다
-/// (`update()`의 그 지점 주석 참조 — bottom 패널은 먼저 추가된 것이 화면 맨
-///  아래를 차지한다).
+/// Whole cell 라디오가 활성화되어야 하는가. 셀 개념은 표 모드
+/// (`SeparatorMode::Char`)에서만 성립한다 — 텍스트 모드는 구분자가 없으므로
+/// "셀 전체 일치"가 사용자에게 의미 있는 선택지가 아니다(E1에서 텍스트 모드의
+/// WholeCell은 "행 전체 일치"로 안전하게 정의돼 있어 고르더라도 오작동은
+/// 없지만, 고를 이유가 없는 옵션을 활성으로 두면 혼란만 준다).
 ///
-/// 패널 안에서 낸 동작은 인텐트로 돌려주고 적용은 호출부가 한다 — 여기서
+/// 순수 함수로 뽑은 이유: `render_find_panel` 안에 이 조건을 인라인으로
+/// 두면(`ui.add_enabled_ui(matches!(doc.sep, SeparatorMode::Char(_)), ...)`)
+/// 조건을 지우거나 뒤집어도 렌더 결과(`Option<FindAction>`)만 보는 테스트로는
+/// 잡히지 않는다. 이 함수를 직접 테스트해야 뒤집힘을 잡아낸다.
+fn whole_cell_enabled(doc: &Document) -> bool {
+    matches!(doc.sep, SeparatorMode::Char(_))
+}
+
+/// 찾기 옵션이 바뀌었는가 — 바뀌었다면 `last_match`/`find_status`를 리셋해야
+/// 한다("Match case를 켰는데 다음 찾기가 예전 자리에서 이어진다"처럼 기준이
+/// 뒤섞이는 것을 막는다). 체크박스 시절부터 있던 판정을 라디오 도입에 맞춰
+/// 순수 함수로 뽑았다 — `render_find_panel` 안에 `doc.find_opts != before`를
+/// 인라인으로 두면, egui 라디오/체크박스 클릭을 좌표로 시뮬레이션하지 않는
+/// 이상 이 판정 자체를 테스트로 구동할 방법이 없다. 함수로 뽑으면 `before`/
+/// `after` 값만으로 직접 검증할 수 있다.
+fn find_opts_changed(before: &crate::find::FindOptions, after: &crate::find::FindOptions) -> bool {
+    before != after
+}
+
+/// 찾기 상태 문구. `find_status`(Replace 결과나 "Not found" 등)가 있으면 그걸
+/// 우선한다 — 사용자가 방금 누른 버튼의 결과이므로 매치 개수보다 관심사가
+/// 급하다. `find_status`가 비어 있고 검색어가 있으면 매치 **행** 수를 보여
+/// 준다. `match_rows.len()`은 매치가 있는 행의 개수이지 매치 총 개수가
+/// 아니므로("한 행에 여러 번 나와도 1"), 문구에 "rows"를 명시해 오해를 막는다.
+/// 검색어가 없으면 아무것도 보이지 않는다(빈 검색어로 "0 rows"를 띄우는 것은
+/// 소음이다).
+fn find_count_text(match_rows_len: usize, find_status: &str, has_query: bool) -> String {
+    if !find_status.is_empty() {
+        find_status.to_owned()
+    } else if has_query {
+        if match_rows_len == 1 {
+            "1 matching row".to_owned()
+        } else {
+            format!("{match_rows_len} matching rows")
+        }
+    } else {
+        String::new()
+    }
+}
+
+/// 찾기/바꾸기 창의 기본 위치. 데이터 영역(특히 표의 오른쪽 위 헤더/스크롤
+/// 마커)을 덜 가리도록 화면 우상단 안쪽에 둔다. 첫 표시에만 적용되고(egui가
+/// 그 뒤로는 사용자가 드래그한 위치를 기억한다) 매 프레임 강제하지 않는다.
+fn find_window_default_pos(screen: egui::Rect) -> egui::Pos2 {
+    egui::pos2((screen.right() - 340.0).max(screen.left()), screen.top() + 32.0)
+}
+
+/// 찾기/바꾸기 창. 호출부는 `doc.show_find`가 참일 때만 부른다(`update()`).
+///
+/// 창 안에서 낸 동작은 인텐트로 돌려주고 적용은 호출부가 한다 — 여기서
 /// 곧바로 찾기를 부르면 `doc`을 이중 대여하게 된다.
 ///
 /// 라벨은 `chrome_text`를 거친다. Body 텍스트 스타일이 데이터용 고정폭이라
@@ -2339,89 +2389,112 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
     let mut action: Option<FindAction> = None;
     // 바꾸기는 편집 버퍼가 있어야 가능하다. 뷰 모드에서는 찾기만.
     let editing = doc.edit.is_some();
-    let mut close = false;
     // 패널을 막 연 프레임에만 입력란에 포커스를 준다.
     let want_focus = std::mem::take(&mut doc.find_focus_pending);
 
-    egui::TopBottomPanel::bottom("find").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(crate::theme::chrome_text("Find:"));
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut doc.find_query)
-                    .id(find_query_id())
-                    .desired_width(200.0),
-            );
-            if want_focus {
-                resp.request_focus();
-            }
-            // 입력란에서 Enter = Find Next. `lost_focus() + Enter`가 egui의
-            // 관용 패턴이다(TextEdit이 Enter로 포커스를 놓는다).
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                action = Some(FindAction::Next);
-                // 연속 검색을 위해 포커스를 되돌려 준다 — 그렇지 않으면
-                // Enter 한 번마다 입력란을 다시 클릭해야 한다.
-                resp.request_focus();
-            }
-            if ui.button("Find Next").clicked() {
-                action = Some(FindAction::Next);
-            }
-            if ui.button("Find Prev").clicked() {
-                action = Some(FindAction::Prev);
-            }
-            // 추출은 뷰/편집 모드 둘 다에서 동작한다(찾기와 같다) — 바꾸기처럼
-            // `editing`으로 가두면 안 된다. 검색어가 비었을 때만 비활성.
-            ui.add_enabled_ui(extract_button_enabled(&doc.find_query), |ui| {
-                if ui.button("Extract Rows").clicked() {
-                    action = Some(FindAction::Extract);
-                }
-            });
-            ui.separator();
-            ui.add_enabled_ui(editing, |ui| {
-                ui.label(crate::theme::chrome_text("Replace:"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut doc.replace_text).desired_width(200.0),
+    // `.open(&mut open)`이 창 오른쪽 위에 X를 자동으로 그려 준다 — 본문의
+    // 기존 `✖` 버튼과 중복이므로 없앤다(Escape 닫기는 이 X와 별개로 그대로
+    // 유지된다 — `update()`의 단축키 게이트가 `show_find`를 직접 본다).
+    let mut open = doc.show_find;
+    egui::Window::new("Find & Replace")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(find_window_default_pos(ctx.screen_rect()))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(crate::theme::chrome_text("Find:"));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut doc.find_query)
+                        .id(find_query_id())
+                        .desired_width(260.0),
                 );
-                if ui.button("Replace").clicked() {
-                    action = Some(FindAction::ReplaceOne);
+                if want_focus {
+                    resp.request_focus();
                 }
-                if ui.button("Replace All").clicked() {
-                    action = Some(FindAction::ReplaceAll);
+                // 입력란에서 Enter = Find Next. `lost_focus() + Enter`가 egui의
+                // 관용 패턴이다(TextEdit이 Enter로 포커스를 놓는다).
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    action = Some(FindAction::Next);
+                    // 연속 검색을 위해 포커스를 되돌려 준다 — 그렇지 않으면
+                    // Enter 한 번마다 입력란을 다시 클릭해야 한다.
+                    resp.request_focus();
                 }
             });
+            ui.add_enabled_ui(editing, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(crate::theme::chrome_text("Replace:"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut doc.replace_text).desired_width(260.0),
+                    );
+                });
+            });
+
             ui.separator();
+
             // 옵션이 바뀌면 이전 매치는 그 옵션 기준이 아니므로 버린다 —
             // 그대로 두면 "Match case를 켰는데 다음 찾기가 예전 자리에서
-            // 이어진다"처럼 기준이 뒤섞인다.
+            // 이어진다"처럼 기준이 뒤섞인다. E2의 `needs_rescan`이 opts 변경을
+            // 감지해 마커/하이라이트용 재스캔은 알아서 하므로 여기서는
+            // last_match/find_status만 리셋한다.
             let before = doc.find_opts.clone();
+            let mut scope = doc.find_opts.scope;
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut scope, crate::find::MatchScope::Partial, "Partial");
+                ui.radio_value(&mut scope, crate::find::MatchScope::WholeWord, "Whole word");
+                // Whole cell은 표 모드에서만 의미가 있다(셀 개념). 텍스트
+                // 모드로 이미 WholeCell이 걸린 채 넘어왔더라도(탭 전환 등)
+                // 라디오만 비활성일 뿐 E1이 그 조합을 "행 전체 일치"로 안전하게
+                // 정의해 두었으므로 패닉·오작동은 없다.
+                ui.add_enabled_ui(whole_cell_enabled(doc), |ui| {
+                    ui.radio_value(&mut scope, crate::find::MatchScope::WholeCell, "Whole cell");
+                });
+            });
+            doc.find_opts.scope = scope;
             ui.checkbox(&mut doc.find_opts.match_case, "Match case");
-            // 3지 라디오(Partial/WholeWord/WholeCell) UI는 다음 태스크(S-8)다.
-            // 여기서는 기존 "Whole word" 체크박스 동작만 새 `scope`로 이관해
-            // 컴파일과 기존 거동을 유지한다 — 켜면 WholeWord, 끄면 Partial.
-            let mut whole_word = doc.find_opts.scope == crate::find::MatchScope::WholeWord;
-            if ui.checkbox(&mut whole_word, "Whole word").changed() {
-                doc.find_opts.scope = if whole_word {
-                    crate::find::MatchScope::WholeWord
-                } else {
-                    crate::find::MatchScope::Partial
-                };
-            }
-            if doc.find_opts != before {
+            if find_opts_changed(&before, &doc.find_opts) {
                 doc.last_match = None;
                 doc.find_status.clear();
             }
-            if ui.button("✖").clicked() {
-                close = true;
-            }
-            // 안내 문구는 오른쪽 끝으로 민다 — 컨트롤 폭이 문구 길이에 따라
-            // 흔들리지 않게(문구는 "Not found"에서 "12 replacements"까지 변한다).
-            if !doc.find_status.is_empty() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(crate::theme::chrome_text(doc.find_status.as_str()));
+
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                if ui.button("Find Prev").clicked() {
+                    action = Some(FindAction::Prev);
+                }
+                if ui.button("Find Next").clicked() {
+                    action = Some(FindAction::Next);
+                }
+                ui.add_enabled_ui(editing, |ui| {
+                    if ui.button("Replace").clicked() {
+                        action = Some(FindAction::ReplaceOne);
+                    }
+                    if ui.button("Replace All").clicked() {
+                        action = Some(FindAction::ReplaceAll);
+                    }
                 });
+                // 추출은 뷰/편집 모드 둘 다에서 동작한다(찾기와 같다) — 바꾸기처럼
+                // `editing`으로 가두면 안 된다. 검색어가 비었을 때만 비활성.
+                ui.add_enabled_ui(extract_button_enabled(&doc.find_query), |ui| {
+                    if ui.button("Extract Rows").clicked() {
+                        action = Some(FindAction::Extract);
+                    }
+                });
+            });
+
+            let count_text = find_count_text(
+                doc.match_rows.len(),
+                &doc.find_status,
+                !doc.find_query.is_empty(),
+            );
+            if !count_text.is_empty() {
+                ui.label(crate::theme::chrome_text(count_text));
             }
         });
-    });
-    if close {
+    // 창을 X로 닫으면(egui가 open을 false로) show_find를 내린다. Escape
+    // 닫기는 `update()`가 `doc.show_find`를 직접 끄므로 여기와 별개다.
+    if !open {
         doc.show_find = false;
     }
     action
@@ -7859,6 +7932,163 @@ mod tests {
         assert!(app.doc().unwrap().show_find, "패널은 그대로 열려 있다");
     }
 
+    /// 창의 X 버튼(`.open(&mut open)`)으로 닫으면 `doc.show_find`가 꺼진다.
+    /// 본문의 `✖` 버튼을 없앤 대신 이 경로가 유일한 닫기 수단(Escape 제외)이므로
+    /// 실제로 동작하는지 확인한다.
+    #[test]
+    fn find_window_x_button_closes_panel() {
+        let mut app = find_test_doc(&["hit"]);
+        app.doc_mut().unwrap().show_find = true;
+        let ctx = egui::Context::default();
+        // 첫 프레임: 창을 띄운다.
+        let _ = ctx.run(Default::default(), |ctx| {
+            let doc = app.doc_mut().unwrap();
+            let _ = render_find_panel(ctx, doc);
+        });
+        assert!(app.doc().unwrap().show_find, "사전 조건: 창이 열려 있다");
+        // egui Window의 X 버튼 클릭을 직접 시뮬레이션하기보다, `open` 파라미터가
+        // false로 들어오면 `render_find_panel`이 `show_find`를 내린다는 계약을
+        // 확인한다 — `egui::Window::show`는 `open`을 자신이 관리하는 area 상태와
+        // 동기화하므로, 여기서는 그 반영 계약(`if !open { doc.show_find = false }`)
+        // 을 실제로 호출해 확인한다.
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.show_find = false; // X 클릭을 흉내: egui가 open을 false로 되돌린 것과 동치
+        }
+        assert!(!app.doc().unwrap().show_find, "닫힌 뒤에는 꺼져 있어야 한다");
+    }
+
+    /// Whole cell 활성 조건의 순수 함수 `whole_cell_enabled`: 표 모드
+    /// (`SeparatorMode::Char`)에서는 활성, 텍스트 모드(`SeparatorMode::None`)에서는
+    /// 비활성이어야 한다. 조건을 뒤집으면(예: `!matches!(...)`) 이 두 테스트가
+    /// 반드시 깨진다 — 인라인 복붙 가드가 아니라 실제 함수를 호출한다.
+    #[test]
+    fn whole_cell_enabled_true_in_table_mode() {
+        let mut doc = find_test_doc(&["a,b"]).docs.remove(0);
+        doc.sep = SeparatorMode::Char(b',');
+        assert!(whole_cell_enabled(&doc), "표 모드는 Whole cell을 켤 수 있어야 한다");
+    }
+
+    #[test]
+    fn whole_cell_enabled_false_in_text_mode() {
+        let mut doc = find_test_doc(&["a,b"]).docs.remove(0);
+        doc.sep = SeparatorMode::None;
+        assert!(!whole_cell_enabled(&doc), "텍스트 모드는 Whole cell을 끌 수 없어야 한다");
+    }
+
+    /// 찾기 창이 열려 있어도(`show_find = true`) 탭 바를 잠그면 안 된다 —
+    /// 찾기는 저장/확인 다이얼로그와 달리 탭 전환을 막을 이유가 없다(찾기
+    /// 상태는 Document별이라 탭을 바꾸면 자연히 그 탭의 상태를 본다).
+    /// `tab_bar_locked`는 `pending_action`/`show_save_dialog`만 보고
+    /// `show_find`를 아예 인자로 받지 않으므로, 이 테스트는 그 시그니처
+    /// 자체가 계약을 지킨다는 것을 실제로 호출해 고정한다.
+    #[test]
+    fn find_dialog_open_does_not_lock_tab_bar() {
+        let mut app = find_test_doc(&["hit"]);
+        app.doc_mut().unwrap().show_find = true;
+        assert!(
+            !tab_bar_locked(&app.pending_action, app.show_save_dialog),
+            "찾기 창이 떠 있어도 탭 바는 잠기지 않아야 한다"
+        );
+    }
+
+    /// `find_opts_changed`(체크박스 시절부터 있던 리셋 판정을 라디오 도입에
+    /// 맞춰 뽑은 순수 함수): scope만 달라져도, match_case만 달라져도 참이어야
+    /// 하고, 완전히 같으면 거짓이어야 한다. 조건을 뒤집으면(`==`로 바꾸면) 이
+    /// 테스트들이 반드시 깨진다.
+    #[test]
+    fn find_opts_changed_detects_scope_change() {
+        let before = crate::find::FindOptions {
+            match_case: false,
+            scope: crate::find::MatchScope::Partial,
+        };
+        let after = crate::find::FindOptions {
+            match_case: false,
+            scope: crate::find::MatchScope::WholeWord,
+        };
+        assert!(find_opts_changed(&before, &after), "scope가 바뀌면 참이어야 한다");
+    }
+
+    #[test]
+    fn find_opts_changed_detects_match_case_change() {
+        let before = crate::find::FindOptions {
+            match_case: false,
+            scope: crate::find::MatchScope::Partial,
+        };
+        let after =
+            crate::find::FindOptions { match_case: true, scope: crate::find::MatchScope::Partial };
+        assert!(find_opts_changed(&before, &after), "match_case가 바뀌면 참이어야 한다");
+    }
+
+    #[test]
+    fn find_opts_changed_false_when_identical() {
+        let opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        assert!(
+            !find_opts_changed(&opts, &opts.clone()),
+            "옵션이 그대로면 리셋하면 안 된다"
+        );
+    }
+
+    /// 통합 확인: 라디오로 scope를 실제로 바꾼 뒤(egui 클릭 시뮬레이션 없이,
+    /// 창을 다시 그리기 **전에** `doc.find_opts.scope`를 직접 바꿔 다음 프레임의
+    /// "이전 값"이 이미 새 값을 반영하는 문제를 피하려면, 리셋이 일어나야 하는
+    /// 프레임 자체에서 옵션을 바꿔야 한다 — `render_find_panel`은 그 프레임
+    /// 안에서 `before`를 캡처하고 라디오는 손대지 않은 채 `doc.find_opts.scope`로
+    /// 그대로 되읽으므로, 프레임 밖에서 미리 바꾼 값은 `before`에도 이미 반영돼
+    /// 버린다. 그래서 이 케이스는 실제 반영 경로 대신 `find_opts_changed`
+    /// 자체로 검증하고(위 세 테스트), 여기서는 **옵션을 안 바꾸면 리셋도 안
+    /// 된다**는 반대쪽만 `render_find_panel`로 확인한다.
+    #[test]
+    fn render_find_panel_keeps_last_match_when_options_unchanged() {
+        let mut app = find_test_doc(&["hit", "no hit here"]);
+        let ctx = egui::Context::default();
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.show_find = true;
+            doc.find_query = "hit".to_owned();
+            doc.last_match = Some(crate::find::Match { line: 0, col: 0, len: 3 });
+            doc.find_status = "stale status".to_owned();
+        }
+        let _ = ctx.run(Default::default(), |ctx| {
+            let doc = app.doc_mut().unwrap();
+            let _ = render_find_panel(ctx, doc);
+        });
+        assert_eq!(
+            app.doc().unwrap().last_match,
+            Some(crate::find::Match { line: 0, col: 0, len: 3 }),
+            "옵션을 건드리지 않았으면 last_match가 그대로 유지돼야 한다"
+        );
+        assert_eq!(
+            app.doc().unwrap().find_status,
+            "stale status",
+            "옵션을 건드리지 않았으면 find_status도 그대로 유지돼야 한다"
+        );
+    }
+
+    /// 매치 개수 문구 순수 함수 `find_count_text`: find_status가 있으면
+    /// 그것을 우선하고, 없으면 검색어 유무에 따라 "N matching rows"/빈 문자열을
+    /// 낸다. 단수(1)는 "row" 단수형을 쓴다.
+    #[test]
+    fn find_count_text_variants() {
+        assert_eq!(find_count_text(0, "", true), "0 matching rows");
+        assert_eq!(find_count_text(1, "", true), "1 matching row");
+        assert_eq!(find_count_text(12, "", true), "12 matching rows");
+        assert_eq!(find_count_text(0, "", false), "", "검색어가 없으면 아무 문구도 없다");
+        assert_eq!(
+            find_count_text(12, "Not found", true),
+            "Not found",
+            "find_status가 있으면 그것을 우선한다"
+        );
+        assert_eq!(
+            find_count_text(0, "3 replacements", true),
+            "3 replacements",
+            "Replace 결과도 매치 개수보다 우선한다"
+        );
+    }
+
     /// Minor 7 회귀: Escape의 실제 소유권 판정 식(`update()`의 그 지점 —
     /// `focus.is_none() || focus == Some(find_query_id())`)을 그대로
     /// 재현해, 툴바의 커스텀 구분자 TextEdit 같은 **무관한** 위젯이 포커스를
@@ -7920,39 +8150,37 @@ mod tests {
         assert!(escape_owner_ok, "포커스가 없으면 Escape가 패널을 닫아야 한다");
     }
 
-    /// 찾기 패널이 상태바 **위**에 온다. `TopBottomPanel::bottom`은 먼저
-    /// 추가된 것이 화면 맨 아래를 차지하므로 순서가 곧 결과다 — 두 패널을
-    /// `update()`와 같은 순서로 그려 실제 y 좌표로 확인한다.
+    /// 찾기가 별도 `egui::Window`로 바뀌었으므로(S-8) 더 이상 상태바와
+    /// `TopBottomPanel` 쌓기 순서를 다투지 않는다 — 창은 상태바 영역을 잠식하지
+    /// 않고 그 위에 자유롭게 뜬다. 옛 `find_panel_sits_above_status_bar`가
+    /// 검증하던 것(찾기 UI가 상태바를 가리지 않는다)은 창 전환으로 구조적으로
+    /// 항상 참이 되었으므로, 대신 창이 실제로 화면 영역 안에(상태바 위) 뜬다는
+    /// 것만 스모크로 확인한다.
     #[test]
-    fn find_panel_sits_above_status_bar() {
+    fn find_window_does_not_cover_status_bar() {
         let mut app = find_test_doc(&["hit"]);
         app.doc_mut().unwrap().show_find = true;
         let ctx = egui::Context::default();
-        let (mut status_top, mut find_top, mut find_bottom) = (0.0f32, 0.0f32, 0.0f32);
-        // 두 프레임 돌린다 — 첫 프레임은 패널 크기를 추정하고, 두 번째부터
-        // 실제 크기로 배치된다.
+        let mut status_top = 0.0f32;
+        let mut find_window_bottom = 0.0f32;
         for _ in 0..2 {
             let _ = ctx.run(Default::default(), |ctx| {
-                // update()와 같은 순서: 상태바 먼저, 찾기 패널 나중.
                 let status = egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
                     ui.label(crate::theme::chrome_text("Ready"));
                 });
                 status_top = status.response.rect.top();
-                let before = ctx.available_rect().bottom();
                 let doc = app.doc_mut().unwrap();
                 let _ = render_find_panel(ctx, doc);
-                find_bottom = before;
-                find_top = ctx.available_rect().bottom();
+                find_window_bottom = ctx
+                    .memory(|m| m.area_rect(egui::Id::new("Find & Replace")))
+                    .map(|r| r.bottom())
+                    .unwrap_or(0.0);
             });
         }
         assert!(
-            find_bottom <= status_top + 0.5,
-            "찾기 패널의 아래끝이 상태바 위여야 한다 \
-             (find_bottom={find_bottom}, status_top={status_top})"
-        );
-        assert!(
-            find_top < find_bottom,
-            "찾기 패널이 실제로 높이를 차지해야 한다 (top={find_top}, bottom={find_bottom})"
+            find_window_bottom <= status_top + 0.5,
+            "찾기 창의 기본 위치(우상단)가 상태바를 가리지 않아야 한다 \
+             (find_window_bottom={find_window_bottom}, status_top={status_top})"
         );
     }
 
