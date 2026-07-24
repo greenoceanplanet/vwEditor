@@ -1661,20 +1661,20 @@ fn search_from(
 /// **설계 S-3의 (나) 방식.** `find.rs`는 mmap/Source를 모르므로, 벤치가 증명한
 /// "파일 전체 memmem + offset 이진탐색" 최적화는 여기(app.rs)에서 한다.
 ///
-/// **ignore_case 프리필터 판단(중요).** memmem은 대소문자를 구분한다.
+/// **ignore_case 프리필터 판단(중요, Task H에서 수정).** memmem은 대소문자를
+/// 구분한다.
 /// - **match_case=true**: 원본 바이트에 그대로 memmem(벤치의 빠른 경로).
-/// - **match_case=false**: needle을 소문자로 접고 hay도 소문자로 접어 비교해야
-///   `"Ab"` 같은 **혼합 대소문자**를 놓치지 않는다. "needle 대문자/소문자 두 벌을
-///   memmem" 방식은 혼합 케이스(`ab`↔`Ab`)를 놓쳐 **위음성**이 생기므로 채택하지
-///   않았다(프리필터가 실제 매치를 버리면 브루트포스와 결과가 달라진다).
-///   대신 ignore_case에서는 memmem 바이트 프리필터를 건너뛰고 **행 단위**
-///   `find_in_line_scoped`로 판정한다(느리지만 정확). 편집 모드는 행이 이미
-///   RAM에 있으니 그대로 순회하고, 뷰 모드는 `logical_line`으로 행을 디코딩해
-///   순회한다 — 둘 다 `matching_lines`와 동일한 판정 경로다.
+/// - **match_case=false**: "needle 대문자/소문자 **두 벌**을 memmem" 방식은 혼합
+///   케이스(`ab`↔`Ab`)를 놓쳐 **위음성**이 생기므로 채택하지 않는다. 대신
+///   **hay와 needle 바이트를 둘 다 ASCII 소문자로 접어** 비교한다
+///   (`find_ci_ascii`) — 접기는 ASCII 범위에서 바이트 단위로 정확히 정의되므로
+///   `Ab`/`aB`/`AB`/`ab`를 전부 잡는다. 조건은 `bytefast_ci_ok`(순수 ASCII
+///   needle + 단일 바이트 인코딩)이고, 그 밖(비ASCII needle, UTF-16, Whole word)은
+///   종전대로 행 단위 `find_in_line_scoped` 폴백이다.
 ///
-/// 요약: ignore_case의 정확성을 위해 프리필터를 포기했고, 그 대가는 흔치 않은
-/// "대소문자 무시 + 초대형 파일" 조합에서의 스캔 속도뿐이다. match_case 스캔은
-/// 벤치가 증명한 빠른 경로를 그대로 쓴다.
+/// 어느 경로든 최종 결과는 반드시 `matching_lines` 브루트포스와 **같은 행 집합**
+/// 이다. 빠른 경로는 "확정" 또는 "정밀 판정 필요"만 판단하고, 애매한 것을
+/// 바이트만으로 "비매치"로 단정하지 않는다.
 ///
 /// (호출부는 Find All(`apply_find_action`의 `FindAction::All`)과 추출뿐이다 —
 /// 매 프레임 자동 호출은 없앴다. 사용자가 명시적으로 눌렀을 때만 돈다.)
@@ -1708,13 +1708,63 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
                 && scope == crate::find::MatchScope::WholeCell
                 && delim.is_some();
             let needle_has_delim = delim.is_some_and(|d| needle_bytes.contains(&d));
+            // ignore_case 바이트 빠른 경로(Task H). `e.lines`는 **항상 UTF-8**
+            // 문자열이므로 문서 인코딩이 무엇이든 CP949 트레일 바이트 문제가 없다 —
+            // UTF-8 연속 바이트는 ≥0x80이라 ASCII needle과 겹칠 수 없어 바로
+            // 확정해도 된다. 그래서 `bytefast_ci_ok`의 인코딩 인자로 문서 인코딩이
+            // 아니라 `Encoding::Utf8`을 넘긴다(버퍼의 실제 인코딩이 판정 근거다).
+            let ci_ok = !opts.match_case && bytefast_ci_ok(query, Encoding::Utf8);
+            let needle_lower: Vec<u8> = query.bytes().map(ascii_lower).collect();
+            let ci_partial = ci_ok && scope == crate::find::MatchScope::Partial;
+            // Whole word는 유니코드 단어 경계라 바이트로 안전하지 않다 → 폴백 유지.
+            let ci_cell =
+                ci_ok && scope == crate::find::MatchScope::WholeCell && delim.is_some();
             let mut out = Vec::new();
             for (i, line) in e.lines.iter().enumerate() {
                 let lb = line.as_bytes();
                 // match_case면 memmem으로 후보를 먼저 거른다(정확성은 scoped가 보장).
-                // ignore_case면 프리필터 없이 바로 scoped(위 주석의 이유).
+                // ignore_case면 ASCII 접기 바이트 탐색, 그것도 안 되면 행 단위 scoped.
                 let Some(f) = &finder else {
-                    // ignore_case: 종전대로 행 단위 scoped.
+                    // ---- ignore_case Partial 빠른 경로: 히트 = 매치(UTF-8 버퍼). ----
+                    if ci_partial {
+                        if find_ci_ascii(lb, &needle_lower).is_some() {
+                            out.push(i as u32);
+                        }
+                        continue;
+                    }
+                    // ---- ignore_case Whole cell: 히트마다 경계 바이트만 본다. ----
+                    if ci_cell {
+                        let d = delim.unwrap();
+                        let mut confirmed = false;
+                        let mut needs_refine = false;
+                        for hit in find_ci_ascii_all(lb, &needle_lower) {
+                            match classify_cell_hit(
+                                lb,
+                                0,
+                                lb.len(),
+                                hit,
+                                needle_len,
+                                d,
+                                needle_has_delim,
+                            ) {
+                                CellHit::Confirmed => {
+                                    confirmed = true;
+                                    break;
+                                }
+                                CellHit::NeedsRefine => needs_refine = true,
+                                CellHit::NotCellBoundary => {}
+                            }
+                        }
+                        let matched = confirmed
+                            || (needs_refine
+                                && !crate::find::find_in_line_scoped(line, query, opts, delim)
+                                    .is_empty());
+                        if matched {
+                            out.push(i as u32);
+                        }
+                        continue;
+                    }
+                    // 그 외(비ASCII needle, Whole word): 종전대로 행 단위 scoped.
                     if !crate::find::find_in_line_scoped(line, query, opts, delim).is_empty() {
                         out.push(i as u32);
                     }
@@ -1768,8 +1818,12 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
         None => {
             if opts.match_case {
                 scan_view_memmem(doc, query, opts, delim)
+            } else if let Some(rows) = scan_view_ci_bytes(doc, query, opts, delim) {
+                rows
             } else {
-                // ignore_case: 행 단위 폴백(프리필터 위음성 방지).
+                // 빠른 경로가 성립하지 않는 경우(비ASCII needle, UTF-16, Whole word,
+                // 텍스트 모드 Whole cell): 행 단위 폴백. 디코딩 비용이 크지만
+                // 정확성이 우선이다.
                 let n = doc.index.line_count();
                 let mut out = Vec::new();
                 for i in 0..n {
@@ -1790,6 +1844,115 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
 /// 바이트 빠른 경로가 안전하지 않다. UTF-8/CP949만 참.
 fn is_single_byte_enc(enc: Encoding) -> bool {
     matches!(enc, Encoding::Utf8 | Encoding::Cp949)
+}
+
+/// ASCII 대문자 한 바이트를 소문자로 접는다. 그 밖의 바이트(숫자·기호·비ASCII
+/// ≥0x80)는 그대로 둔다 — 멀티바이트 시퀀스의 바이트를 건드리면 원래 없던
+/// 바이트열이 생겨 위양성/위음성이 둘 다 가능해진다.
+fn ascii_lower(b: u8) -> u8 {
+    if b.is_ascii_uppercase() {
+        b + 32
+    } else {
+        b
+    }
+}
+
+/// ASCII 대소문자 무시 바이트 탐색. `needle_lower`는 **호출부가 미리 소문자로
+/// 접어** 넘긴다(행마다 다시 접지 않게). hay는 비교 시점에 한 바이트씩 접으므로
+/// 할당이 없다.
+///
+/// **왜 양쪽을 다 접는가.** 예전 판단은 "needle의 대문자 변형 하나로 memmem을
+/// 돌린다"였고 그건 `Ab` 같은 혼합 대소문자를 놓쳤다(위음성). hay와 needle을
+/// **둘 다** ASCII 소문자로 접으면 `Ab`/`aB`/`AB`/`ab`가 전부 같은 바이트열이
+/// 되므로 ASCII 범위에서 정확하다.
+///
+/// 첫 바이트는 `memchr2`(소문자/대문자 두 바이트)로 건너뛰어 스캔한다 —
+/// 벤치에서 순진한 바이트 루프보다 눈에 띄게 빨랐다(374ms vs 408ms/2GB).
+fn find_ci_ascii(hay: &[u8], needle_lower: &[u8]) -> Option<usize> {
+    find_ci_ascii_from(hay, needle_lower, 0)
+}
+
+/// `find_ci_ascii`를 `from` 바이트 위치부터 시작한다. 모든 출현을 훑는
+/// `find_ci_ascii_all`이 재진입할 때 쓴다.
+fn find_ci_ascii_from(hay: &[u8], needle_lower: &[u8], from: usize) -> Option<usize> {
+    let n = needle_lower.len();
+    if n == 0 || hay.len() < n || from > hay.len() - n {
+        return None;
+    }
+    let lo = needle_lower[0];
+    // 소문자로 접힌 첫 바이트의 대문자 짝. ASCII 소문자가 아니면(숫자·기호·
+    // 비ASCII) 짝이 자기 자신이라 memchr 한 개로 충분하다.
+    let up = if lo.is_ascii_lowercase() { lo - 32 } else { lo };
+    let mut start = from;
+    while start + n <= hay.len() {
+        let rest = &hay[start..];
+        let pos = if lo == up {
+            memchr::memchr(lo, rest)
+        } else {
+            memchr::memchr2(lo, up, rest)
+        };
+        let i = start + pos?;
+        if i + n > hay.len() {
+            return None;
+        }
+        if hay[i + 1..i + n].iter().zip(&needle_lower[1..]).all(|(&h, &d)| ascii_lower(h) == d) {
+            return Some(i);
+        }
+        start = i + 1;
+    }
+    None
+}
+
+/// 겹치지 않는 모든 출현 위치(Whole cell 경계 판정에 필요 — 히트마다
+/// `classify_cell_hit`을 돌려야 하므로 첫 히트만으로는 부족하다).
+///
+/// `memmem::Finder::find_iter`와 같은 **비중첩** 규칙을 쓴다(찾은 뒤 needle
+/// 길이만큼 건너뜀) — Whole cell 판정은 히트가 더 많아도 결과가 같고
+/// (`classify_cell_hit`이 각각을 독립적으로 본다), 같은 규칙을 써야 match_case
+/// 경로와 동작을 나란히 읽을 수 있다. 한 행당 히트 수는 작아 `Vec`으로 모은다.
+fn find_ci_ascii_all(hay: &[u8], needle_lower: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if needle_lower.is_empty() {
+        return out;
+    }
+    let mut from = 0usize;
+    while let Some(i) = find_ci_ascii_from(hay, needle_lower, from) {
+        out.push(i);
+        from = i + needle_lower.len();
+    }
+    out
+}
+
+/// ignore_case에서 ASCII 바이트 접기 빠른 경로를 쓸 수 있는가.
+///
+/// - **needle이 순수 ASCII일 때만.** 비ASCII가 하나라도 있으면 유니코드 대소문자
+///   접기(그리스·키릴·터키어 `İ` 등 1:N 확장)가 필요한데 바이트로는 표현되지
+///   않는다 → 행 단위 폴백(`find_in_line_scoped`)이 정답이다.
+/// - **인코딩이 단일 바이트 계열일 때만.** UTF-16은 코드유닛이 2바이트라 원바이트
+///   경계·탐색이 코드유닛 중간에 걸린다 — match_case 경로와 **같은**
+///   `is_single_byte_enc` 판정을 재사용한다(판정을 두 벌로 만들면 갈린다).
+fn bytefast_ci_ok(query: &str, enc: Encoding) -> bool {
+    !query.is_empty() && query.is_ascii() && is_single_byte_enc(enc)
+}
+
+/// ignore_case 빠른 경로의 히트를 **바이트만으로 확정해도 되는가**(정밀 판정
+/// 생략 가능한가).
+///
+/// - **UTF-8: 확정해도 된다.** UTF-8 멀티바이트 시퀀스의 연속 바이트는 항상
+///   ≥0x80이라 ASCII 바이트(0x00~0x7F)와 **절대** 겹치지 않는다. 따라서 ASCII
+///   needle의 바이트열이 한글/이모지 문자 중간에 우연히 걸릴 수 없다.
+/// - **CP949: 확정하면 안 된다.** CP949 트레일 바이트는 0x41~0xFE라 ASCII
+///   대문자(0x41~0x5A)와 **겹친다**. 한글 한 글자의 트레일 바이트가 `A`(0x41)와
+///   같은 값일 수 있어, ASCII needle `a`를 ignore_case로 찾으면 그 트레일
+///   바이트에 걸려 **위양성**이 난다. 위양성은 안전하지만(최종 판정이 걸러낸다)
+///   결과가 브루트포스와 달라지면 안 되므로 후보로만 보고
+///   `find_in_line_scoped`로 확인한다.
+///
+/// 브리프의 (가)안. (나)안(인코딩 무관하게 전부 정밀 판정)은 단순하지만
+/// UTF-8 — 압도적으로 흔한 경우 — 에서 이득이 거의 사라진다. CP949는 후보 행에만
+/// 정밀 판정이 돌므로 비용이 히트 수에 비례할 뿐이다.
+fn bytefast_ci_confirms(enc: Encoding) -> bool {
+    matches!(enc, Encoding::Utf8)
 }
 
 /// Whole cell match_case 빠른 경로에서 memmem 히트 하나를 바이트만으로 판정한 결과.
@@ -1991,6 +2154,145 @@ fn scan_view_memmem(
     // 않으므로 같은 행이 뒤에 확정돼도 한 번만 담긴다(offset 단조 증가 + 한 행의
     // 바이트 범위 연속 → 같은 행 히트는 반드시 인접).
     out
+}
+
+/// 뷰 모드 + **ignore_case**의 바이트 빠른 경로(Task H). 빠른 경로가 성립하지
+/// 않으면(비ASCII needle, UTF-16, Whole word, 텍스트 모드 Whole cell) `None`을
+/// 돌려 호출부가 행 단위 폴백을 타게 한다.
+///
+/// **왜 필요한가.** `FindOptions::default()`는 `match_case: false`다 — 사용자가
+/// "Match case"를 켜지 않으면 **항상** 이 경로다. 그런데 종전에는 행마다
+/// `logical_line`으로 **디코딩(String 할당)** 한 뒤 `find_in_line_scoped`를 불렀다.
+/// 2GB/2200만 행에서 Whole cell 412초, Partial 54초가 나온 원인이 그 행마다의
+/// 디코딩·할당이다. 여기서는 mmap 바이트를 그대로 훑어 그 비용을 없앤다(~0.37초).
+///
+/// **파일 전체 훑기가 아니라 행 단위인 이유.** `scan_view_memmem`은 memmem으로
+/// 파일 전체를 한 번에 훑고 히트 offset을 이진탐색으로 행에 매핑한다. 그
+/// 구조를 여기 그대로 쓰면 히트마다 `partition_point`(log n) 비용이 붙는데,
+/// 흔한 검색어에서는 히트가 곧 행 수만큼 나오므로 그 비용이 그대로 쌓인다.
+/// 행 경계는 이미 `index`가 알고 있으므로 **행마다 `find_ci_ascii`를 한 번**
+/// 도는 편이 단순하고 충분히 빠르다(벤치 374ms). 핵심은 스캔 단위가 아니라
+/// **디코딩을 하지 않는 것**이다.
+///
+/// **needle 인코딩.** `save::encode_bytes`로 문서 인코딩에 맞춰 바이트를 얻는다
+/// (Task G의 교훈 — UTF-8 바이트를 CP949 파일에 그대로 쓰면 위음성). 여기서는
+/// needle이 순수 ASCII임을 `bytefast_ci_ok`가 보장하므로 UTF-8/CP949에서 같은
+/// 바이트가 나오지만, match_case 경로와 같은 길을 쓴다.
+fn scan_view_ci_bytes(
+    doc: &Document,
+    query: &str,
+    opts: &crate::find::FindOptions,
+    delim: Option<u8>,
+) -> Option<Vec<u32>> {
+    if !bytefast_ci_ok(query, doc.enc) {
+        return None;
+    }
+    let scope = opts.scope;
+    // Whole word는 유니코드 단어 경계라 바이트로 안전하지 않다(match_case 경로도
+    // 같은 이유로 폴백이다). Whole cell은 표 모드(delim 존재)에서만 — 텍스트 모드의
+    // "행 전체 일치"는 개행 trim·인코딩 정합성이 섞여 폴백에 맡긴다.
+    let cell = match scope {
+        crate::find::MatchScope::Partial => false,
+        crate::find::MatchScope::WholeCell if delim.is_some() => true,
+        _ => return None,
+    };
+    let needle_bytes = crate::save::encode_bytes(query, doc.enc);
+    if needle_bytes.is_empty() {
+        return None;
+    }
+    let needle_len = needle_bytes.len();
+    let needle_lower: Vec<u8> = needle_bytes.iter().copied().map(ascii_lower).collect();
+    let needle_has_delim = delim.is_some_and(|d| needle_bytes.contains(&d));
+    // UTF-8이면 히트를 바로 확정, CP949면 트레일 바이트 위양성 때문에 후보로만 본다.
+    let confirms = bytefast_ci_confirms(doc.enc);
+
+    let (offsets, total_bytes) = doc.index.snapshot();
+    let bytes = doc.source.as_bytes();
+    let mut out = Vec::new();
+    for row in 0..offsets.len() {
+        let Some((s, en)) = crate::index::LineIndex::range_in(&offsets, total_bytes, row) else {
+            continue;
+        };
+        let (line_start, mut line_end) = (s as usize, en as usize);
+        if line_end > bytes.len() || line_start > line_end {
+            continue;
+        }
+        // 개행 제외 내용 끝(단일 바이트 인코딩이므로 `\r`/`\n`은 1바이트).
+        while line_end > line_start && matches!(bytes[line_end - 1], b'\r' | b'\n') {
+            line_end -= 1;
+        }
+        let lb = &bytes[line_start..line_end];
+
+        // ---- Partial: 히트 하나면 이 행에 needle이 있다는 증명. ----
+        if !cell {
+            if find_ci_ascii(lb, &needle_lower).is_none() {
+                continue;
+            }
+            // CP949는 한글 트레일 바이트가 ASCII 대문자와 겹쳐 위양성이 가능하므로
+            // 후보 행만 디코딩해 정밀 판정한다(위양성은 안전, 위음성이 위험).
+            if confirms || ci_refine_hit(doc, s, en, query, opts, delim) {
+                out.push(row as u32);
+            }
+            continue;
+        }
+
+        // ---- Whole cell: 히트마다 경계 바이트만 본다(`classify_cell_hit` 재사용 —
+        //      그 함수는 대소문자와 무관하게 경계 바이트만 보므로 그대로 쓴다). ----
+        let d = delim.unwrap();
+        let mut confirmed = false;
+        let mut needs_refine = false;
+        for hit in find_ci_ascii_all(lb, &needle_lower) {
+            // `classify_cell_hit`은 파일 전체 바이트 기준 offset을 받으므로
+            // 행 슬라이스 안의 위치를 파일 offset으로 되돌린다.
+            match classify_cell_hit(
+                bytes,
+                line_start,
+                line_end,
+                line_start + hit,
+                needle_len,
+                d,
+                needle_has_delim,
+            ) {
+                CellHit::Confirmed => {
+                    confirmed = true;
+                    break;
+                }
+                CellHit::NeedsRefine => needs_refine = true,
+                CellHit::NotCellBoundary => {}
+            }
+        }
+        // 확정 히트가 있어도 CP949면 정밀 판정을 거친다(위 (가)안). 확정이 없고
+        // 따옴표 후보만 있으면 폴백으로 확인한다. 둘 다 없으면 비매치 —
+        // 모든 히트가 경계 밖이면 셀 전체 매치가 있을 수 없다.
+        let matched = if confirmed && confirms {
+            true
+        } else if confirmed || needs_refine {
+            ci_refine_hit(doc, s, en, query, opts, delim)
+        } else {
+            false
+        };
+        if matched {
+            out.push(row as u32);
+        }
+    }
+    Some(out)
+}
+
+/// 후보 행 하나를 디코딩해 `find_in_line_scoped`로 정밀 판정한다.
+/// `scan_view_memmem`의 폴백 경로와 **완전히 같은** 방법으로 디코딩·개행 제거해야
+/// 결과가 `matching_lines`(= `logical_line` 경유)와 어긋나지 않는다.
+fn ci_refine_hit(
+    doc: &Document,
+    s: u64,
+    en: u64,
+    query: &str,
+    opts: &crate::find::FindOptions,
+    delim: Option<u8>,
+) -> bool {
+    let text = crate::parse::decode_line(doc.source.slice(s, en), doc.enc)
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
+    !crate::find::find_in_line_scoped(&text, query, opts, delim).is_empty()
 }
 
 /// 스크롤 마커 거터를 그릴지 여부. Find All 스냅샷(`highlight`)이 없거나 매치
@@ -7772,6 +8074,339 @@ mod tests {
                     assert_scan_equals_brute(doc);
                 }
             }
+        }
+    }
+
+    // ---- Task H: ignore_case 바이트 빠른 경로 ----
+
+    /// `ascii_lower`는 ASCII 대문자만 접고 나머지는 그대로 둔다. 비ASCII 바이트를
+    /// 건드리면 멀티바이트 시퀀스가 뒤틀려 위양성/위음성이 둘 다 가능해진다.
+    #[test]
+    fn ascii_lower_folds_only_ascii_uppercase() {
+        assert_eq!(ascii_lower(b'A'), b'a');
+        assert_eq!(ascii_lower(b'Z'), b'z');
+        assert_eq!(ascii_lower(b'a'), b'a');
+        assert_eq!(ascii_lower(b'0'), b'0');
+        assert_eq!(ascii_lower(b'_'), b'_');
+        // 0x80 이상(UTF-8 연속 바이트·CP949 리드/트레일)은 절대 바뀌지 않는다.
+        for b in 0x80u8..=0xFF {
+            assert_eq!(ascii_lower(b), b, "비ASCII 바이트 {b:#x}는 그대로여야 한다");
+        }
+    }
+
+    /// `find_ci_ascii`가 혼합 대소문자를 전부 잡는다 — 이것이 "needle 한 벌만
+    /// 접는" 옛 방식이 놓쳤던 케이스다(위음성).
+    #[test]
+    fn find_ci_ascii_finds_all_case_variants() {
+        let needle: Vec<u8> = "ab".bytes().map(ascii_lower).collect();
+        for hay in ["Ab", "aB", "AB", "ab"] {
+            assert_eq!(
+                find_ci_ascii(hay.as_bytes(), &needle),
+                Some(0),
+                "{hay}를 놓치면 안 된다"
+            );
+        }
+        // 앞에 다른 바이트가 붙어도 위치가 정확해야 한다.
+        assert_eq!(find_ci_ascii(b"xxAbxx", &needle), Some(2));
+        // 없으면 None.
+        assert_eq!(find_ci_ascii(b"xyz", &needle), None);
+        // hay가 needle보다 짧으면 None(범위 밖 접근 방지).
+        assert_eq!(find_ci_ascii(b"a", &needle), None);
+        // 빈 needle은 None — 매치를 내면 호출부가 무한 루프에 빠진다.
+        assert_eq!(find_ci_ascii(b"abc", b""), None);
+        assert_eq!(find_ci_ascii(b"", b""), None);
+    }
+
+    /// 비ASCII 바이트가 섞여도 ASCII needle의 위치가 정확하고, 접기가 비ASCII를
+    /// 건드리지 않아 한글 바이트가 우연히 매치를 만들지 않는다(UTF-8 기준).
+    #[test]
+    fn find_ci_ascii_leaves_non_ascii_alone() {
+        let needle: Vec<u8> = "hit".bytes().map(ascii_lower).collect();
+        let hay = "가나HIT다".as_bytes();
+        assert_eq!(find_ci_ascii(hay, &needle), Some("가나".len()));
+        // 한글만 있는 hay에는 ASCII needle이 없다(UTF-8 연속 바이트는 ≥0x80).
+        assert_eq!(find_ci_ascii("가나다".as_bytes(), &needle), None);
+    }
+
+    /// `find_ci_ascii_all`은 겹치지 않는 모든 출현을 준다(`memmem::find_iter`와
+    /// 같은 규칙). Whole cell은 히트마다 경계를 봐야 하므로 첫 히트만으론 부족하다.
+    #[test]
+    fn find_ci_ascii_all_collects_non_overlapping() {
+        let needle: Vec<u8> = "ab".bytes().map(ascii_lower).collect();
+        assert_eq!(find_ci_ascii_all(b"AB,ab,Ab", &needle), vec![0, 3, 6]);
+        // "aaaa"에서 "aa"는 비중첩 2개(0, 2) — 3개가 아니다.
+        let n2: Vec<u8> = "aa".bytes().map(ascii_lower).collect();
+        assert_eq!(find_ci_ascii_all(b"AaaA", &n2), vec![0, 2]);
+        assert!(find_ci_ascii_all(b"abc", b"").is_empty());
+        assert!(find_ci_ascii_all(b"xyz", &needle).is_empty());
+    }
+
+    /// `bytefast_ci_ok` 판정. ASCII needle + UTF-8/CP949만 참.
+    #[test]
+    fn bytefast_ci_ok_conditions() {
+        assert!(bytefast_ci_ok("hit", Encoding::Utf8));
+        assert!(bytefast_ci_ok("hit", Encoding::Cp949));
+        // 비ASCII needle은 유니코드 접기가 필요해 폴백.
+        assert!(!bytefast_ci_ok("가나", Encoding::Utf8));
+        assert!(!bytefast_ci_ok("İ", Encoding::Utf8));
+        // UTF-16은 코드유닛이 2바이트라 바이트 경계가 성립하지 않는다.
+        assert!(!bytefast_ci_ok("hit", Encoding::Utf16Le));
+        assert!(!bytefast_ci_ok("hit", Encoding::Utf16Be));
+        // 빈 needle은 빠른 경로 대상이 아니다.
+        assert!(!bytefast_ci_ok("", Encoding::Utf8));
+    }
+
+    /// 뮤테이션 감지: 판정이 무의미하게 항상 같은 값을 주지 않음을 못박는다.
+    /// `query.is_ascii()`를 빼면 (한글, UTF-8)이 true가 되고, `is_single_byte_enc`를
+    /// 빼면 (ASCII, UTF-16)이 true가 된다 — 두 단정이 각각 그걸 잡는다.
+    #[test]
+    fn bytefast_ci_ok_distinguishes_each_condition() {
+        assert_ne!(
+            bytefast_ci_ok("hit", Encoding::Utf8),
+            bytefast_ci_ok("가나", Encoding::Utf8),
+            "needle ASCII 여부가 판정을 가른다"
+        );
+        assert_ne!(
+            bytefast_ci_ok("hit", Encoding::Utf8),
+            bytefast_ci_ok("hit", Encoding::Utf16Le),
+            "인코딩이 판정을 가른다"
+        );
+    }
+
+    /// `bytefast_ci_confirms`: UTF-8만 바이트 히트로 확정. CP949는 트레일 바이트가
+    /// ASCII 대문자와 겹쳐 위양성이 가능하므로 정밀 판정을 거쳐야 한다.
+    #[test]
+    fn bytefast_ci_confirms_only_utf8() {
+        assert!(bytefast_ci_confirms(Encoding::Utf8));
+        assert!(!bytefast_ci_confirms(Encoding::Cp949));
+        assert!(!bytefast_ci_confirms(Encoding::Utf16Le));
+    }
+
+    /// **핵심 계약 테스트.** 대량 혼합 데이터에서 ignore_case Partial/WholeCell이
+    /// 브루트포스와 같다. 빠른 경로(순수 셀)와 폴백(따옴표 셀)이 **둘 다** 타도록
+    /// 섞고, 대소문자 변형·한글·부분 걸침을 함께 넣는다. 뷰/편집 모드 모두.
+    #[test]
+    fn scan_ignore_case_bytefast_matches_brute_force() {
+        let lines: Vec<String> = (0..400)
+            .map(|i| match i % 8 {
+                0 => "HIT,a,b".to_string(),          // 셀0 = HIT (빠른 경로 확정)
+                1 => "x,hIt,y".to_string(),          // 셀1 = hIt (빠른 경로 확정)
+                2 => "hitting,z".to_string(),        // 부분 걸침 (WholeCell 제외)
+                3 => "\"Hit\",q".to_string(),        // 따옴표 셀 (폴백 확정)
+                4 => "가나,HIT".to_string(),          // 한글 + 매치
+                5 => "p,q,r".to_string(),            // 매치 없음
+                6 => "\"a,hit\",z".to_string(),      // 따옴표 안 delim (폴백)
+                _ => "가나다,라마".to_string(),        // 한글만
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        for scope in [crate::find::MatchScope::Partial, crate::find::MatchScope::WholeCell] {
+            for needle in ["hit", "HIT", "Hit", "a,hit"] {
+                let mut doc =
+                    scan_view_doc(&refs, Encoding::Utf8, SeparatorMode::Char(b','));
+                doc.find_query = needle.to_owned();
+                doc.find_opts = crate::find::FindOptions { match_case: false, scope };
+                assert_scan_equals_brute(&doc);
+            }
+        }
+        // 빠른 경로가 실제로 결과를 내는지(항상 빈 Vec이면 계약 테스트가 무의미).
+        let mut doc = scan_view_doc(&refs, Encoding::Utf8, SeparatorMode::Char(b','));
+        doc.find_query = "hit".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: false,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        let got = scan_all_matches(&doc);
+        assert!(!got.is_empty(), "대소문자 변형 셀을 잡아야 한다");
+        for &r in &got {
+            assert_ne!(r % 8, 2, "hitting 행(부분 걸침)은 빠져야 한다");
+            assert_ne!(r % 8, 5, "매치 없는 행이 들어오면 안 된다");
+        }
+
+        // 편집 모드도 같은 데이터로(버퍼는 항상 UTF-8).
+        let mut src = String::new();
+        for l in &lines {
+            src.push_str(l);
+            src.push('\n');
+        }
+        let (mut app, _d) = edit_doc(src.as_bytes(), false);
+        let doc = app.doc_mut().unwrap();
+        for scope in [
+            crate::find::MatchScope::Partial,
+            crate::find::MatchScope::WholeWord,
+            crate::find::MatchScope::WholeCell,
+        ] {
+            for needle in ["hit", "HIT", "Hit", "a,hit"] {
+                doc.find_query = needle.to_owned();
+                doc.find_opts = crate::find::FindOptions { match_case: false, scope };
+                assert_scan_equals_brute(doc);
+            }
+        }
+    }
+
+    /// 한글(비ASCII) needle이면 빠른 경로를 타지 않고 폴백으로 가되 결과는 정확.
+    /// `İ` 같은 1:N 확장 needle도 마찬가지다 — 바이트 접기로는 표현되지 않는다.
+    #[test]
+    fn scan_ignore_case_hangul_needle_falls_back() {
+        let lines = &["가나,x", "다라,가나", "가나다,y", "İabc,z", "iabc,w"];
+        for enc in [Encoding::Utf8, Encoding::Cp949] {
+            for needle in ["가나", "İ"] {
+                // CP949는 `İ`를 표현하지 못하므로 UTF-8에서만 그 케이스를 본다.
+                if enc == Encoding::Cp949 && needle == "İ" {
+                    continue;
+                }
+                for scope in [
+                    crate::find::MatchScope::Partial,
+                    crate::find::MatchScope::WholeCell,
+                ] {
+                    assert!(!bytefast_ci_ok(needle, enc), "비ASCII needle은 폴백이어야 한다");
+                    let mut doc = scan_view_doc(lines, enc, SeparatorMode::Char(b','));
+                    doc.find_query = needle.to_owned();
+                    doc.find_opts = crate::find::FindOptions { match_case: false, scope };
+                    assert_scan_equals_brute(&doc);
+                }
+            }
+        }
+    }
+
+    /// **CP949 트레일 바이트 위양성 회귀.** CP949 한글의 트레일 바이트는
+    /// 0x41~0xFE라 ASCII 대문자와 겹친다 — 예를 들어 `갂`(0xB0 0xA2) 같은 글자들
+    /// 중에는 트레일 바이트가 `A`(0x41)~`Z`(0x5A)인 것이 있다. ignore_case
+    /// 접기가 후보를 넓히므로 그 트레일 바이트가 ASCII needle로 잡힐 수 있는데,
+    /// 정밀 판정이 걸러 결과는 브루트포스와 같아야 한다.
+    #[test]
+    fn scan_ignore_case_cp949_trail_byte_no_false_positive() {
+        // CP949에서 트레일 바이트가 ASCII 대문자 범위(0x41~0x5A)인 한글을 찾는다.
+        let mut hangul = Vec::new();
+        for c in '가'..='힣' {
+            let b = crate::save::encode_bytes(&c.to_string(), Encoding::Cp949);
+            if b.len() == 2 && (0x41..=0x5A).contains(&b[1]) {
+                hangul.push(c);
+                if hangul.len() >= 6 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            !hangul.is_empty(),
+            "사전 조건: 트레일 바이트가 ASCII 대문자인 CP949 한글이 존재해야 한다"
+        );
+        // 그 한글만으로 이뤄진 행 + 진짜 ASCII 매치 행을 섞는다.
+        let mut lines: Vec<String> = hangul.iter().map(|c| format!("{c},x")).collect();
+        lines.push("A,y".to_string());
+        lines.push("a,z".to_string());
+        lines.push("qA,w".to_string());
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        for scope in [crate::find::MatchScope::Partial, crate::find::MatchScope::WholeCell] {
+            for needle in ["a", "A"] {
+                let mut doc = scan_view_doc(&refs, Encoding::Cp949, SeparatorMode::Char(b','));
+                doc.find_query = needle.to_owned();
+                doc.find_opts = crate::find::FindOptions { match_case: false, scope };
+                // 브루트포스와 같아야 한다 — 트레일 바이트 위양성이 남으면 여기서 깨진다.
+                assert_scan_equals_brute(&doc);
+            }
+        }
+        // WholeCell + needle "a": 셀 전체가 a/A인 행만(한글 행·`qA` 행은 제외).
+        let mut doc = scan_view_doc(&refs, Encoding::Cp949, SeparatorMode::Char(b','));
+        doc.find_query = "a".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: false,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        let n = hangul.len() as u32;
+        assert_eq!(
+            scan_all_matches(&doc),
+            vec![n, n + 1],
+            "한글 트레일 바이트 행이 들어오면 위양성이다"
+        );
+    }
+
+    /// **편집 모드는 문서 인코딩이 CP949/UTF-16이어도 버퍼가 UTF-8이므로 빠른
+    /// 경로를 탄다**(그 판정 근거가 문서 인코딩이 아니라 버퍼의 실제 인코딩임을
+    /// 못박는 테스트). CP949 트레일 바이트 위양성은 여기서 발생할 수 없다 —
+    /// 버퍼는 UTF-8이라 연속 바이트가 ≥0x80이다.
+    #[test]
+    fn scan_ignore_case_edit_buffer_is_utf8_regardless_of_doc_encoding() {
+        // CP949로 인코딩된 파일을 편집 모드로 연다(버퍼는 UTF-8 String).
+        let mut raw = crate::save::encode_bytes(
+            "가나,x\nA,y\n갂,z\nHIT,w\n",
+            Encoding::Cp949,
+        );
+        raw.push(b'\n');
+        let p = temp(&raw);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        // 인코딩을 명시적으로 CP949로 고정한 뒤 편집 모드 진입(버퍼는 UTF-8).
+        doc.enc = Encoding::Cp949;
+        doc.sep = SeparatorMode::Char(b',');
+        enter_edit_mode(doc);
+        assert_eq!(doc.enc, Encoding::Cp949, "사전 조건: 문서 인코딩은 CP949");
+        assert!(doc.edit.is_some(), "사전 조건: 편집 모드");
+        // 편집 모드가 실제로 빠른 경로를 타는 근거: 버퍼 인코딩(UTF-8) 기준 판정은
+        // 참이고, 문서 인코딩(CP949) 기준으로도 참이지만 **확정 여부**가 갈린다 —
+        // 버퍼는 UTF-8이라 바로 확정하고, 뷰 모드였다면 정밀 판정을 거쳤을 것이다.
+        assert!(bytefast_ci_ok("a", Encoding::Utf8), "버퍼 기준 빠른 경로 성립");
+        assert!(
+            bytefast_ci_confirms(Encoding::Utf8) && !bytefast_ci_confirms(doc.enc),
+            "UTF-8 버퍼는 바로 확정, CP949 파일 바이트였다면 정밀 판정이 필요했다"
+        );
+        for needle in ["a", "hit", "가나"] {
+            for scope in [
+                crate::find::MatchScope::Partial,
+                crate::find::MatchScope::WholeCell,
+                crate::find::MatchScope::WholeWord,
+            ] {
+                doc.find_query = needle.to_owned();
+                doc.find_opts = crate::find::FindOptions { match_case: false, scope };
+                assert_scan_equals_brute(doc);
+            }
+        }
+    }
+
+    /// UTF-16 + ignore_case는 빠른 경로를 타지 않고 폴백으로도 정확하다(회귀).
+    #[test]
+    fn scan_ignore_case_utf16_falls_back_correctly() {
+        for enc in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            let mut doc = scan_view_doc(
+                &["HIT,x", "가나,hit", "hitting,y", "z,가나"],
+                enc,
+                SeparatorMode::Char(b','),
+            );
+            for needle in ["hit", "가나"] {
+                assert!(!bytefast_ci_ok(needle, enc));
+                doc.find_query = needle.to_owned();
+                for scope in [
+                    crate::find::MatchScope::Partial,
+                    crate::find::MatchScope::WholeCell,
+                    crate::find::MatchScope::WholeWord,
+                ] {
+                    doc.find_opts = crate::find::FindOptions { match_case: false, scope };
+                    assert_scan_equals_brute(&doc);
+                }
+            }
+        }
+    }
+
+    /// 텍스트 모드(delim=None)의 ignore_case Whole cell은 폴백이어야 하고,
+    /// Partial은 빠른 경로를 타도 결과가 정확하다.
+    #[test]
+    fn scan_ignore_case_text_mode_matches_brute_force() {
+        let mut doc = scan_view_doc(
+            &["HIT", "hit", "Hit there", "none"],
+            Encoding::Utf8,
+            SeparatorMode::None,
+        );
+        for scope in [
+            crate::find::MatchScope::Partial,
+            crate::find::MatchScope::WholeCell,
+            crate::find::MatchScope::WholeWord,
+        ] {
+            doc.find_query = "hit".to_owned();
+            doc.find_opts = crate::find::FindOptions { match_case: false, scope };
+            assert_scan_equals_brute(&doc);
         }
     }
 
