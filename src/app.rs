@@ -111,10 +111,15 @@ pub struct Document {
     /// **왜 그 자리에서 곧바로 스크롤하지 않는가.** 본문은 `TableBuilder`
     /// 가상 스크롤이라 화면 밖 행은 아예 그려지지 않는다 —
     /// `Response::scroll_to_me`는 그려진 위젯에만 통하므로 화면 밖 매치에는
-    /// 무력하다. 대신 `TableBuilder::scroll_to_row(row, align)`
-    /// (`egui_extras-0.28.1/src/table.rs:320`)이 행 번호만으로 스크롤해 주는데,
-    /// 그건 **테이블을 만들 때** 주는 빌더 옵션이라 찾기를 수행하는 지점에서
-    /// 직접 부를 수 없다. 그래서 요청만 남기고 테이블 생성 시점이 소비한다.
+    /// 무력하다. 대신 행 번호를 세로 offset(px)으로 환산해
+    /// `TableBuilder::vertical_scroll_offset`에 넘기는데
+    /// (`egui_extras-0.28.1/src/table.rs:329`), 그건 **테이블을 만들 때** 주는
+    /// 빌더 옵션이라 찾기를 수행하는 지점에서 직접 부를 수 없다. 그래서 요청만
+    /// 남기고 테이블 생성 시점이 소비한다.
+    ///
+    /// 환산은 `scroll_offset_for_row`가 한다 — `scroll_to_row`를 쓰면 egui가
+    /// 0.1~0.3초에 걸쳐 부드럽게 감아 페이지 이동이 느리게 느껴지기 때문이다
+    /// (K-3, 그 함수 주석 참조).
     ///
     /// 찾기 패널의 버튼은 본문(`CentralPanel`)보다 먼저 처리되므로 **같은
     /// 프레임**에 반영되고, `update()` 끝의 F3 단축키 경로는 본문이 이미
@@ -1313,8 +1318,9 @@ impl eframe::App for App {
         //
         // 본문은 `body.rows` 가상 스크롤이라 화면 밖 행이 그려지지 않으므로,
         // 스크롤은 찾기와 **같은 메커니즘**으로 한다: 목표 화면 행을
-        // `pending_scroll_row`에 남기면 다음 프레임 렌더가 `scroll_to_row`로
-        // 옮긴다(`apply_page_scroll`). 이 경로는 본문이 이미 그려진 뒤라
+        // `pending_scroll_row`에 남기면 다음 프레임 렌더가
+        // `vertical_scroll_offset`으로 옮긴다(`apply_page_scroll`).
+        // 이 경로는 본문이 이미 그려진 뒤라
         // 다음 프레임에 반영된다 — F3 단축키와 같다.
         //
         // **화면 행 기준으로 계산한다.** 표 모드는 정렬 permutation 때문에
@@ -1652,7 +1658,8 @@ fn doc_screen_row_count(doc: &Document) -> usize {
 
 /// 페이지 이동 한 번을 문서에 반영한다 — 목표 화면 행을 `pending_scroll_row`에,
 /// 정렬을 `pending_scroll_align`에 남긴다(실제 스크롤은 다음 프레임 렌더가
-/// `scroll_to_row`로 수행한다 — 그 필드 주석 참조).
+/// `vertical_scroll_offset`으로 **애니메이션 없이 즉시** 수행한다 —
+/// 그 필드 주석과 `scroll_offset_for_row` 참조).
 ///
 /// `update()`의 키 블록 안에 인라인으로 두면 `update()`가 `eframe::Frame`을
 /// 요구해 테스트가 이 동작을 구동할 수 없으므로(코드베이스의 기존 문제),
@@ -1665,6 +1672,51 @@ fn apply_page_scroll(doc: &mut Document, dir: PageDir) {
         // 다음 페이지가 정확히 이어진다(찾기의 Center와 다르다).
         doc.pending_scroll_align = egui::Align::TOP;
     }
+}
+
+/// 스크롤 요청 한 건을 `TableBuilder`의 **세로 offset(px)** 으로 바꾼다.
+///
+/// **왜 `scroll_to_row`가 아니라 offset인가(K-3).** `TableBuilder::scroll_to_row`는
+/// 결국 `ui.scroll_to_rect`로 이어지고, egui 0.28.1의 `ScrollArea`는 그 요청을
+/// `offset_target`에 넣어 **0.1~0.3초에 걸쳐 ease-in-ease-out으로 감는다**
+/// (`egui-0.28.1/src/containers/scroll_area.rs:638-664, 845-862`).
+/// 페이지 이동은 "중간 단계를 볼 이유가 없는" 조작이라 그 애니메이션이 지연으로만
+/// 느껴진다. 반면 `vertical_scroll_offset`은 `state.offset.y`에 **그대로 대입**
+/// 되므로(같은 파일 512행) 애니메이션 없이 즉시 점프한다.
+///
+/// **왜 `ScrollArea::animated(false)`를 안 쓰는가.** egui 0.28.1에는 그 옵션이
+/// 있지만(`scroll_area.rs:408`) `egui_extras 0.28.1`의 `TableBuilder`가
+/// 노출하지 않는다(`TableScrollOptions`에 필드 자체가 없다). 0.28.1에는
+/// `style.scroll_animation`/`ScrollAnimation`도 **없다**(레지스트리 소스 확인).
+/// 그래서 이 버전에서 즉시 점프를 얻는 길은 offset 직접 지정뿐이다.
+///
+/// **행 → y 좌표.** `TableBody::rows`가 쓰는 것과 **같은** 식이다
+/// (`egui_extras-0.28.1/src/table.rs:969-988`): 행 하나가 차지하는 높이는
+/// `row_height + item_spacing.y`이고, `row`번째 행의 위쪽 y는 그 값의 배수다.
+/// 두 계산이 어긋나면 점프한 자리가 한 행씩 밀린다.
+///
+/// **정렬.** `Align::TOP`(페이지 이동)은 목표 행을 맨 위에. `Align::Center`
+/// (찾기·거터 클릭)는 목표 행이 화면 중앙에 오도록 뷰포트 절반만큼 뺀다.
+/// `Align::BOTTOM`은 목표 행의 아래쪽이 화면 바닥에 닿게 한다. 음수 offset은
+/// 0으로 클램프한다(문서 맨 앞보다 위로는 갈 수 없다).
+///
+/// `viewport_height`는 **본문**(헤더 제외) 높이다 — 호출부가 `available_height`
+/// 에서 헤더 한 줄을 빼서 넘긴다(`visible_row_count`와 같은 규율).
+fn scroll_offset_for_row(
+    row: usize,
+    align: egui::Align,
+    row_height: f32,
+    spacing_y: f32,
+    viewport_height: f32,
+) -> f32 {
+    let step = row_height + spacing_y;
+    let row_top = row as f32 * step;
+    let offset = match align {
+        egui::Align::Min => row_top,
+        egui::Align::Center => row_top - (viewport_height - step) * 0.5,
+        egui::Align::Max => row_top + step - viewport_height,
+    };
+    offset.max(0.0)
 }
 
 /// 본문에 남은 높이에서 한 화면에 들어가는 **본문 행 수**를 구한다.
@@ -1714,8 +1766,8 @@ fn table_col_count(doc: &Document, delim: u8) -> usize {
 }
 
 /// 논리 행번호 → **헤더를 뺀** 화면 행(= `render_table`의 `view_row`,
-/// `pending_scroll_row`가 요구하는 단위). `TableBuilder`의 `scroll_to_row`가
-/// 이 값을 그대로 받는다.
+/// `pending_scroll_row`가 요구하는 단위). `scroll_offset_for_row`가 이 값을
+/// 세로 offset(px)으로 바꿔 `TableBuilder::vertical_scroll_offset`에 넘긴다.
 ///
 /// 정렬 permutation이 있으면(뷰 모드 정렬, `doc.sort`) `render_table`이
 /// `permutation[view_row] = 논리 행`(절대 논리 행번호, 헤더 포함 좌표계 —
@@ -4310,11 +4362,11 @@ fn render_table(
 ) {
     use std::cell::{Cell, RefCell};
 
-    // 찾기가 남긴 스크롤 요청을 소비한다. `body.rows` 가상 스크롤에서는 화면 밖
-    // 행이 아예 그려지지 않아 `Response::scroll_to_me`가 통하지 않으므로, 행
-    // 번호만으로 스크롤하는 `TableBuilder::scroll_to_row`를 쓴다
-    // (`egui_extras-0.28.1/src/table.rs:320`; `rows()`가 그 행의 y 범위를 직접
-    //  계산하므로 그려지지 않은 행에도 정확히 맞는다). 정렬은 요청자가
+    // 찾기·페이지 이동이 남긴 스크롤 요청을 소비한다. `body.rows` 가상 스크롤에서는
+    // 화면 밖 행이 아예 그려지지 않아 `Response::scroll_to_me`가 통하지 않으므로,
+    // 행 번호를 세로 offset(px)으로 직접 환산해 `vertical_scroll_offset`에 넘긴다
+    // (`scroll_offset_for_row` 주석 — `scroll_to_row`는 egui가 0.1~0.3초에 걸쳐
+    //  부드럽게 감아 페이지 이동이 느리게 느껴진다). 정렬은 요청자가
     // `pending_scroll_align`에 함께 남긴다 — 찾기는 `Center`(매치가 가장자리에
     // 붙지 않고 앞뒤 맥락과 함께 보이게), Page Up/Down은 `TOP`이다.
     // 아래 스냅샷들이 doc을 불변 대여하기 **전에** 꺼내야 한다.
@@ -4446,6 +4498,9 @@ fn render_table(
     //   ~35행에서 멈추므로, 사용 가능한 높이로 올린다.
     // - auto_shrink의 y축을 false로 두어 내용이 적어도 테이블이 창을 채운다.
     let avail_height = ui.available_height();
+    // 행 간격은 `TableBody::rows`가 행 높이에 더하는 값과 **같아야** 한다
+    // (`scroll_offset_for_row` 주석) — 여기서 한 번 읽어 그대로 넘긴다.
+    let spacing_y = ui.spacing().item_spacing.y;
 
     // 컬럼은 auto()(전 행 measure로 대용량에서 느림) 대신 고정 초기폭 +
     // 드래그 조절(resizable)로 둔다. 긴 값은 셀에서 truncate 되고 폭을
@@ -4458,7 +4513,17 @@ fn render_table(
         .columns(Column::initial(120.0).at_least(60.0).resizable(true), col_count);
 
     if let Some(row) = scroll_to {
-        table = table.scroll_to_row(row, Some(scroll_align));
+        // 요청된 행은 실제 존재하는 마지막 데이터 행으로 클램프한다
+        // (`scroll_to_row`가 내부적으로 하던 일 — offset 경로에는 없으므로 여기서).
+        let row = row.min(data_rows.saturating_sub(1));
+        table = table.vertical_scroll_offset(scroll_offset_for_row(
+            row,
+            scroll_align,
+            ROW_HEIGHT,
+            spacing_y,
+            // 본문 높이 = 전체 - 헤더 한 줄(`visible_row_count`와 같은 규율).
+            (avail_height - ROW_HEIGHT).max(0.0),
+        ));
     }
 
     // 이번 프레임에 그려진 행 중 가장 작은 화면 행. Page Up/Down이 "지금
@@ -5553,6 +5618,9 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
         Vec::new()
     };
 
+    // 행 간격 — 표 모드와 같은 이유(`scroll_offset_for_row` 주석).
+    let spacing_y = ui.spacing().item_spacing.y;
+
     // 줄 전체 컬럼은 넉넉한 초기폭 + resizable. 긴 줄은 셀 안에서 truncate.
     let mut table = TableBuilder::new(ui)
         .striped(true)
@@ -5561,7 +5629,15 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
         .column(Column::initial(64.0).at_least(48.0).resizable(true)) // 라인번호 #
         .column(Column::remainder().at_least(200.0).resizable(true)); // 줄 전체
     if let Some(row) = scroll_to {
-        table = table.scroll_to_row(row, Some(scroll_align));
+        // 텍스트 모드는 논리 행이 곧 화면 행이라 전체 줄 수로 클램프한다.
+        let row = row.min(total_lines.saturating_sub(1));
+        table = table.vertical_scroll_offset(scroll_offset_for_row(
+            row,
+            scroll_align,
+            ROW_HEIGHT,
+            spacing_y,
+            (avail_height - ROW_HEIGHT).max(0.0),
+        ));
     }
 
     // 표 모드와 같은 통로 — Page Up/Down이 읽을 "화면 첫 행"을 관측한다.
@@ -11123,7 +11199,7 @@ mod tests {
     /// 두 필드가 채워지는지 본다.
     ///
     /// 스크롤 요청을 남긴 뒤 렌더하면 그 행이 화면 맨 위로 오므로
-    /// (`scroll_to_row` + `Align::TOP`), 다음 프레임의 `first_visible_row`가
+    /// (`vertical_scroll_offset` + `Align::TOP`), 다음 프레임의 `first_visible_row`가
     /// 그 언저리로 따라와야 한다 — "요청 → 스크롤 → 관측"이 한 바퀴 도는지를
     /// 이 한 테스트가 고정한다.
     #[test]
@@ -11162,12 +11238,13 @@ mod tests {
             doc.pending_scroll_row.unwrap()
         };
         assert!(target > 0, "사전 조건: 실제로 움직일 목표가 생겼다");
-        // 요청 소비 → 스크롤 → 옮겨진 자리에서 재관측. egui의 스크롤은 한
-        // 프레임에 끝나지 않고 부드럽게(`stable_dt` 기준) 수렴하므로 여유를
-        // 준다 — 프레임 수 자체는 이 테스트의 관심사가 아니다.
-        for _ in 0..40 {
-            draw(&mut app, &mut clip);
-        }
+        // 요청 소비 → 스크롤 → 옮겨진 자리에서 재관측. **두 프레임이면 끝난다**
+        // (K-3): `vertical_scroll_offset`이 `state.offset.y`에 즉시 대입되므로
+        // 첫 프레임에 자리가 잡히고 다음 프레임이 그 자리를 관측한다.
+        // 예전 `scroll_to_row`는 0.1~0.3초에 걸쳐 감겨 수십 프레임이 필요했다 —
+        // 프레임 수를 늘리면 그 회귀를 놓친다.
+        draw(&mut app, &mut clip);
+        draw(&mut app, &mut clip);
         let doc = app.doc().unwrap();
         assert_eq!(
             doc.pending_scroll_row, None,
@@ -11338,9 +11415,13 @@ mod tests {
             doc.pending_scroll_row = Some(200);
             doc.pending_scroll_align = egui::Align::TOP;
         }
-        for _ in 0..40 {
-            draw(&mut app, &mut clip);
-        }
+        // **한 프레임만** 그린다(K-3). `scroll_to_row`(애니메이션)였다면 여기서
+        // 목표에 도달하지 못하고 수십 프레임에 걸쳐 감겼다 — 지금은
+        // `vertical_scroll_offset`으로 `state.offset.y`에 즉시 대입되므로
+        // 다음 프레임의 관측이 곧 목표 자리다. 그리는 프레임 수를 늘리지 말 것:
+        // "한 프레임 뒤 도달"이 이 테스트가 지키는 성질이다.
+        draw(&mut app, &mut clip); // offset 적용
+        draw(&mut app, &mut clip); // 그 자리를 관측(first_visible_row 기록)
         let doc = app.doc().unwrap();
         assert_eq!(
             doc.pending_scroll_row, None,
@@ -11352,9 +11433,68 @@ mod tests {
         // 하드코딩된 뮤턴트라면 이 범위를 크게 벗어난다.
         assert!(
             (199..=200).contains(&doc.first_visible_row),
-            "TOP 정렬 스크롤 후 화면 첫 행이 목표 근처(199 또는 200)여야 한다 \
-             (got {})",
+            "TOP 정렬 스크롤 후 **한 프레임 만에** 화면 첫 행이 목표 근처(199 또는 \
+             200)여야 한다 — 애니메이션이 남아 있으면 훨씬 작은 값이 나온다 (got {})",
             doc.first_visible_row
+        );
+
+        // Center 정렬도 즉시 도달하는가(찾기 경로). 목표 행이 화면 **중앙**이므로
+        // 첫 행은 목표에서 반 화면만큼 위다.
+        let half = app.doc().unwrap().visible_rows / 2;
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.pending_scroll_row = Some(400);
+            doc.pending_scroll_align = egui::Align::Center;
+        }
+        draw(&mut app, &mut clip);
+        draw(&mut app, &mut clip);
+        let doc = app.doc().unwrap();
+        let want = 400 - half;
+        assert!(
+            doc.first_visible_row.abs_diff(want) <= 1,
+            "Center 정렬 스크롤 후 한 프레임 만에 첫 행이 {want} 근처여야 한다 (got {})",
+            doc.first_visible_row
+        );
+    }
+
+    /// `scroll_offset_for_row`: 행 번호 → 세로 offset(px). 계산이
+    /// `TableBody::rows`(`row_height + item_spacing.y` 배수)와 같아야 한다.
+    #[test]
+    fn scroll_offset_for_row_matches_table_row_geometry() {
+        let (rh, sp) = (20.0f32, 4.0f32);
+        let step = rh + sp; // 24.0
+        // TOP: 목표 행의 위 경계가 곧 offset.
+        assert_eq!(scroll_offset_for_row(0, egui::Align::TOP, rh, sp, 240.0), 0.0);
+        assert_eq!(scroll_offset_for_row(10, egui::Align::TOP, rh, sp, 240.0), 10.0 * step);
+        // Center: 뷰포트 절반만큼 위로 당긴다.
+        assert_eq!(
+            scroll_offset_for_row(10, egui::Align::Center, rh, sp, 240.0),
+            10.0 * step - (240.0 - step) * 0.5
+        );
+        // BOTTOM: 목표 행의 아래 경계가 화면 바닥.
+        assert_eq!(
+            scroll_offset_for_row(20, egui::Align::BOTTOM, rh, sp, 240.0),
+            21.0 * step - 240.0
+        );
+        // 문서 맨 앞보다 위로는 갈 수 없다 — 음수는 0으로 클램프.
+        assert_eq!(scroll_offset_for_row(0, egui::Align::Center, rh, sp, 240.0), 0.0);
+        assert_eq!(scroll_offset_for_row(1, egui::Align::BOTTOM, rh, sp, 240.0), 0.0);
+    }
+
+    /// **뮤테이션 감지.** 정렬 세 값이 서로 다른 offset을 내야 한다 —
+    /// 어느 하나로 하드코딩하면(예: 전부 TOP) 찾기의 중앙 정렬이 조용히
+    /// 상단 정렬로 바뀐다.
+    #[test]
+    fn scroll_offset_for_row_distinguishes_alignments() {
+        let (rh, sp, vh) = (20.0f32, 4.0f32, 240.0f32);
+        let top = scroll_offset_for_row(50, egui::Align::TOP, rh, sp, vh);
+        let center = scroll_offset_for_row(50, egui::Align::Center, rh, sp, vh);
+        let bottom = scroll_offset_for_row(50, egui::Align::BOTTOM, rh, sp, vh);
+        assert!(bottom < center && center < top, "BOTTOM < Center < TOP (got {bottom}/{center}/{top})");
+        // 행 번호가 커지면 offset도 커진다(단조).
+        assert!(
+            scroll_offset_for_row(51, egui::Align::TOP, rh, sp, vh) > top,
+            "행 번호에 비례해야 한다"
         );
     }
 
