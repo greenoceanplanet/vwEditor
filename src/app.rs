@@ -1690,14 +1690,73 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
         // ---- 편집 모드: EditBuffer.lines 순회 ----
         Some(e) => {
             let finder = (opts.match_case).then(|| memchr::memmem::Finder::new(query.as_bytes()));
+            // 편집 모드도 뷰 모드와 같은 바이트 빠른 경로를 쓴다. `e.lines`는 이미
+            // RAM 위 `String`이라 디코딩 비용은 없지만, `find_in_line_scoped`가
+            // 부르는 `split_fields`/`chars().collect()` **할당**은 행마다 그대로
+            // 발생한다(수 GB 버퍼면 수백만 회). 흔한 검색어에서 그 할당을 없앤다.
+            //
+            // `e.lines`는 항상 UTF-8 문자열이므로 needle(UTF-8) 바이트로 memmem을
+            // 돌리는 것과 `,`(0x2C) 같은 구분자 바이트 판정이 코드유닛과 어긋날 일이
+            // 없다 — 뷰 모드의 UTF-16 폴백 이유가 여기선 적용되지 않아, 인코딩과
+            // 무관하게 빠른 경로가 안전하다.
+            let needle_bytes = query.as_bytes();
+            let needle_len = needle_bytes.len();
+            let scope = opts.scope;
+            let bytefast_partial =
+                opts.match_case && scope == crate::find::MatchScope::Partial;
+            let bytefast_cell = opts.match_case
+                && scope == crate::find::MatchScope::WholeCell
+                && delim.is_some();
+            let needle_has_delim = delim.is_some_and(|d| needle_bytes.contains(&d));
             let mut out = Vec::new();
             for (i, line) in e.lines.iter().enumerate() {
+                let lb = line.as_bytes();
                 // match_case면 memmem으로 후보를 먼저 거른다(정확성은 scoped가 보장).
                 // ignore_case면 프리필터 없이 바로 scoped(위 주석의 이유).
-                if let Some(f) = &finder {
-                    if f.find(line.as_bytes()).is_none() {
-                        continue;
+                let Some(f) = &finder else {
+                    // ignore_case: 종전대로 행 단위 scoped.
+                    if !crate::find::find_in_line_scoped(line, query, opts, delim).is_empty() {
+                        out.push(i as u32);
                     }
+                    continue;
+                };
+                // Partial 빠른 경로: memmem 히트 = 매치.
+                if bytefast_partial {
+                    if f.find(lb).is_some() {
+                        out.push(i as u32);
+                    }
+                    continue;
+                }
+                // Whole cell 빠른 경로: 히트마다 경계 바이트만 보고 확정/폴백/버림.
+                if bytefast_cell {
+                    let d = delim.unwrap();
+                    let mut confirmed = false;
+                    let mut needs_refine = false;
+                    for hit in f.find_iter(lb) {
+                        match classify_cell_hit(lb, 0, lb.len(), hit, needle_len, d, needle_has_delim) {
+                            CellHit::Confirmed => {
+                                confirmed = true;
+                                break;
+                            }
+                            CellHit::NeedsRefine => needs_refine = true,
+                            CellHit::NotCellBoundary => {}
+                        }
+                    }
+                    // 확정 히트가 하나라도 있으면 매치. 없고 따옴표 후보만 있으면
+                    // 폴백으로 정밀 확인. 둘 다 없으면(모든 히트가 NotCellBoundary)
+                    // 셀 전체 매치가 있을 수 없으므로 비매치 — 바이트로 안전하게 단정.
+                    let matched = confirmed
+                        || (needs_refine
+                            && !crate::find::find_in_line_scoped(line, query, opts, delim)
+                                .is_empty());
+                    if matched {
+                        out.push(i as u32);
+                    }
+                    continue;
+                }
+                // 그 외(Whole word): 종전대로 프리필터 후 정밀 판정.
+                if f.find(lb).is_none() {
+                    continue;
                 }
                 if !crate::find::find_in_line_scoped(line, query, opts, delim).is_empty() {
                     out.push(i as u32);
@@ -1725,10 +1784,99 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
     }
 }
 
+/// 인코딩이 **단일 바이트 구분자**(delimiter/개행이 1바이트)를 쓰는가.
+/// UTF-16은 구분자·개행이 2바이트 코드유닛이라 원바이트 경계 판정이 코드유닛
+/// 중간에 걸릴 수 있어(예: 한글의 하위 바이트가 우연히 `,`(0x2C)와 겹침)
+/// 바이트 빠른 경로가 안전하지 않다. UTF-8/CP949만 참.
+fn is_single_byte_enc(enc: Encoding) -> bool {
+    matches!(enc, Encoding::Utf8 | Encoding::Cp949)
+}
+
+/// Whole cell match_case 빠른 경로에서 memmem 히트 하나를 바이트만으로 판정한 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellHit {
+    /// 앞뒤 경계가 순수 delim/줄끝이고 따옴표가 개입하지 않음 → 매치 확정.
+    Confirmed,
+    /// 경계가 delim/줄끝이긴 하나 따옴표(`"`)가 걸쳐 있어 표시값이 파일
+    /// 바이트와 다를 수 있음 → `find_in_line_scoped`로 정밀 확인 필요.
+    NeedsRefine,
+    /// 앞뒤가 delim/줄끝이 아님(셀 부분에만 걸침, 예: `John`이 `Johnson` 안).
+    /// 이 히트 자체는 셀 전체가 아니다 — 다만 같은 행의 다른 히트가 셀 전체일
+    /// 수 있으므로 "이 행 비매치"로 단정하지는 않는다(호출부가 히트 단위 순회).
+    NotCellBoundary,
+}
+
+/// memmem 히트가 **셀 전체** 매치인지 바이트만으로 판정한다(Whole cell, match_case,
+/// 단일 바이트 인코딩 전용). `bytes`는 파일 전체, `[line_start, line_end)`는 히트가
+/// 속한 행의 **개행 제외** 내용 범위, `hit`은 needle 시작 바이트 offset, `needle_len`은
+/// needle 바이트 길이, `delim`은 구분자 바이트, `needle_has_delim`은 needle 바이트에
+/// `delim`이 들어 있는지다.
+///
+/// 판정: 히트 바로 앞 바이트가 `delim` 또는 줄시작이고, 히트 바로 뒤 바이트가
+/// `delim` 또는 줄끝이면 셀 경계다. 그 경계 바이트 중 하나라도 `"`이면 따옴표
+/// 셀일 수 있어 `NeedsRefine`(브리프 §2·§G-1). 그 외 순수 경계는 `Confirmed`.
+/// 경계가 아니면 `NotCellBoundary`.
+///
+/// **needle에 delim이 들어 있으면(따옴표 셀에서만 가능) 무조건 `NeedsRefine`.**
+/// 예: needle `a,b`는 `a,b,c`에서 앞이 줄시작·뒤가 delim이라 순수 경계처럼
+/// 보이지만, 실은 `a`와 `b` 두 셀을 가로지른다(셀 전체가 아니다). 바이트만으론
+/// 셀 경계를 오판하므로 폴백에 맡긴다. `field_slice`가 따옴표 안 delim을 정확히
+/// 처리한다. **"확실히 비매치"를 바이트로 단정하지 않는다** — 애매하면 항상 폴백.
+fn classify_cell_hit(
+    bytes: &[u8],
+    line_start: usize,
+    line_end: usize,
+    hit: usize,
+    needle_len: usize,
+    delim: u8,
+    needle_has_delim: bool,
+) -> CellHit {
+    // needle에 delim이 있으면 순수 바이트 경계로는 셀을 판정할 수 없다 → 폴백.
+    if needle_has_delim {
+        return CellHit::NeedsRefine;
+    }
+    let after_pos = hit + needle_len;
+    // 앞 경계: 히트가 줄시작이면 경계(None), 아니면 바로 앞 바이트.
+    let before = if hit <= line_start { None } else { Some(bytes[hit - 1]) };
+    // 뒤 경계: 히트 끝이 줄끝(내용 끝)에 닿으면 경계(None), 아니면 바로 뒤 바이트.
+    let after = if after_pos >= line_end { None } else { Some(bytes[after_pos]) };
+    // 경계 바이트 중 하나라도 `"`면 따옴표 셀일 수 있어 표시값이 파일 바이트와
+    // 다르다 → 무조건 폴백(NeedsRefine). `"`는 delim이 아니라 순수 경계 검사에서
+    // 걸러지지만, 그 경우 NotCellBoundary가 아니라 NeedsRefine으로 보내야
+    // 따옴표 셀 매치를 놓치지 않는다(브리프 §2·§G-3의 `"John Smith"` 케이스).
+    if before == Some(b'"') || after == Some(b'"') {
+        return CellHit::NeedsRefine;
+    }
+    // 순수 경계: 앞뒤가 delim 또는 줄시작/줄끝. 그 외(부분 걸침)는 NotCellBoundary.
+    let before_boundary = before.is_none_or(|b| b == delim);
+    let after_boundary = after.is_none_or(|b| b == delim);
+    if before_boundary && after_boundary {
+        CellHit::Confirmed
+    } else {
+        CellHit::NotCellBoundary
+    }
+}
+
 /// 뷰 모드 + match_case의 빠른 경로. 파일 바이트 전체에 memmem을 돌려 히트
 /// offset을 얻고, 인덱스 snapshot의 offset 배열에 이진탐색해 행 번호로 바꾼다.
-/// 같은 행에 여러 히트가 연속으로 나오면 한 번만 담는다. 그 후보 행만
-/// `find_in_line_scoped`로 정밀 판정한다(whole_word/cell·인코딩 정합성).
+///
+/// **핵심 최적화(브리프 Task G).** 흔한 검색어는 후보 행이 곧 전 행이라, 후보마다
+/// 문자열을 디코딩·할당해 `find_in_line_scoped`를 부르면 2200만 번의 할당이 돌아
+/// 5분씩 걸린다. 그래서 **바이트만으로 판정 가능한 경우엔 디코딩을 건너뛴다**:
+///
+/// - **Partial(match_case, 단일 바이트 인코딩)**: memmem 히트 = 이 행에 needle이
+///   있다는 증명. `find_in_line`(Partial)이 하는 일이 곧 이 부분 문자열 찾기이므로
+///   재판정이 필요 없다. 그 행을 바로 담는다.
+/// - **Whole cell(match_case, 단일 바이트 인코딩)**: `classify_cell_hit`로 앞뒤
+///   경계 바이트만 본다. 순수 경계면 확정, 따옴표가 걸치면 그 행만 폴백, 경계가
+///   아니면 그 히트는 버리되(같은 행의 다른 히트가 셀 전체일 수 있으므로) 행 단위
+///   중복은 막는다.
+/// - **그 외**(Whole word / UTF-16 등 멀티바이트 인코딩): 종전대로 후보 행을
+///   디코딩해 `find_in_line_scoped`로 정밀 판정한다. 단어 경계는 유니코드라
+///   바이트로 안전하지 않고, UTF-16은 구분자·개행이 2바이트라 원바이트 경계가
+///   코드유닛 중간에 걸릴 수 있어 빠른 경로가 성립하지 않는다(폴백이 정답).
+///
+/// 어떤 경로든 최종 결과는 반드시 `matching_lines` 브루트포스와 **같은 행 집합**이다.
 fn scan_view_memmem(
     doc: &Document,
     query: &str,
@@ -1749,7 +1897,22 @@ fn scan_view_memmem(
     if needle_bytes.is_empty() {
         return Vec::new();
     }
+    let needle_len = needle_bytes.len();
     let finder = memchr::memmem::Finder::new(&needle_bytes);
+    // 바이트 빠른 경로를 탈 수 있는가. Partial/WholeCell + 단일 바이트 인코딩만.
+    // (WholeWord·UTF-16은 아래 폴백 판정으로 간다.)
+    let single_byte = is_single_byte_enc(doc.enc);
+    let scope = opts.scope;
+    let bytefast_partial = single_byte && scope == crate::find::MatchScope::Partial;
+    // Whole cell 빠른 경로는 표 모드(delim 존재)에서만. 텍스트 모드(delim==None)의
+    // "행 전체 일치"는 개행 trim·인코딩 정합성이 섞여 폴백에 맡긴다(흔치 않다).
+    let bytefast_cell = single_byte
+        && scope == crate::find::MatchScope::WholeCell
+        && delim.is_some();
+    // needle 바이트에 delim이 있으면(따옴표 셀에서만 셀 전체일 수 있음) 경계 판정이
+    // 성립하지 않으므로 그 히트는 항상 폴백으로 보낸다(`classify_cell_hit` 참조).
+    let needle_has_delim = delim.is_some_and(|d| needle_bytes.contains(&d));
+
     let mut out = Vec::new();
     let mut last_row: Option<u32> = None;
     for hit in finder.find_iter(bytes) {
@@ -1757,6 +1920,54 @@ fn scan_view_memmem(
         // partition_point는 "off <= hit"인 원소 개수를 주므로 -1이 그 행이다.
         let row = offsets.partition_point(|&off| off <= hit as u64).saturating_sub(1);
         let row_u32 = row as u32;
+
+        // ---- Partial 빠른 경로: memmem 히트 자체가 매치. 행 중복만 거른다. ----
+        if bytefast_partial {
+            if last_row == Some(row_u32) {
+                continue;
+            }
+            last_row = Some(row_u32);
+            out.push(row_u32);
+            continue;
+        }
+
+        let Some((s, en)) = crate::index::LineIndex::range_in(&offsets, total_bytes, row) else {
+            continue;
+        };
+
+        // ---- Whole cell 빠른 경로: 경계 바이트만 보고 확정/폴백/버림. ----
+        if bytefast_cell {
+            // 개행 제외 내용 끝(단일 바이트 인코딩이므로 `\r`/`\n`은 1바이트).
+            let line_start = s as usize;
+            let mut line_end = en as usize;
+            while line_end > line_start
+                && matches!(bytes[line_end - 1], b'\r' | b'\n')
+            {
+                line_end -= 1;
+            }
+            let d = delim.unwrap();
+            match classify_cell_hit(bytes, line_start, line_end, hit, needle_len, d, needle_has_delim) {
+                CellHit::NotCellBoundary => {
+                    // 이 히트는 셀 부분일 뿐. 행을 확정하지 않는다(같은 행의
+                    // 다른 히트가 셀 전체일 수 있다). last_row도 갱신하지 않아
+                    // 뒤따르는 확정 히트가 이 행을 담을 수 있게 둔다.
+                    continue;
+                }
+                CellHit::Confirmed => {
+                    if last_row == Some(row_u32) {
+                        continue;
+                    }
+                    last_row = Some(row_u32);
+                    out.push(row_u32);
+                    continue;
+                }
+                CellHit::NeedsRefine => {
+                    // 따옴표 개입 가능 → 폴백으로 내려가 정밀 판정한다(아래 공통 경로).
+                }
+            }
+        }
+
+        // ---- 폴백(정밀 판정): Whole word, 멀티바이트 인코딩, 따옴표 셀 등. ----
         // 연속 히트가 같은 행이면 건너뛴다(정밀 판정도 한 번만 하게).
         if last_row == Some(row_u32) {
             continue;
@@ -1765,9 +1976,6 @@ fn scan_view_memmem(
         // 정밀 판정: 인코딩 디코딩 + whole_word/cell을 실제로 확인한다.
         // (memmem은 원바이트 부분 일치라 CP949 등에서 위양성이 있을 수 있고,
         //  whole_word/cell은 memmem이 판정하지 못한다.)
-        let Some((s, en)) = crate::index::LineIndex::range_in(&offsets, total_bytes, row) else {
-            continue;
-        };
         // `decode_logical_line`과 **완전히 같은** 방법으로 디코딩·개행 제거해야
         // 정밀 판정이 `matching_lines`(= logical_line 경유)와 어긋나지 않는다:
         // 전체 슬라이스를 디코딩한 뒤 뒤쪽 `\r`/`\n`을 모두 trim한다.
@@ -1778,9 +1986,10 @@ fn scan_view_memmem(
             out.push(row_u32);
         }
     }
-    // find_iter는 offset 오름차순이라 out도 행 오름차순이지만, 연속 중복만
-    // 걸렀으므로 비연속으로 같은 행이 다시 나올 일은 없다(offset이 단조 증가하고
-    // 한 행의 바이트 범위는 연속이므로 같은 행 히트는 반드시 인접한다).
+    // find_iter는 offset 오름차순이라 out도 행 오름차순이다. Partial/Confirmed
+    // 경로는 last_row로 연속 중복을 막고, NotCellBoundary는 last_row를 갱신하지
+    // 않으므로 같은 행이 뒤에 확정돼도 한 번만 담긴다(offset 단조 증가 + 한 행의
+    // 바이트 범위 연속 → 같은 행 히트는 반드시 인접).
     out
 }
 
@@ -7344,6 +7553,226 @@ mod tests {
         let doc = scan_view_doc(&["a", "b"], Encoding::Utf8, SeparatorMode::None);
         // find_query가 비어 있으면 빈 Vec.
         assert!(scan_all_matches(&doc).is_empty());
+    }
+
+    // ---- Task G: 바이트 빠른 경로 (classify_cell_hit + 빠른/폴백 혼합) ----
+
+    /// `classify_cell_hit` 순수 함수 단위 테스트. 순수 경계 Confirmed, 따옴표 경계
+    /// NeedsRefine, 부분 걸침 NotCellBoundary. 이 함수가 잘못 판정하면 Whole cell
+    /// 빠른 경로가 위양성/위음성을 내므로 각 분기를 직접 부른다(인라인 복붙 금지).
+    #[test]
+    fn classify_cell_hit_branches() {
+        // `a,bb,c` — 셀 1 = bb. hit=2, needle_len=2, delim=','.
+        // 앞 = bytes[1] = ',', 뒤 = bytes[4] = ',' → 순수 경계 Confirmed.
+        let b = b"a,bb,c";
+        assert_eq!(
+            classify_cell_hit(b, 0, b.len(), 2, 2, b',', false),
+            CellHit::Confirmed
+        );
+        // 줄시작에 걸린 셀: `bb,c` — hit=0. 앞 = 줄시작(None), 뒤 = ',' → Confirmed.
+        let b = b"bb,c";
+        assert_eq!(
+            classify_cell_hit(b, 0, b.len(), 0, 2, b',', false),
+            CellHit::Confirmed
+        );
+        // 줄끝에 걸린 셀: `a,bb` — hit=2. 앞 = ',', 뒤 = 줄끝(None) → Confirmed.
+        let b = b"a,bb";
+        assert_eq!(
+            classify_cell_hit(b, 0, b.len(), 2, 2, b',', false),
+            CellHit::Confirmed
+        );
+        // 부분 걸침: `Johnson`에서 needle `John` hit=0, len=4. 뒤 = 's'(delim 아님)
+        // → NotCellBoundary.
+        let b = b"Johnson";
+        assert_eq!(
+            classify_cell_hit(b, 0, b.len(), 0, 4, b',', false),
+            CellHit::NotCellBoundary
+        );
+        // 따옴표 셀: `"John",x` 에서 needle `John` hit=1(따옴표 뒤), len=4.
+        // 앞 = '"', 뒤 = '"' → NeedsRefine.
+        let b = b"\"John\",x";
+        assert_eq!(
+            classify_cell_hit(b, 0, b.len(), 1, 4, b',', false),
+            CellHit::NeedsRefine
+        );
+        // 개행이 제외된 line_end를 넘겨도 줄끝 경계로 잡힌다: `a,bb`의 내용 끝은 4.
+        let b = b"a,bb\n";
+        assert_eq!(
+            classify_cell_hit(b, 0, 4, 2, 2, b',', false),
+            CellHit::Confirmed,
+            "line_end(개행 제외)가 needle 끝이면 뒤 경계로 인정"
+        );
+        // needle에 delim이 있으면(`a,b`) 순수 경계처럼 보여도 무조건 NeedsRefine.
+        // `a,b,c`에서 hit=0, len=3: 앞=줄시작, 뒤=','(delim)이라 경계로 보이지만
+        // 실은 두 셀을 가로지른다 → 폴백.
+        let b = b"a,b,c";
+        assert_eq!(
+            classify_cell_hit(b, 0, b.len(), 0, 3, b',', true),
+            CellHit::NeedsRefine,
+            "needle에 delim이 있으면 바이트만으로 확정하지 않는다"
+        );
+    }
+
+    /// 잘못 판정하면 테스트가 깨지는지(뮤테이션 감지). before 경계 검사를 뒤집으면
+    /// 부분 걸침이 Confirmed로 잘못 나오는데, 위 `classify_cell_hit_branches`의
+    /// NotCellBoundary 단정이 그걸 잡는다. 여기서는 Confirmed vs NotCellBoundary가
+    /// 실제로 갈리는 입력을 명시해 판정이 무의미하게 항상 같은 값을 주지 않음을 못박는다.
+    #[test]
+    fn classify_cell_hit_distinguishes_boundary() {
+        let confirmed = classify_cell_hit(b"a,bb,c", 0, 6, 2, 2, b',', false);
+        let not_boundary = classify_cell_hit(b"Johnson", 0, 7, 0, 4, b',', false);
+        assert_ne!(
+            confirmed, not_boundary,
+            "순수 경계와 부분 걸침은 반드시 다른 판정이어야 한다"
+        );
+    }
+
+    /// Whole cell match_case: 따옴표 없는 대량 데이터에서 빠른 경로가 타고 결과가
+    /// 브루트포스와 같다. 여러 행·여러 셀·부분 걸침 행을 섞는다.
+    #[test]
+    fn scan_wholecell_bytefast_matches_brute_force() {
+        let lines: Vec<String> = (0..500)
+            .map(|i| match i % 4 {
+                0 => "hit,a,b".to_string(),   // 셀0 = hit (확정)
+                1 => "x,hit,y".to_string(),   // 셀1 = hit (확정)
+                2 => "hitting,z".to_string(), // 부분 (제외)
+                _ => "p,q,r".to_string(),     // 매치 없음
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let mut doc = scan_view_doc(&refs, Encoding::Utf8, SeparatorMode::Char(b','));
+        doc.find_query = "hit".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        assert_scan_equals_brute(&doc);
+        // 부분 걸침(hitting) 행은 결과에 없어야 한다.
+        let got = scan_all_matches(&doc);
+        assert!(!got.is_empty());
+        for &r in &got {
+            assert_ne!(r % 4, 2, "hitting 행(부분)은 빠져야 한다");
+        }
+    }
+
+    /// 따옴표 셀 정확성 회귀. 빠른 경로가 따옴표에 속지 않고 폴백이 잡는다.
+    /// 순수 셀과 따옴표 셀을 한 문서에 섞어 **빠른 경로와 폴백이 둘 다** 타게 한다.
+    #[test]
+    fn scan_wholecell_quoted_cell_matches() {
+        // 행 0: 순수 셀 `John Smith`(빠른 경로 확정).
+        // 행 1: 따옴표 셀 `"John Smith"` — 표시값 John Smith, needle과 같음(폴백 확정).
+        // 행 2: 따옴표 안 콤마 `"a,b"` — needle `a,b`와 같음(폴백 확정). ↓ 별 문서.
+        // 행 3: `Johnson` — 부분이라 매치 없음.
+        let lines = &["John Smith,x", "\"John Smith\",x", "Johnson,y", "z,John Smith"];
+        let mut doc = scan_view_doc(lines, Encoding::Utf8, SeparatorMode::Char(b','));
+        doc.find_query = "John Smith".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        // 브루트포스와 같아야 한다(핵심 계약).
+        assert_scan_equals_brute(&doc);
+        assert_eq!(
+            scan_all_matches(&doc),
+            vec![0, 1, 3],
+            "순수 셀·따옴표 셀 모두 매치, Johnson(부분)만 제외"
+        );
+
+        // 따옴표 안 콤마 셀: needle에 delim이 들어 있어 바이트만으론 셀을 오판할
+        // 케이스. 폴백이 정확히 잡는지.
+        let lines2 = &["\"a,b\",c", "a,b,c", "x,\"a,b\""];
+        let mut doc2 = scan_view_doc(lines2, Encoding::Utf8, SeparatorMode::Char(b','));
+        doc2.find_query = "a,b".to_owned();
+        doc2.find_opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        assert_scan_equals_brute(&doc2);
+        assert_eq!(
+            scan_all_matches(&doc2),
+            vec![0, 2],
+            "따옴표로 감싼 a,b 셀만 매치. 행1(a,b,c)은 세 셀이라 매치 없음"
+        );
+    }
+
+    /// `Johnson`에서 needle `John`은 Whole cell로 매치 없음(부분 걸침 제외).
+    #[test]
+    fn scan_wholecell_partial_containment_excluded() {
+        let mut doc = scan_view_doc(
+            &["Johnson,x", "John,y", "z,Johnson"],
+            Encoding::Utf8,
+            SeparatorMode::Char(b','),
+        );
+        doc.find_query = "John".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        assert_scan_equals_brute(&doc);
+        assert_eq!(scan_all_matches(&doc), vec![1], "셀 전체가 John인 행만");
+    }
+
+    /// Partial match_case가 재판정 없이 memmem 히트로 확정돼도 브루트포스와 같다.
+    #[test]
+    fn scan_partial_bytefast_matches_brute_force() {
+        let lines: Vec<String> = (0..300)
+            .map(|i| if i % 3 == 0 { "has hit here".to_string() } else { "none".to_string() })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let mut doc = scan_view_doc(&refs, Encoding::Utf8, SeparatorMode::Char(b','));
+        doc.find_query = "hit".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::Partial,
+        };
+        assert_scan_equals_brute(&doc);
+    }
+
+    /// UTF-16은 빠른 경로를 타지 않고 폴백으로 가야 정확하다. 구분자·개행이 2바이트
+    /// 코드유닛이라 원바이트 경계 판정이 성립하지 않기 때문. 브루트포스와 같은지로 확인.
+    #[test]
+    fn scan_wholecell_utf16_falls_back_correctly() {
+        for enc in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            let mut doc = scan_view_doc(
+                &["hit,x", "가나,hit", "hitting,y", "z,가나"],
+                enc,
+                SeparatorMode::Char(b','),
+            );
+            for needle in ["hit", "가나"] {
+                doc.find_query = needle.to_owned();
+                for scope in [
+                    crate::find::MatchScope::Partial,
+                    crate::find::MatchScope::WholeCell,
+                ] {
+                    doc.find_opts = crate::find::FindOptions { match_case: true, scope };
+                    assert_scan_equals_brute(&doc);
+                }
+            }
+        }
+    }
+
+    /// 편집 모드 Whole cell/Partial 바이트 빠른 경로도 브루트포스와 같다.
+    /// 따옴표 셀 + 순수 셀 + 부분 걸침을 섞어 빠른 경로와 폴백이 둘 다 타게 한다.
+    #[test]
+    fn scan_edit_mode_bytefast_matches_brute_force() {
+        let (mut app, _d) = edit_doc(
+            b"John Smith,x\n\"John Smith\",y\nJohnson,z\nq,John Smith\n",
+            false,
+        );
+        let doc = app.doc_mut().unwrap();
+        for needle in ["John Smith", "John", "x"] {
+            for scope in [
+                crate::find::MatchScope::Partial,
+                crate::find::MatchScope::WholeWord,
+                crate::find::MatchScope::WholeCell,
+            ] {
+                for match_case in [true, false] {
+                    doc.find_query = needle.to_owned();
+                    doc.find_opts = crate::find::FindOptions { match_case, scope };
+                    assert_scan_equals_brute(doc);
+                }
+            }
+        }
     }
 
     // ---- F: Find All 하이라이트 스냅샷 / 상태 전이 ----
