@@ -1676,6 +1676,12 @@ fn search_from(
 /// 이다. 빠른 경로는 "확정" 또는 "정밀 판정 필요"만 판단하고, 애매한 것을
 /// 바이트만으로 "비매치"로 단정하지 않는다.
 ///
+/// **Whole cell의 함정(Task I에서 고친 것).** Whole cell 비교 대상은 파일 바이트가
+/// 아니라 `split_fields`의 **표시값**(따옴표 벗김, `""` → `"`)이다. 그래서
+/// "needle 바이트가 이 행에 없다"는 사실은 **비매치의 근거가 되지 못한다** —
+/// `"a"a`의 표시값은 `aa`이고, `"a""b"`는 `a"b`다. 바이트로 비매치를 단정할 수
+/// 있는 것은 행에 `"`가 하나도 없을 때뿐이다(`cell_bytes_are_display`).
+///
 /// (호출부는 Find All(`apply_find_action`의 `FindAction::All`)과 추출뿐이다 —
 /// 매 프레임 자동 호출은 없앴다. 사용자가 명시적으로 눌렀을 때만 돈다.)
 fn scan_all_matches(doc: &Document) -> Vec<u32> {
@@ -1735,6 +1741,8 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
                     // ---- ignore_case Whole cell: 히트마다 경계 바이트만 본다. ----
                     if ci_cell {
                         let d = delim.unwrap();
+                        // 행 바이트가 곧 표시값인가(`"`가 없는가). 뷰 모드와 같은 규율.
+                        let plain = cell_bytes_are_display(lb);
                         let mut confirmed = false;
                         let mut needs_refine = false;
                         for hit in find_ci_ascii_all(lb, &needle_lower) {
@@ -1755,8 +1763,11 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
                                 CellHit::NotCellBoundary => {}
                             }
                         }
-                        let matched = confirmed
-                            || (needs_refine
+                        // 히트 0개를 비매치로 단정하지 않는다 — Whole cell 비교
+                        // 대상은 표시값이라 `"a"a`(표시값 `aa`)처럼 needle 바이트가
+                        // 행에 없어도 매치일 수 있다. `"`가 없는 행만 단정한다.
+                        let matched = (confirmed && plain)
+                            || ((confirmed || needs_refine || !plain)
                                 && !crate::find::find_in_line_scoped(line, query, opts, delim)
                                     .is_empty());
                         if matched {
@@ -1780,6 +1791,8 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
                 // Whole cell 빠른 경로: 히트마다 경계 바이트만 보고 확정/폴백/버림.
                 if bytefast_cell {
                     let d = delim.unwrap();
+                    // 행 바이트가 곧 표시값인가(`"`가 없는가). 뷰 모드와 같은 규율.
+                    let plain = cell_bytes_are_display(lb);
                     let mut confirmed = false;
                     let mut needs_refine = false;
                     for hit in f.find_iter(lb) {
@@ -1793,10 +1806,15 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
                         }
                     }
                     // 확정 히트가 하나라도 있으면 매치. 없고 따옴표 후보만 있으면
-                    // 폴백으로 정밀 확인. 둘 다 없으면(모든 히트가 NotCellBoundary)
-                    // 셀 전체 매치가 있을 수 없으므로 비매치 — 바이트로 안전하게 단정.
-                    let matched = confirmed
-                        || (needs_refine
+                    // 폴백으로 정밀 확인.
+                    //
+                    // **히트 0개(또는 전부 NotCellBoundary)를 비매치로 단정하지
+                    // 않는다.** Whole cell 비교 대상은 `split_fields`가 준 표시값이라
+                    // 따옴표가 낀 행은 needle 바이트가 한 번도 나타나지 않아도 매치일
+                    // 수 있다(`"a"a` → 표시값 `aa`, `"a""b"` → `a"b`).
+                    // `"`가 하나도 없는 행만 표시값 == 원본 바이트라 단정할 수 있다.
+                    let matched = (confirmed && plain)
+                        || ((confirmed || needs_refine || !plain)
                             && !crate::find::find_in_line_scoped(line, query, opts, delim)
                                 .is_empty());
                     if matched {
@@ -1824,15 +1842,7 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
                 // 빠른 경로가 성립하지 않는 경우(비ASCII needle, UTF-16, Whole word,
                 // 텍스트 모드 Whole cell): 행 단위 폴백. 디코딩 비용이 크지만
                 // 정확성이 우선이다.
-                let n = doc.index.line_count();
-                let mut out = Vec::new();
-                for i in 0..n {
-                    let Some(text) = logical_line(doc, i) else { continue };
-                    if !crate::find::find_in_line_scoped(&text, query, opts, delim).is_empty() {
-                        out.push(i as u32);
-                    }
-                }
-                out
+                scan_rows_scoped(doc, query, opts, delim)
             }
         }
     }
@@ -1844,6 +1854,44 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
 /// 바이트 빠른 경로가 안전하지 않다. UTF-8/CP949만 참.
 fn is_single_byte_enc(enc: Encoding) -> bool {
     matches!(enc, Encoding::Utf8 | Encoding::Cp949)
+}
+
+/// needle을 문서 인코딩으로 옮겼다가 되돌렸을 때 **원문 그대로**인가.
+///
+/// **왜 필요한가(치명적).** `save::encode_bytes`는 표현할 수 없는 문자를 조용히
+/// 대체한다(CP949에 `é`가 없어 `?`(0x3F)가 된다). 그 대체 바이트로 프리필터를
+/// 돌리면 `?`가 있는 행이 후보로 잡히고, 반대로 `é`가 실제로 든 행은
+/// (인코딩할 수 없으니 파일에도 없어) 잡히지 않는다 — 즉 프리필터가 브루트포스와
+/// **다른 질문**을 하게 된다. 위양성만이면 정밀 판정이 걸러 주지만, 이 경우
+/// `?` 행이 후보가 되었다가 걸러지는 대신 match_case Partial처럼 "히트 = 확정"인
+/// 경로에서는 그대로 위양성이 남는다.
+///
+/// 왕복(encode → decode)이 원문과 같은지로 판정한다. 다르면 손실이 있었다는
+/// 뜻이므로 바이트 경로 전체를 포기하고 행 단위 폴백으로 간다.
+fn needle_roundtrips(query: &str, enc: Encoding) -> bool {
+    let bytes = crate::save::encode_bytes(query, enc);
+    crate::parse::decode_line(&bytes, enc) == query
+}
+
+/// 이 행을 **바이트만으로 "비매치"라고 단정해도 되는가**(Whole cell 전용).
+///
+/// **절대 계약.** `scan_all_matches`는 `find::matching_lines` 브루트포스와 같은
+/// 행 집합을 내야 한다. Whole cell 비교 대상은 파일 바이트가 아니라
+/// **표시값**이다 — `find_in_line_scoped`는 `split_fields`가 준 값(바깥 따옴표
+/// 벗김, `""` → `"`)과 needle을 비교한다(`find.rs:197`). 그래서 따옴표가 낀 행은
+/// 표시값이 원본 바이트와 **다르고**, needle 바이트가 행에 한 번도 나타나지 않아도
+/// 매치일 수 있다:
+/// - `"a"a` → 표시값 `aa`. 파일에 `aa`는 없다.
+/// - `"a""b"` → 표시값 `a"b`. 파일에 `a"b`는 없다.
+/// - `"hi"t` → 표시값 `hit`.
+///
+/// 따라서 "히트 0개"는 **비매치의 근거가 될 수 없다**. 행에 `"`가 하나도 없을
+/// 때만 표시값 == 원본 바이트가 보장되므로 그때만 단정한다. 따옴표가 없는 데이터가
+/// 압도적으로 흔하므로 빠른 경로는 그대로 살아 있고, 비용은 `memchr` 한 번이다.
+/// (닫히지 않은 따옴표·`"` 자체가 needle인 경우도 이 한 줄이 함께 덮는다 —
+///  그런 행은 전부 `"`를 포함하므로 정밀 판정으로 간다.)
+fn cell_bytes_are_display(line_bytes: &[u8]) -> bool {
+    memchr::memchr(b'"', line_bytes).is_none()
 }
 
 /// ASCII 대문자 한 바이트를 소문자로 접는다. 그 밖의 바이트(숫자·기호·비ASCII
@@ -1980,6 +2028,12 @@ enum CellHit {
 /// 셀일 수 있어 `NeedsRefine`(브리프 §2·§G-1). 그 외 순수 경계는 `Confirmed`.
 /// 경계가 아니면 `NotCellBoundary`.
 ///
+/// **이 함수는 히트 주변 바이트만 본다 — 줄 앞쪽의 닫히지 않은 따옴표를 볼 수 없다.**
+/// 그래서 `Confirmed`를 그대로 믿어도 되는 것은 호출부가 **그 행에 `"`가 하나도
+/// 없음**(`cell_bytes_are_display`)을 확인했을 때뿐이다. `"`가 있는 행은
+/// `Confirmed`든 히트 0개든 전부 정밀 판정으로 보내야 한다(`"a_,,HIT` × `HIT`가
+/// 순수 경계로 보이지만 실제로는 따옴표 안이다).
+///
 /// **needle에 delim이 들어 있으면(따옴표 셀에서만 가능) 무조건 `NeedsRefine`.**
 /// 예: needle `a,b`는 `a,b,c`에서 앞이 줄시작·뒤가 delim이라 순수 경계처럼
 /// 보이지만, 실은 `a`와 `b` 두 셀을 가로지른다(셀 전체가 아니다). 바이트만으론
@@ -2027,19 +2081,23 @@ fn classify_cell_hit(
 /// 문자열을 디코딩·할당해 `find_in_line_scoped`를 부르면 2200만 번의 할당이 돌아
 /// 5분씩 걸린다. 그래서 **바이트만으로 판정 가능한 경우엔 디코딩을 건너뛴다**:
 ///
-/// - **Partial(match_case, 단일 바이트 인코딩)**: memmem 히트 = 이 행에 needle이
-///   있다는 증명. `find_in_line`(Partial)이 하는 일이 곧 이 부분 문자열 찾기이므로
-///   재판정이 필요 없다. 그 행을 바로 담는다.
-/// - **Whole cell(match_case, 단일 바이트 인코딩)**: `classify_cell_hit`로 앞뒤
-///   경계 바이트만 본다. 순수 경계면 확정, 따옴표가 걸치면 그 행만 폴백, 경계가
-///   아니면 그 히트는 버리되(같은 행의 다른 히트가 셀 전체일 수 있으므로) 행 단위
-///   중복은 막는다.
-/// - **그 외**(Whole word / UTF-16 등 멀티바이트 인코딩): 종전대로 후보 행을
+/// - **Partial(match_case, UTF-8)**: memmem 히트 = 이 행에 needle이 있다는 증명.
+///   `find_in_line`(Partial)이 하는 일이 곧 이 부분 문자열 찾기이므로 재판정이
+///   필요 없다. 그 행을 바로 담는다. **CP949는 제외** — 트레일 바이트(0x41~0xFE)가
+///   ASCII와 겹쳐 히트가 문자 중간에 걸릴 수 있다(`_갂` × needle `A` = 위양성).
+///   그 판정은 `bytefast_ci_confirms`가 ignore_case 경로와 공유한다.
+/// - **Whole cell**: 이 함수가 아니라 `scan_view_cell_bytes`(행 단위)로 보낸다.
+///   Whole cell 비교 대상은 파일 바이트가 아니라 표시값이라 needle 바이트가 행에
+///   한 번도 안 나와도 매치일 수 있는데(`"a"a` → `aa`), 히트 순회 구조는 그런 행을
+///   방문조차 하지 않기 때문이다(위음성). 자세한 이유는 그 함수 주석 참조.
+/// - **그 외**(Whole word / UTF-16 등 멀티바이트 인코딩 / CP949 Partial): 후보 행을
 ///   디코딩해 `find_in_line_scoped`로 정밀 판정한다. 단어 경계는 유니코드라
 ///   바이트로 안전하지 않고, UTF-16은 구분자·개행이 2바이트라 원바이트 경계가
 ///   코드유닛 중간에 걸릴 수 있어 빠른 경로가 성립하지 않는다(폴백이 정답).
 ///
 /// 어떤 경로든 최종 결과는 반드시 `matching_lines` 브루트포스와 **같은 행 집합**이다.
+/// 바이트 층은 "확정" 또는 "정밀 판정 필요"만 말할 수 있고, **혼자서 "확실히
+/// 비매치"라고 단정하지 못한다** — 위음성은 곧 계약 위반이다.
 fn scan_view_memmem(
     doc: &Document,
     query: &str,
@@ -2056,25 +2114,44 @@ fn scan_view_memmem(
     // 모든 행을 놓친다(위음성). ASCII needle은 UTF-8/CP949에서 같은 바이트라
     // 이 인코딩이 무해하고, 비ASCII는 반드시 필요하다. 정밀 판정은 어차피
     // 디코딩 후 `find_in_line_scoped`가 하므로 프리필터의 위양성은 안전하다.
+    //
+    // 다만 그 인코딩이 **손실 없어야** 한다. CP949에 없는 문자(`é`)는
+    // `encode_bytes`가 조용히 `?`(0x3F)로 바꾸므로, 그 바이트로 프리필터를 돌리면
+    // 브루트포스와 다른 질문(`?`를 찾는 검색)을 하게 된다 → 바이트 경로를 통째로
+    // 포기하고 행 단위 폴백으로 간다(위양성이 아니라 **결과가 달라지는** 문제다).
+    if !needle_roundtrips(query, doc.enc) {
+        return scan_rows_scoped(doc, query, opts, delim);
+    }
     let needle_bytes = crate::save::encode_bytes(query, doc.enc);
     if needle_bytes.is_empty() {
         return Vec::new();
     }
-    let needle_len = needle_bytes.len();
-    let finder = memchr::memmem::Finder::new(&needle_bytes);
     // 바이트 빠른 경로를 탈 수 있는가. Partial/WholeCell + 단일 바이트 인코딩만.
     // (WholeWord·UTF-16은 아래 폴백 판정으로 간다.)
     let single_byte = is_single_byte_enc(doc.enc);
     let scope = opts.scope;
-    let bytefast_partial = single_byte && scope == crate::find::MatchScope::Partial;
-    // Whole cell 빠른 경로는 표 모드(delim 존재)에서만. 텍스트 모드(delim==None)의
-    // "행 전체 일치"는 개행 trim·인코딩 정합성이 섞여 폴백에 맡긴다(흔치 않다).
-    let bytefast_cell = single_byte
-        && scope == crate::find::MatchScope::WholeCell
-        && delim.is_some();
-    // needle 바이트에 delim이 있으면(따옴표 셀에서만 셀 전체일 수 있음) 경계 판정이
-    // 성립하지 않으므로 그 히트는 항상 폴백으로 보낸다(`classify_cell_hit` 참조).
-    let needle_has_delim = delim.is_some_and(|d| needle_bytes.contains(&d));
+    // ---- Whole cell은 **행 단위**로 훑는다(히트 단위가 아니라). ----
+    // Whole cell 비교 대상은 파일 바이트가 아니라 `split_fields`의 표시값이라,
+    // needle 바이트가 행에 한 번도 안 나와도 매치일 수 있다(`"a"a` → `aa`).
+    // 히트를 순회하는 구조는 **히트 0개인 행을 아예 방문하지 않아** 그런 행을
+    // 조용히 비매치로 만든다(위음성 = 계약 위반). 행을 훑어야 그 행에 `"`가 있는지
+    // 보고 정밀 판정으로 보낼 수 있다.
+    if scope == crate::find::MatchScope::WholeCell {
+        if single_byte && delim.is_some() {
+            return scan_view_cell_bytes(
+                doc, query, opts, delim, &offsets, total_bytes, bytes, &needle_bytes,
+            );
+        }
+        // 텍스트 모드(delim==None)의 "행 전체 일치"와 UTF-16은 바이트 경계 판정이
+        // 성립하지 않는다 → 행 단위 폴백.
+        return scan_rows_scoped(doc, query, opts, delim);
+    }
+    let finder = memchr::memmem::Finder::new(&needle_bytes);
+    let bytefast_partial = single_byte && scope == crate::find::MatchScope::Partial
+        // CP949 트레일 바이트(0x41~0xFE)는 ASCII와 겹쳐 memmem 히트가 문자 중간에
+        // 걸릴 수 있다(`_갂`에서 needle `A`). 그래서 히트를 바로 확정할 수 있는
+        // 인코딩은 UTF-8뿐이다 — ignore_case 경로와 **같은** 판정을 재사용한다.
+        && bytefast_ci_confirms(doc.enc);
 
     let mut out = Vec::new();
     let mut last_row: Option<u32> = None;
@@ -2098,39 +2175,7 @@ fn scan_view_memmem(
             continue;
         };
 
-        // ---- Whole cell 빠른 경로: 경계 바이트만 보고 확정/폴백/버림. ----
-        if bytefast_cell {
-            // 개행 제외 내용 끝(단일 바이트 인코딩이므로 `\r`/`\n`은 1바이트).
-            let line_start = s as usize;
-            let mut line_end = en as usize;
-            while line_end > line_start
-                && matches!(bytes[line_end - 1], b'\r' | b'\n')
-            {
-                line_end -= 1;
-            }
-            let d = delim.unwrap();
-            match classify_cell_hit(bytes, line_start, line_end, hit, needle_len, d, needle_has_delim) {
-                CellHit::NotCellBoundary => {
-                    // 이 히트는 셀 부분일 뿐. 행을 확정하지 않는다(같은 행의
-                    // 다른 히트가 셀 전체일 수 있다). last_row도 갱신하지 않아
-                    // 뒤따르는 확정 히트가 이 행을 담을 수 있게 둔다.
-                    continue;
-                }
-                CellHit::Confirmed => {
-                    if last_row == Some(row_u32) {
-                        continue;
-                    }
-                    last_row = Some(row_u32);
-                    out.push(row_u32);
-                    continue;
-                }
-                CellHit::NeedsRefine => {
-                    // 따옴표 개입 가능 → 폴백으로 내려가 정밀 판정한다(아래 공통 경로).
-                }
-            }
-        }
-
-        // ---- 폴백(정밀 판정): Whole word, 멀티바이트 인코딩, 따옴표 셀 등. ----
+        // ---- 폴백(정밀 판정): Whole word, 멀티바이트 인코딩, CP949 Partial 등. ----
         // 연속 히트가 같은 행이면 건너뛴다(정밀 판정도 한 번만 하게).
         if last_row == Some(row_u32) {
             continue;
@@ -2149,10 +2194,113 @@ fn scan_view_memmem(
             out.push(row_u32);
         }
     }
-    // find_iter는 offset 오름차순이라 out도 행 오름차순이다. Partial/Confirmed
-    // 경로는 last_row로 연속 중복을 막고, NotCellBoundary는 last_row를 갱신하지
-    // 않으므로 같은 행이 뒤에 확정돼도 한 번만 담긴다(offset 단조 증가 + 한 행의
-    // 바이트 범위 연속 → 같은 행 히트는 반드시 인접).
+    // find_iter는 offset 오름차순이라 out도 행 오름차순이다. Partial/폴백 경로 모두
+    // last_row로 연속 중복을 막는다(offset 단조 증가 + 한 행의 바이트 범위 연속 →
+    // 같은 행 히트는 반드시 인접).
+    out
+}
+
+/// 행 단위 브루트포스 폴백. 빠른 경로가 성립하지 않을 때(비ASCII/손실 needle,
+/// UTF-16 Whole cell, 텍스트 모드 Whole cell) 결과의 정의 그 자체인
+/// `find_in_line_scoped`를 행마다 부른다. 느리지만 **항상 옳다**.
+fn scan_rows_scoped(
+    doc: &Document,
+    query: &str,
+    opts: &crate::find::FindOptions,
+    delim: Option<u8>,
+) -> Vec<u32> {
+    let n = doc.index.line_count();
+    let mut out = Vec::new();
+    for i in 0..n {
+        let Some(text) = logical_line(doc, i) else { continue };
+        if !crate::find::find_in_line_scoped(&text, query, opts, delim).is_empty() {
+            out.push(i as u32);
+        }
+    }
+    out
+}
+
+/// 뷰 모드 + match_case + **Whole cell**의 바이트 빠른 경로. `scan_view_ci_bytes`와
+/// 같은 **행 단위** 구조다.
+///
+/// **왜 행 단위인가(치명적 계약).** Whole cell 비교 대상은 파일 바이트가 아니라
+/// `split_fields`가 준 **표시값**이다(바깥 따옴표 벗김, `""` → `"`). 그래서
+/// needle 바이트가 행에 한 번도 나타나지 않아도 매치일 수 있다:
+/// `"a"a`의 표시값은 `aa`, `"a""b"`의 표시값은 `a"b`, `"hi"t`는 `hit`.
+/// 히트를 순회하는 옛 구조는 히트 0개인 행을 **방문조차 하지 않아** 조용히
+/// 비매치로 만들었다(위음성 = 브루트포스와 다른 결과). 행을 훑으면 그 행에 `"`가
+/// 있는지 보고 정밀 판정으로 보낼 수 있다 — `"`가 없는 행(압도적 다수)만 바이트로
+/// 단정하므로 빠른 경로의 이득은 그대로다.
+#[allow(clippy::too_many_arguments)]
+fn scan_view_cell_bytes(
+    doc: &Document,
+    query: &str,
+    opts: &crate::find::FindOptions,
+    delim: Option<u8>,
+    offsets: &[u64],
+    total_bytes: u64,
+    bytes: &[u8],
+    needle_bytes: &[u8],
+) -> Vec<u32> {
+    let needle_len = needle_bytes.len();
+    let d = delim.expect("호출부가 delim.is_some()을 확인한다");
+    // needle 바이트에 delim이 있으면(따옴표 셀에서만 셀 전체일 수 있음) 경계 판정이
+    // 성립하지 않으므로 그 히트는 항상 폴백으로 보낸다(`classify_cell_hit` 참조).
+    let needle_has_delim = needle_bytes.contains(&d);
+    let finder = memchr::memmem::Finder::new(needle_bytes);
+    let mut out = Vec::new();
+    for row in 0..offsets.len() {
+        let Some((s, en)) = crate::index::LineIndex::range_in(offsets, total_bytes, row) else {
+            continue;
+        };
+        let (line_start, mut line_end) = (s as usize, en as usize);
+        if line_end > bytes.len() || line_start > line_end {
+            continue;
+        }
+        // 개행 제외 내용 끝(단일 바이트 인코딩이므로 `\r`/`\n`은 1바이트).
+        while line_end > line_start && matches!(bytes[line_end - 1], b'\r' | b'\n') {
+            line_end -= 1;
+        }
+        let lb = &bytes[line_start..line_end];
+        // 이 행의 바이트가 곧 표시값인가(`"`가 하나도 없는가). 아니면 어떤 히트도
+        // 바이트만으로 확정할 수 없고, 히트가 0개여도 비매치로 단정할 수 없다.
+        // `classify_cell_hit`은 히트 **주변** 바이트만 보므로 줄 앞쪽의 닫히지 않은
+        // 따옴표(`"a_,,HIT`)나 `"` 자체가 needle인 경우(`",` × `"`)를 볼 수 없다.
+        let plain = cell_bytes_are_display(lb);
+        let mut confirmed = false;
+        let mut needs_refine = false;
+        for hit in finder.find_iter(lb) {
+            match classify_cell_hit(
+                bytes,
+                line_start,
+                line_end,
+                line_start + hit,
+                needle_len,
+                d,
+                needle_has_delim,
+            ) {
+                CellHit::Confirmed => {
+                    confirmed = true;
+                    break;
+                }
+                CellHit::NeedsRefine => needs_refine = true,
+                CellHit::NotCellBoundary => {}
+            }
+        }
+        // 확정 히트가 있어도 CP949면 정밀 판정을 거친다 — 트레일 바이트가 ASCII와
+        // 겹쳐 히트가 문자 중간에 걸릴 수 있다(`bytefast_ci_confirms`와 같은 규율).
+        // 확정도 후보도 없을 때(히트 0개 포함)는 `plain`한 행만 비매치로 단정한다.
+        let matched = if confirmed && plain && bytefast_ci_confirms(doc.enc) {
+            true
+        } else if confirmed || needs_refine || !plain {
+            ci_refine_hit(doc, s, en, query, opts, delim)
+        } else {
+            false
+        };
+        if matched {
+            out.push(row as u32);
+        }
+    }
     out
 }
 
@@ -2185,6 +2333,13 @@ fn scan_view_ci_bytes(
     delim: Option<u8>,
 ) -> Option<Vec<u32>> {
     if !bytefast_ci_ok(query, doc.enc) {
+        return None;
+    }
+    // needle이 문서 인코딩으로 손실 없이 옮겨지지 않으면(대체 문자) 프리필터가
+    // 브루트포스와 다른 질문을 하게 된다 → 폴백. (`bytefast_ci_ok`가 ASCII만
+    // 통과시키므로 지금은 늘 참이지만, 가드를 여기 두어야 조건이 완화돼도
+    // 계약이 깨지지 않는다.)
+    if !needle_roundtrips(query, doc.enc) {
         return None;
     }
     let scope = opts.scope;
@@ -2239,6 +2394,10 @@ fn scan_view_ci_bytes(
         // ---- Whole cell: 히트마다 경계 바이트만 본다(`classify_cell_hit` 재사용 —
         //      그 함수는 대소문자와 무관하게 경계 바이트만 보므로 그대로 쓴다). ----
         let d = delim.unwrap();
+        // 이 행의 바이트가 곧 표시값인가(`"`가 하나도 없는가). `classify_cell_hit`은
+        // 히트 **주변** 바이트만 보므로 줄 앞쪽의 닫히지 않은 따옴표나 `"`가 needle인
+        // 경우를 볼 수 없다 → `"`가 있으면 어떤 판정도 바이트로 확정하지 않는다.
+        let plain = cell_bytes_are_display(lb);
         let mut confirmed = false;
         let mut needs_refine = false;
         for hit in find_ci_ascii_all(lb, &needle_lower) {
@@ -2262,11 +2421,15 @@ fn scan_view_ci_bytes(
             }
         }
         // 확정 히트가 있어도 CP949면 정밀 판정을 거친다(위 (가)안). 확정이 없고
-        // 따옴표 후보만 있으면 폴백으로 확인한다. 둘 다 없으면 비매치 —
-        // 모든 히트가 경계 밖이면 셀 전체 매치가 있을 수 없다.
-        let matched = if confirmed && confirms {
+        // 따옴표 후보만 있으면 폴백으로 확인한다.
+        //
+        // **둘 다 없을 때(히트 0개 포함)를 바이트로 "비매치"라 단정하지 않는다.**
+        // Whole cell 비교 대상은 표시값이라 따옴표가 낀 행은 needle 바이트가
+        // 한 번도 나타나지 않아도 매치일 수 있다(`"a"a` → 표시값 `aa`).
+        // 행에 `"`가 없을 때만 표시값 == 원본 바이트이므로 그때만 단정한다.
+        let matched = if confirmed && plain && confirms {
             true
-        } else if confirmed || needs_refine {
+        } else if confirmed || needs_refine || !plain {
             ci_refine_hit(doc, s, en, query, opts, delim)
         } else {
             false
@@ -7933,11 +8096,16 @@ mod tests {
     /// 브루트포스와 같다. 여러 행·여러 셀·부분 걸침 행을 섞는다.
     #[test]
     fn scan_wholecell_bytefast_matches_brute_force() {
+        // 따옴표가 needle을 쪼개는 행(`"hi"t` → 표시값 `hit`)을 섞는다 — 그 행은
+        // 파일 바이트에 `hit`이 붙어 나타나지 않으므로 "히트 0개 = 비매치"로
+        // 단정하던 옛 코드가 놓쳤다(위음성).
         let lines: Vec<String> = (0..500)
-            .map(|i| match i % 4 {
+            .map(|i| match i % 6 {
                 0 => "hit,a,b".to_string(),   // 셀0 = hit (확정)
                 1 => "x,hit,y".to_string(),   // 셀1 = hit (확정)
                 2 => "hitting,z".to_string(), // 부분 (제외)
+                3 => "\"hi\"t,z".to_string(), // 표시값 hit (폴백으로만 잡힌다)
+                4 => "\"a_,,hit".to_string(), // 닫히지 않은 따옴표 (제외돼야 한다)
                 _ => "p,q,r".to_string(),     // 매치 없음
             })
             .collect();
@@ -7953,8 +8121,13 @@ mod tests {
         let got = scan_all_matches(&doc);
         assert!(!got.is_empty());
         for &r in &got {
-            assert_ne!(r % 4, 2, "hitting 행(부분)은 빠져야 한다");
+            assert_ne!(r % 6, 2, "hitting 행(부분)은 빠져야 한다");
+            assert_ne!(r % 6, 4, "닫히지 않은 따옴표 행은 셀 전체가 hit가 아니다");
         }
+        assert!(
+            got.iter().any(|&r| r % 6 == 3),
+            "`\"hi\"t`(표시값 hit) 행이 빠지면 위음성이다"
+        );
     }
 
     /// 따옴표 셀 정확성 회귀. 빠른 경로가 따옴표에 속지 않고 폴백이 잡는다.
@@ -8187,8 +8360,13 @@ mod tests {
     /// 섞고, 대소문자 변형·한글·부분 걸침을 함께 넣는다. 뷰/편집 모드 모두.
     #[test]
     fn scan_ignore_case_bytefast_matches_brute_force() {
+        // **완전히 따옴표로 감싼 셀만 넣으면 안 된다.** `"Hit"`류는 따옴표 안에
+        // needle 바이트가 그대로 있어 "히트가 반드시 존재한다"는 성질을 만족하므로
+        // "히트 0개 = 비매치" 구멍을 **드러내지 못한다**. 따옴표가 needle을 쪼개거나
+        // (`"hi"t` → 표시값 `hit`) 언이스케이프하는(`"a""b"` → `a"b`) 형태를 함께 넣어야
+        // 그 구멍이 드러난다.
         let lines: Vec<String> = (0..400)
-            .map(|i| match i % 8 {
+            .map(|i| match i % 12 {
                 0 => "HIT,a,b".to_string(),          // 셀0 = HIT (빠른 경로 확정)
                 1 => "x,hIt,y".to_string(),          // 셀1 = hIt (빠른 경로 확정)
                 2 => "hitting,z".to_string(),        // 부분 걸침 (WholeCell 제외)
@@ -8196,12 +8374,16 @@ mod tests {
                 4 => "가나,HIT".to_string(),          // 한글 + 매치
                 5 => "p,q,r".to_string(),            // 매치 없음
                 6 => "\"a,hit\",z".to_string(),      // 따옴표 안 delim (폴백)
+                7 => "\"hi\"t,z".to_string(),        // 표시값 `hit` — 바이트엔 `hit`이 없다
+                8 => "\"HI\"T,z".to_string(),        // 위의 대소문자 변형
+                9 => "\"a\"a,x".to_string(),         // 표시값 `aa`
+                10 => "\"a\"\"b\",x".to_string(),    // 표시값 `a"b` (`""` 언이스케이프)
                 _ => "가나다,라마".to_string(),        // 한글만
             })
             .collect();
         let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
         for scope in [crate::find::MatchScope::Partial, crate::find::MatchScope::WholeCell] {
-            for needle in ["hit", "HIT", "Hit", "a,hit"] {
+            for needle in ["hit", "HIT", "Hit", "a,hit", "aa", "AA", "a\"b"] {
                 let mut doc =
                     scan_view_doc(&refs, Encoding::Utf8, SeparatorMode::Char(b','));
                 doc.find_query = needle.to_owned();
@@ -8219,9 +8401,15 @@ mod tests {
         let got = scan_all_matches(&doc);
         assert!(!got.is_empty(), "대소문자 변형 셀을 잡아야 한다");
         for &r in &got {
-            assert_ne!(r % 8, 2, "hitting 행(부분 걸침)은 빠져야 한다");
-            assert_ne!(r % 8, 5, "매치 없는 행이 들어오면 안 된다");
+            assert_ne!(r % 12, 2, "hitting 행(부분 걸침)은 빠져야 한다");
+            assert_ne!(r % 12, 5, "매치 없는 행이 들어오면 안 된다");
         }
+        // 따옴표가 needle을 쪼갠 행(`"hi"t` → 표시값 `hit`)이 **반드시 잡혀야** 한다 —
+        // 이것이 "히트 0개 = 비매치" 구멍의 직접 회귀다.
+        assert!(
+            got.iter().any(|&r| r % 12 == 7),
+            "`\"hi\"t`(표시값 hit) 행이 빠지면 위음성이다"
+        );
 
         // 편집 모드도 같은 데이터로(버퍼는 항상 UTF-8).
         let mut src = String::new();
@@ -8236,7 +8424,7 @@ mod tests {
             crate::find::MatchScope::WholeWord,
             crate::find::MatchScope::WholeCell,
         ] {
-            for needle in ["hit", "HIT", "Hit", "a,hit"] {
+            for needle in ["hit", "HIT", "Hit", "a,hit", "aa", "AA", "a\"b"] {
                 doc.find_query = needle.to_owned();
                 doc.find_opts = crate::find::FindOptions { match_case: false, scope };
                 assert_scan_equals_brute(doc);
@@ -8407,6 +8595,250 @@ mod tests {
             doc.find_query = "hit".to_owned();
             doc.find_opts = crate::find::FindOptions { match_case: false, scope };
             assert_scan_equals_brute(&doc);
+        }
+    }
+
+    // ---- Task I: 바이트 경로의 "비매치 단정" 구멍 수정 (회귀 테스트) ----
+
+    /// `cell_bytes_are_display` 단위 테스트. 이것이 Whole cell 빠른 경로에서
+    /// "바이트로 비매치를 단정해도 되는가"의 **유일한** 근거이므로 각 분기를
+    /// 직접 부른다(호출부에 조건을 복붙하지 않는다).
+    #[test]
+    fn cell_bytes_are_display_only_without_quote() {
+        assert!(cell_bytes_are_display(b"a,b,c"), "따옴표가 없으면 바이트 == 표시값");
+        assert!(cell_bytes_are_display(b""), "빈 행도 마찬가지");
+        assert!(!cell_bytes_are_display(b"\"a\"a"), "따옴표가 있으면 표시값이 다를 수 있다");
+        assert!(!cell_bytes_are_display(b"\"a_,,HIT"), "닫히지 않은 따옴표도 마찬가지");
+        assert!(!cell_bytes_are_display(b"\","), "`\"` 한 개만 있어도");
+        // 뮤테이션 감지: 판정이 항상 같은 값을 주지 않는다.
+        assert_ne!(
+            cell_bytes_are_display(b"a,b"),
+            cell_bytes_are_display(b"\"a\",b"),
+            "따옴표 유무가 판정을 갈라야 한다"
+        );
+    }
+
+    /// `needle_roundtrips`: 문서 인코딩으로 옮겼다 되돌렸을 때 원문이 보존되는가.
+    /// CP949에 없는 문자는 `encode_bytes`가 `?`로 대체하므로 거짓이어야 한다 —
+    /// 그 대체 바이트로 프리필터를 돌리면 브루트포스와 **다른 질문**을 하게 된다.
+    #[test]
+    fn needle_roundtrips_detects_lossy_encoding() {
+        assert!(needle_roundtrips("hit", Encoding::Utf8));
+        assert!(needle_roundtrips("hit", Encoding::Cp949));
+        assert!(needle_roundtrips("가나", Encoding::Cp949), "CP949에 있는 한글은 왕복 가능");
+        assert!(needle_roundtrips("é", Encoding::Utf8));
+        assert!(
+            !needle_roundtrips("é", Encoding::Cp949),
+            "CP949에 없는 문자는 `?`로 대체돼 왕복이 깨진다"
+        );
+        assert!(!needle_roundtrips("😀", Encoding::Cp949));
+    }
+
+    /// **Critical 회귀: Whole cell에서 "히트 0개"는 비매치의 근거가 아니다.**
+    ///
+    /// `find_in_line_scoped`가 비교하는 값은 파일 바이트가 아니라 `split_fields`가
+    /// 준 **표시값**(바깥 따옴표 벗김, `""` → `"`)이다. 그래서 needle 바이트가
+    /// 행에 한 번도 나타나지 않아도 매치일 수 있다. 아래 입력은 전부 수정 전에
+    /// 빠른 경로가 `[]`를 내고 브루트포스가 `[0]`을 내던 **위음성**이다.
+    #[test]
+    fn scan_wholecell_quote_split_needle_is_not_missed() {
+        // (행, needle) — 표시값이 원본 바이트와 다른 형태들.
+        let cases: &[(&str, &str)] = &[
+            ("\"a\"a", "aa"),               // 표시값 `aa` — 바이트에 `aa`가 붙어 있지 않다
+            ("\"a\"a", "AA"),               // ignore_case 변형
+            ("x,\"a\"a,y", "aa"),           // 가운데 셀
+            ("\"a\"\"b\"", "a\"b"),         // `""` → `"` 언이스케이프
+            ("\"hi\"t", "hit"),
+            ("\"HI\"T", "hit"),
+            ("a,\"jo\"hn smith", "john smith"),
+            // 아래 둘은 반대 방향(위양성): 바이트로는 셀 경계처럼 보이지만 실제로는 아니다.
+            ("\"a_,,HIT", "HIT"),           // 닫히지 않은 따옴표
+            ("\",", "\""),                  // needle이 `"` 자체
+        ];
+        for &(line, needle) in cases {
+            for match_case in [true, false] {
+                // 뷰 모드.
+                let mut doc = scan_view_doc(&[line], Encoding::Utf8, SeparatorMode::Char(b','));
+                doc.find_query = needle.to_owned();
+                doc.find_opts = crate::find::FindOptions {
+                    match_case,
+                    scope: crate::find::MatchScope::WholeCell,
+                };
+                assert_scan_equals_brute(&doc);
+                // 편집 모드(같은 데이터).
+                let src = format!("{line}\n");
+                let (mut app, _d) = edit_doc(src.as_bytes(), false);
+                let ed = app.doc_mut().unwrap();
+                ed.sep = SeparatorMode::Char(b',');
+                ed.find_query = needle.to_owned();
+                ed.find_opts = crate::find::FindOptions {
+                    match_case,
+                    scope: crate::find::MatchScope::WholeCell,
+                };
+                assert_scan_equals_brute(ed);
+            }
+        }
+        // 위음성이 실제로 사라졌는지 한 케이스는 값으로도 못박는다(빈 결과 비교가
+        // 우연히 통과하는 것을 막는다).
+        let mut doc = scan_view_doc(&["\"a\"a"], Encoding::Utf8, SeparatorMode::Char(b','));
+        doc.find_query = "aa".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: false,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        assert_eq!(scan_all_matches(&doc), vec![0], "표시값 `aa`를 잡아야 한다");
+        // 위양성도 값으로 못박는다.
+        let mut doc = scan_view_doc(&["\"a_,,HIT"], Encoding::Utf8, SeparatorMode::Char(b','));
+        doc.find_query = "HIT".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        assert!(
+            scan_all_matches(&doc).is_empty(),
+            "닫히지 않은 따옴표 안이라 셀 전체가 HIT가 아니다"
+        );
+    }
+
+    /// **CP949 트레일 바이트 위양성(match_case Partial) 회귀.** CP949 한글의
+    /// 트레일 바이트는 ASCII와 겹치므로 memmem 히트가 문자 **중간**에 걸릴 수 있다.
+    /// `_갂\t\thitting` + needle `A`(TSV)가 그 예다 — 수정 전에는 빠른 경로가
+    /// `[0]`, 브루트포스가 `[]`였다.
+    #[test]
+    fn scan_partial_match_case_cp949_trail_byte_no_false_positive() {
+        let mut doc =
+            scan_view_doc(&["_갂\t\thitting"], Encoding::Cp949, SeparatorMode::Char(b'\t'));
+        doc.find_query = "A".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::Partial,
+        };
+        assert_scan_equals_brute(&doc);
+        assert!(
+            scan_all_matches(&doc).is_empty(),
+            "`갂`의 트레일 바이트가 `A`와 같아도 그건 문자 중간이라 매치가 아니다"
+        );
+        // 진짜 ASCII `A`가 든 행은 여전히 잡혀야 한다(가드가 전부를 죽이지 않았다).
+        let mut doc2 =
+            scan_view_doc(&["_갂\t\thitting", "A\tx"], Encoding::Cp949, SeparatorMode::Char(b'\t'));
+        doc2.find_query = "A".to_owned();
+        doc2.find_opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::Partial,
+        };
+        assert_eq!(scan_all_matches(&doc2), vec![1]);
+        assert_scan_equals_brute(&doc2);
+    }
+
+    /// **UTF-16LE Whole cell 위음성 회귀.** UTF-16은 코드유닛이 2바이트라 바이트
+    /// 경계 판정이 성립하지 않으므로 Whole cell은 통째로 행 단위 폴백이어야 한다.
+    /// 수정 전에는 memmem 프리필터가 히트 0개인 행을 **방문조차 하지 않아**
+    /// `"a"a`(표시값 `aa`) 행을 놓쳤다.
+    #[test]
+    fn scan_wholecell_utf16_quote_split_needle_is_not_missed() {
+        for enc in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            let mut doc = scan_view_doc(
+                &["zzz", "\"a\"a,a b0,,"],
+                enc,
+                SeparatorMode::Char(b','),
+            );
+            for match_case in [true, false] {
+                doc.find_query = "aa".to_owned();
+                doc.find_opts = crate::find::FindOptions {
+                    match_case,
+                    scope: crate::find::MatchScope::WholeCell,
+                };
+                assert_scan_equals_brute(&doc);
+                assert_eq!(scan_all_matches(&doc), vec![1], "표시값 `aa`인 셀을 잡아야 한다");
+            }
+        }
+    }
+
+    /// **CP949로 표현할 수 없는 needle 회귀.** `save::encode_bytes`는 `é`를 조용히
+    /// `?`(0x3F)로 바꾼다. 그 바이트로 프리필터를 돌리면 "`?`를 찾는 검색"이 되어
+    /// 브루트포스와 다른 결과가 나온다(위양성이 아니라 **다른 질문**이다).
+    /// 왕복 가드(`needle_roundtrips`)가 이걸 막고 행 단위 폴백으로 보낸다.
+    #[test]
+    fn scan_cp949_unrepresentable_needle_falls_back() {
+        let mut doc = scan_view_doc(&["é,x", "?,y", "a?b,z"], Encoding::Cp949, SeparatorMode::Char(b','));
+        for scope in [
+            crate::find::MatchScope::Partial,
+            crate::find::MatchScope::WholeCell,
+            crate::find::MatchScope::WholeWord,
+        ] {
+            for match_case in [true, false] {
+                doc.find_query = "é".to_owned();
+                doc.find_opts = crate::find::FindOptions { match_case, scope };
+                assert_scan_equals_brute(&doc);
+                assert!(
+                    scan_all_matches(&doc).is_empty(),
+                    "CP949 파일에 `é`는 존재할 수 없다 — `?` 행이 잡히면 위양성"
+                );
+            }
+        }
+    }
+
+    /// **차등 퍼징(적대적 따옴표 알파벳, 소규모 전수).** 무작위 생성은 따옴표가
+    /// 셀을 쪼개거나(`"a"a`) 언이스케이프하는(`"a""b"`) 형태를 거의 만들지 못해
+    /// 이번 결함들을 놓쳤다. 그래서 `a A " ,` 네 글자로 이뤄진 **길이 ≤ 4의 모든
+    /// 문자열**(4^0+…+4^4 = 341개)을 전수로 만들어 브루트포스와 대조한다.
+    /// scope × match_case × UTF-8/CP949를 모두 돈다.
+    #[test]
+    fn scan_all_matches_differential_fuzz_quote_alphabet() {
+        const ALPHA: &[char] = &['a', 'A', '"', ','];
+        // 길이 0..=4의 모든 문자열.
+        let mut corpus: Vec<String> = vec![String::new()];
+        let mut frontier: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for s in &frontier {
+                for &c in ALPHA {
+                    let mut t = s.clone();
+                    t.push(c);
+                    next.push(t);
+                }
+            }
+            corpus.extend(next.iter().cloned());
+            frontier = next;
+        }
+        assert_eq!(corpus.len(), 1 + 4 + 16 + 64 + 256, "전수 코퍼스 크기");
+        let refs: Vec<&str> = corpus.iter().map(|s| s.as_str()).collect();
+        let scopes = [
+            crate::find::MatchScope::Partial,
+            crate::find::MatchScope::WholeWord,
+            crate::find::MatchScope::WholeCell,
+        ];
+        // needle도 같은 알파벳에서 뽑는다(길이 1~3).
+        let needles = ["a", "A", "\"", ",", "aa", "aA", "a\"", "\"a", "a,", ",a", "a\"a", "aaa", "a\"b"];
+        for enc in [Encoding::Utf8, Encoding::Cp949] {
+            for &scope in &scopes {
+                for match_case in [true, false] {
+                    for needle in needles {
+                        let mut doc = scan_view_doc(&refs, enc, SeparatorMode::Char(b','));
+                        doc.find_query = needle.to_owned();
+                        doc.find_opts = crate::find::FindOptions { match_case, scope };
+                        assert_scan_equals_brute(&doc);
+                    }
+                }
+            }
+        }
+        // 편집 모드도 같은 코퍼스로(버퍼는 UTF-8).
+        let mut src = String::new();
+        for l in &corpus {
+            src.push_str(l);
+            src.push('\n');
+        }
+        let (mut app, _d) = edit_doc(src.as_bytes(), false);
+        let doc = app.doc_mut().unwrap();
+        doc.sep = SeparatorMode::Char(b',');
+        for &scope in &scopes {
+            for match_case in [true, false] {
+                for needle in needles {
+                    doc.find_query = needle.to_owned();
+                    doc.find_opts = crate::find::FindOptions { match_case, scope };
+                    assert_scan_equals_brute(doc);
+                }
+            }
         }
     }
 
