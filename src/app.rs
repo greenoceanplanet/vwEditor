@@ -120,6 +120,36 @@ pub struct Document {
     /// 프레임**에 반영되고, `update()` 끝의 F3 단축키 경로는 본문이 이미
     /// 그려진 뒤라 **다음 프레임**에 반영된다. 둘 다 이 한 필드로 처리된다.
     pub pending_scroll_row: Option<usize>,
+    /// `pending_scroll_row`를 화면 어디에 붙일지. 찾기는 `Center`(매치가
+    /// 가장자리에 붙지 않고 앞뒤 맥락과 함께 보이게), Page Up/Down은
+    /// `Align::TOP`이다 — 페이지 단위 이동은 "이 행부터 한 화면"이라는 뜻이라
+    /// 목표 행이 맨 위에 와야 다음 페이지가 정확히 이어진다(Center로 두면
+    /// 반 페이지가 이미 본 내용이 된다).
+    ///
+    /// 정렬을 `pending_scroll_row`의 `Option` 안에 튜플로 넣지 않고 별도
+    /// 필드로 둔 이유: 기존 스크롤 요청 지점(찾기, 거터 클릭)이 모두
+    /// `Some(row)`만 쓰고 있어 튜플로 바꾸면 그 지점들이 전부 정렬을 명시해야
+    /// 하는데, 그건 "정렬은 기본이 Center"라는 기존 동작을 옮겨 적는 일이라
+    /// 한 군데만 빠뜨려도 조용히 회귀한다. 기본값을 Center로 둔 별도 필드는
+    /// **아무것도 안 하면 예전 그대로**다.
+    pub pending_scroll_align: egui::Align,
+    /// 이번(정확히는 직전) 프레임에 화면에 그려진 **첫 화면 행**과 화면에
+    /// 들어가는 행 수. 렌더가 매 프레임 기록하고 Page Up/Down이 읽는다.
+    ///
+    /// **왜 필요한가.** 본문은 `body.rows` 가상 스크롤이라 화면 밖 행은
+    /// 그려지지 않고, `Table::body`는 `ScrollAreaOutput`을 삼켜(`()` 반환)
+    /// 스크롤 offset을 돌려주지 않는다. 그래서 "지금 어디를 보고 있나"를
+    /// 알 방법은 **그려진 행 번호를 관측하는 것**뿐이다.
+    ///
+    /// 단위는 `pending_scroll_row`와 같은 **화면 행**이다(표 모드는 정렬
+    /// permutation 때문에 논리 행과 다르다) — Page Up/Down은 "지금 보는
+    /// 자리에서 한 화면 위/아래"라 화면 행끼리 더하고 빼면 되고, 논리 행으로
+    /// 변환할 이유가 없다.
+    pub first_visible_row: usize,
+    /// 한 화면에 들어가는 행 수(`available_height / ROW_HEIGHT`). 렌더가
+    /// 기록한다 — Page 키 처리 시점(`update()` 끝)에는 본문 `Ui`가 없어
+    /// `available_height`를 다시 구할 수 없기 때문이다.
+    pub visible_rows: usize,
 }
 
 /// 확인 없이 바로 수행할 컬럼 연산의 최대 행 수. 이보다 크면 사용자에게 묻는다.
@@ -399,6 +429,9 @@ impl App {
             find_focus_pending: false,
             highlight: None,
             pending_scroll_row: None,
+            pending_scroll_align: egui::Align::Center,
+            first_visible_row: 0,
+            visible_rows: 0,
         });
     }
 
@@ -1276,6 +1309,45 @@ impl eframe::App for App {
             }
         }
 
+        // ---- Page Up / Page Down (페이지 단위 스크롤) ----
+        //
+        // 본문은 `body.rows` 가상 스크롤이라 화면 밖 행이 그려지지 않으므로,
+        // 스크롤은 찾기와 **같은 메커니즘**으로 한다: 목표 화면 행을
+        // `pending_scroll_row`에 남기면 다음 프레임 렌더가 `scroll_to_row`로
+        // 옮긴다(`apply_page_scroll`). 이 경로는 본문이 이미 그려진 뒤라
+        // 다음 프레임에 반영된다 — F3 단축키와 같다.
+        //
+        // **화면 행 기준으로 계산한다.** 표 모드는 정렬 permutation 때문에
+        // 논리 행 ≠ 화면 행인데, 페이지 이동은 "지금 보는 자리에서 한 화면
+        // 위/아래"라는 **화면상의** 요구이므로 관측값(`first_visible_row`)과
+        // 목적지가 둘 다 화면 행이면 변환이 아예 필요 없다. 논리 행으로
+        // 왕복하면 정렬된 문서에서 엉뚱한 곳으로 튄다.
+        //
+        // **편집 모드에서도 캐럿은 옮기지 않는다.** 요청은 "뷰어에서 페이지
+        // 단위로 넘겨보게"이므로 스크롤만 한다. 캐럿까지 옮기면 선택 확장
+        // (Shift+PageDown)·되돌리기 경계 같은 편집 의미가 딸려 오는데 그건
+        // 요청 범위 밖이고, 본다고 캐럿이 움직이지 않는 편이 놀랍지 않다.
+        if page_keys_live_for(self, ctx) {
+            // 두 키가 같은 프레임에 오면 Down을 먼저 본다(먼저 소비된 쪽만
+            // 반영된다) — 어느 쪽이든 한 프레임에 한 페이지만 움직인다.
+            let dir = if ctx
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown))
+            {
+                Some(PageDir::Down)
+            } else if ctx
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp))
+            {
+                Some(PageDir::Up)
+            } else {
+                None
+            };
+            if let Some(dir) = dir {
+                if let Some(doc) = self.doc_mut() {
+                    apply_page_scroll(doc, dir);
+                }
+            }
+        }
+
         // 메뉴에서 고른 되돌리기(단축키를 모르는 사용자용). 메뉴바 클로저 안에서는
         // self를 가변 대여할 수 없어 인텐트만 받아 여기서 적용한다.
         if undo_clicked {
@@ -1483,6 +1555,134 @@ fn find_keys_live(app: &App) -> bool {
         && !app.show_save_dialog
 }
 
+// ---------------------------------------------------------------------------
+// Page Up / Page Down (페이지 단위 스크롤)
+// ---------------------------------------------------------------------------
+
+/// 페이지 이동 방향.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageDir {
+    Up,
+    Down,
+}
+
+/// Page Up/Down이 스크롤할 **화면 행**을 계산한다.
+///
+/// - `first`: 지금 화면 맨 위에 보이는 화면 행(`Document::first_visible_row`).
+/// - `visible`: 한 화면에 들어가는 행 수(`Document::visible_rows`).
+/// - `total`: 전체 화면 행 수(표 모드는 헤더를 뺀 데이터 행 수).
+///
+/// **한 행을 겹친다(`visible - 1`).** 일반 에디터 관례이고, 겹치는 행이 없으면
+/// 페이지 경계에서 문맥이 끊겨 "방금 본 마지막 줄"과 "지금 첫 줄"이 이어지는지
+/// 확인할 수 없다. `visible`이 0이나 1이면 `max(1)`로 최소 한 행은 움직인다 —
+/// 그러지 않으면 창이 아주 작을 때 키가 아무 반응도 안 하는 것처럼 보인다.
+///
+/// 클램프: 위로는 0(`saturating_sub`), 아래로는 마지막 행(`total - 1`).
+/// `total == 0`이면 갈 곳이 없으므로 `None`을 돌려 스크롤 요청 자체를 만들지
+/// 않는다(0을 돌려주면 빈 문서에 대해 무의미한 스크롤 요청이 매번 쌓인다).
+///
+/// `update()`의 키 처리 클로저 안에 인라인으로 두면 이 계산을 테스트가 구동할
+/// 수 없으므로(`page_keys_live`/`extract_plan`과 같은 규율) 순수 함수로 뺀다.
+fn page_target_row(dir: PageDir, first: usize, visible: usize, total: usize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    let step = visible.saturating_sub(1).max(1);
+    let last = total - 1;
+    let target = match dir {
+        PageDir::Up => first.saturating_sub(step),
+        PageDir::Down => first.saturating_add(step).min(last),
+    };
+    Some(target.min(last))
+}
+
+/// Page Up/Down 단축키가 살아 있는가. `find_keys_live`/`can_undo_key`와 같은
+/// 규율의 가드를 **하나의 순수 함수**로 뽑아 `update()`와 테스트가 같은 코드를
+/// 지나게 한다 — 게이트 식을 테스트에 베껴 적으면 실제 게이트를 뒤집어도 그
+/// 테스트는 자기 사본만 보고 통과한다.
+///
+/// - `has_doc`: 문서가 열려 있는가.
+/// - `editing_cell`: 인라인 셀 편집 중인가. 그러면 TextEdit이 키를 가져가야
+///   한다(셀 편집기 안에서 Page Down이 문서를 넘기면 안 된다).
+/// - `focused`: **다른 위젯이 키보드 포커스를 쥐고 있는가.** 찾기 입력란에
+///   타이핑하는 중에 Page Down이 문서를 넘기면 안 되므로 양보한다. 찾기의
+///   Ctrl+F/F3과 달리 여기서는 포커스가 있으면 **무조건** 양보한다 — Page
+///   Up/Down은 텍스트 입력 위젯 자신이 캐럿을 옮기는 데 쓰는 키라
+///   `consume_key`로 가로채면 그 위젯의 정상 동작을 뺏는다(Ctrl+F/F3은 어떤
+///   TextEdit도 쓰지 않는 조합이라 사정이 다르다).
+/// - `pending_action` / `save_dialog`: 확인·저장 다이얼로그가 떠 있으면 양보.
+fn page_keys_live(
+    has_doc: bool,
+    editing_cell: bool,
+    focused: bool,
+    pending_action: bool,
+    save_dialog: bool,
+) -> bool {
+    has_doc && !editing_cell && !focused && !pending_action && !save_dialog
+}
+
+/// `page_keys_live`에 `App`/`Context`의 실제 상태를 먹이는 어댑터.
+/// `update()`와 테스트가 **이 함수 하나**를 지나게 해서, 인자를 어디서 읽는지
+/// (특히 "포커스"를 `App`이 아니라 egui `Context`에서 읽는다는 사실)까지
+/// 한 곳에 둔다 — 인자 조립을 양쪽에 따로 적으면, 예컨대 포커스 인자를
+/// 실수로 항상 `false`로 넘겨도 테스트는 자기 사본만 보고 통과한다.
+fn page_keys_live_for(app: &App, ctx: &egui::Context) -> bool {
+    page_keys_live(
+        app.doc().is_some(),
+        app.doc().is_some_and(|d| d.editing_cell.is_some()),
+        ctx.memory(|m| m.focused().is_some()),
+        app.pending_action.is_some(),
+        app.show_save_dialog,
+    )
+}
+
+/// 문서의 전체 **화면** 행 수. 표 모드는 헤더가 본문 행이 아니므로 빼야
+/// `render_table`의 `data_rows`와 같아지고, 그래야 페이지 이동의 마지막 행
+/// 클램프가 실제로 존재하는 마지막 행과 맞는다. 텍스트 모드는 논리 행이 곧
+/// 화면 행이다.
+fn doc_screen_row_count(doc: &Document) -> usize {
+    match doc.sep {
+        SeparatorMode::None => doc_line_count(doc),
+        SeparatorMode::Char(_) => {
+            let data_start = if doc.has_header { 1 } else { 0 };
+            doc_line_count(doc).saturating_sub(data_start)
+        }
+    }
+}
+
+/// 페이지 이동 한 번을 문서에 반영한다 — 목표 화면 행을 `pending_scroll_row`에,
+/// 정렬을 `pending_scroll_align`에 남긴다(실제 스크롤은 다음 프레임 렌더가
+/// `scroll_to_row`로 수행한다 — 그 필드 주석 참조).
+///
+/// `update()`의 키 블록 안에 인라인으로 두면 `update()`가 `eframe::Frame`을
+/// 요구해 테스트가 이 동작을 구동할 수 없으므로(코드베이스의 기존 문제),
+/// 키 소비만 `update()`에 남기고 **결정과 상태 변경 전부**를 여기로 뺀다.
+fn apply_page_scroll(doc: &mut Document, dir: PageDir) {
+    let total = doc_screen_row_count(doc);
+    if let Some(target) = page_target_row(dir, doc.first_visible_row, doc.visible_rows, total) {
+        doc.pending_scroll_row = Some(target);
+        // 페이지 단위 이동은 "이 행부터 한 화면"이라 목표 행이 맨 위에 와야
+        // 다음 페이지가 정확히 이어진다(찾기의 Center와 다르다).
+        doc.pending_scroll_align = egui::Align::TOP;
+    }
+}
+
+/// 본문에 남은 높이에서 한 화면에 들어가는 **본문 행 수**를 구한다.
+///
+/// `ui.available_height()`는 헤더 행까지 포함한 테이블 전체 높이이므로
+/// 헤더 한 줄(`ROW_HEIGHT`)을 빼고 나눈다 — 그러지 않으면 Page Down이 매번
+/// 한 행씩 더 건너뛰어 그 행이 조용히 안 읽힌다.
+///
+/// 표/텍스트 두 렌더가 같은 규칙을 써야 하므로(둘 다 `TableBuilder` +
+/// `ROW_HEIGHT` 헤더 하나) 계산을 한 함수로 묶는다.
+fn visible_row_count(avail_height: f32) -> usize {
+    let body = avail_height - ROW_HEIGHT;
+    if body <= 0.0 {
+        return 0;
+    }
+    (body / ROW_HEIGHT) as usize
+}
+
 /// 표 모드가 실제로 그리는 컬럼 수. `render_table`의 col_count 계산
 /// (`app.rs`의 그 지점 주석 — 헤더 필드 수와 앞부분 데이터 행 몇 개를
 /// 샘플링한 필드 수의 최댓값)과 **완전히 같은 알고리즘**이어야 한다 —
@@ -1558,6 +1758,12 @@ fn logical_to_screen_row(doc: &Document, logical: usize, data_start: usize) -> u
 fn focus_match(doc: &mut Document, m: crate::find::Match) {
     doc.last_match = Some(m);
     doc.find_status.clear();
+    // 찾기는 매치를 화면 **중앙**에 둔다(앞뒤 맥락과 함께 보이게).
+    // Page Up/Down이 `Align::TOP`으로 바꿔 놓았을 수 있으므로 여기서 **매번**
+    // 되돌린다 — 정렬은 요청마다 새로 지시해야 하는 값이지, 마지막 요청이
+    // 남긴 잔여 상태를 물려받으면 안 된다(페이지를 한 번 넘긴 뒤의 Find Next가
+    // 조용히 상단 정렬로 바뀌는 회귀).
+    doc.pending_scroll_align = egui::Align::Center;
     let start = crate::edit::TextPos { line: m.line, col: m.col };
     let end = crate::edit::TextPos { line: m.line, col: m.col + m.len };
     match doc.sep {
@@ -2799,6 +3005,9 @@ fn build_extracted_doc(
         // `scan_all_matches`를 돌려 채운다. 여기서는 빈 상태로 둔다.
         highlight: None,
         pending_scroll_row: None,
+        pending_scroll_align: egui::Align::Center,
+        first_visible_row: 0,
+        visible_rows: 0,
     }
 }
 
@@ -4016,10 +4225,12 @@ fn render_table(
     // 행이 아예 그려지지 않아 `Response::scroll_to_me`가 통하지 않으므로, 행
     // 번호만으로 스크롤하는 `TableBuilder::scroll_to_row`를 쓴다
     // (`egui_extras-0.28.1/src/table.rs:320`; `rows()`가 그 행의 y 범위를 직접
-    //  계산하므로 그려지지 않은 행에도 정확히 맞는다). `Align::Center`로 두어
-    // 매치가 화면 가장자리에 붙지 않고 앞뒤 맥락과 함께 보이게 한다.
+    //  계산하므로 그려지지 않은 행에도 정확히 맞는다). 정렬은 요청자가
+    // `pending_scroll_align`에 함께 남긴다 — 찾기는 `Center`(매치가 가장자리에
+    // 붙지 않고 앞뒤 맥락과 함께 보이게), Page Up/Down은 `TOP`이다.
     // 아래 스냅샷들이 doc을 불변 대여하기 **전에** 꺼내야 한다.
     let scroll_to = doc.pending_scroll_row.take();
+    let scroll_align = doc.pending_scroll_align;
 
     // 헤더 행 데이터(있으면 첫 줄)와 데이터 시작 행 결정
     let total_lines = match &doc.edit {
@@ -4158,8 +4369,14 @@ fn render_table(
         .columns(Column::initial(120.0).at_least(60.0).resizable(true), col_count);
 
     if let Some(row) = scroll_to {
-        table = table.scroll_to_row(row, Some(egui::Align::Center));
+        table = table.scroll_to_row(row, Some(scroll_align));
     }
+
+    // 이번 프레임에 그려진 행 중 가장 작은 화면 행. Page Up/Down이 "지금
+    // 어디를 보고 있나"를 알 유일한 방법이다(`Document::first_visible_row`
+    // 주석 참조). 클로저는 doc을 불변으로만 빌리므로 `Cell`에 모았다가
+    // 클로저 종료 뒤 doc에 쓴다(`clicked_col`과 같은 통로).
+    let min_drawn_row: Cell<Option<usize>> = Cell::new(None);
 
     table
         .header(ROW_HEIGHT, |mut header| {
@@ -4213,6 +4430,9 @@ fn render_table(
         .body(|body| {
             body.rows(ROW_HEIGHT, data_rows, |mut row| {
                 let view_row = row.index();
+                min_drawn_row.set(Some(
+                    min_drawn_row.get().map_or(view_row, |m: usize| m.min(view_row)),
+                ));
                 let line_no = view_row + row_base;
                 // 정렬이 적용돼 있으면 permutation으로 원본 논리 행번호를 얻는다.
                 // 없으면 원본 순서(data_start + view_row).
@@ -4420,6 +4640,16 @@ fn render_table(
                 }
             });
         });
+
+    // Page Up/Down이 읽을 "지금 보고 있는 자리". **아래의 `if !editing { return }`
+    // 보다 먼저** 기록해야 한다 — 뷰 모드에서도 페이지 이동은 되어야 하는데,
+    // 그 조기 반환 뒤에 두면 뷰 모드에서는 영원히 0으로 남는다.
+    // 그려진 행이 하나도 없으면(빈 문서, 창이 접힌 경우) 이전 값을 유지한다 —
+    // 0으로 되돌리면 다음 Page Up/Down이 문서 맨 앞에서 시작한다.
+    if let Some(first) = min_drawn_row.get() {
+        doc.first_visible_row = first;
+    }
+    doc.visible_rows = visible_row_count(avail_height);
 
     // 클로저 종료 후 헤더 클릭 결과를 반영(같은 컬럼 재클릭이면 선택 해제 토글).
     // 셀 사각 선택도 함께 지운다 — 컬럼을 고른 순간 사용자의 대상은 그 컬럼이고,
@@ -5135,6 +5365,9 @@ fn render_match_gutter(ctx: &egui::Context, doc: &mut Document) {
             if let Some(pos) = resp.interact_pointer_pos() {
                 if resp.clicked() {
                     let logical = row_at_y(pos.y, line_count, top, height);
+                    // 거터 클릭도 찾기와 같은 중앙 정렬이다(`focus_match`와 같은
+                    // 이유로 매번 명시한다 — Page 키가 TOP으로 바꿔 놨을 수 있다).
+                    doc.pending_scroll_align = egui::Align::Center;
                     doc.pending_scroll_row = Some(match doc.sep {
                         SeparatorMode::None => logical,
                         SeparatorMode::Char(_) => {
@@ -5158,6 +5391,7 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
 
     // 찾기가 남긴 스크롤 요청(표 모드와 같은 이유·같은 방법 — render_table 주석 참조).
     let scroll_to = doc.pending_scroll_row.take();
+    let scroll_align = doc.pending_scroll_align;
 
     let editing = doc.edit.is_some();
     let total_lines = match &doc.edit {
@@ -5243,8 +5477,12 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
         .column(Column::initial(64.0).at_least(48.0).resizable(true)) // 라인번호 #
         .column(Column::remainder().at_least(200.0).resizable(true)); // 줄 전체
     if let Some(row) = scroll_to {
-        table = table.scroll_to_row(row, Some(egui::Align::Center));
+        table = table.scroll_to_row(row, Some(scroll_align));
     }
+
+    // 표 모드와 같은 통로 — Page Up/Down이 읽을 "화면 첫 행"을 관측한다.
+    // 텍스트 모드는 정렬 permutation이 없어 화면 행 = 논리 행이다.
+    let min_drawn_row: Cell<Option<usize>> = Cell::new(None);
 
     table
         .header(ROW_HEIGHT, |mut header| {
@@ -5265,6 +5503,9 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
         .body(|body| {
             body.rows(ROW_HEIGHT, total_lines, |mut row| {
                 let logical = row.index();
+                min_drawn_row.set(Some(
+                    min_drawn_row.get().map_or(logical, |m: usize| m.min(logical)),
+                ));
                 let line_no = logical + row_base;
                 row.col(|ui| {
                     let rect = ui.max_rect();
@@ -5477,6 +5718,14 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
         });
 
     // ---- 클로저 종료 → doc 가변 대여 가능 ----
+
+    // Page Up/Down이 읽을 관측값. 표 모드와 같은 이유로 아래 조기 반환보다
+    // **먼저** 기록한다 — 뷰 모드에서도 페이지 이동이 되어야 한다.
+    if let Some(first) = min_drawn_row.get() {
+        doc.first_visible_row = first;
+    }
+    doc.visible_rows = visible_row_count(avail_height);
+
     if !editing {
         return;
     }
@@ -10315,5 +10564,329 @@ mod tests {
         assert!(app.doc().unwrap().find_query.is_empty(), "새 탭은 빈 검색어로 시작");
         app.active = 0;
         assert_eq!(app.doc().unwrap().find_query, "alpha", "탭마다 검색어가 따로 산다");
+    }
+
+    // ---- Page Up / Page Down (J-2) ----
+
+    #[test]
+    fn page_down_target_row() {
+        // 첫 행 0, 한 화면 10행, 전체 100행 → 한 행 겹쳐 9로.
+        assert_eq!(page_target_row(PageDir::Down, 0, 10, 100), Some(9));
+        assert_eq!(page_target_row(PageDir::Down, 9, 10, 100), Some(18));
+        // 마지막 행 너머로 가지 않는다.
+        assert_eq!(page_target_row(PageDir::Down, 95, 10, 100), Some(99));
+        assert_eq!(page_target_row(PageDir::Down, 99, 10, 100), Some(99));
+        // 한 화면보다 작은 문서 — 끝까지만 간다.
+        assert_eq!(page_target_row(PageDir::Down, 0, 50, 3), Some(2));
+        // 행 0개면 갈 곳이 없다(스크롤 요청 자체를 만들지 않는다).
+        assert_eq!(page_target_row(PageDir::Down, 0, 10, 0), None);
+        // 창이 접혀 한 화면이 0/1행이어도 최소 한 행은 움직인다 —
+        // 그러지 않으면 키가 죽은 것처럼 보인다.
+        assert_eq!(page_target_row(PageDir::Down, 5, 0, 100), Some(6));
+        assert_eq!(page_target_row(PageDir::Down, 5, 1, 100), Some(6));
+    }
+
+    #[test]
+    fn page_up_target_row() {
+        assert_eq!(page_target_row(PageDir::Up, 18, 10, 100), Some(9));
+        assert_eq!(page_target_row(PageDir::Up, 9, 10, 100), Some(0));
+        // 맨 위에서 Page Up은 0에 머문다(0 밑으로 안 내려간다).
+        assert_eq!(page_target_row(PageDir::Up, 0, 10, 100), Some(0));
+        assert_eq!(page_target_row(PageDir::Up, 3, 10, 100), Some(0));
+        assert_eq!(page_target_row(PageDir::Up, 0, 10, 0), None);
+        assert_eq!(page_target_row(PageDir::Up, 5, 0, 100), Some(4));
+        // 첫 행이 문서 밖에 있어도(창 축소 등) 마지막 행으로 클램프된다.
+        assert_eq!(page_target_row(PageDir::Up, 500, 10, 3), Some(2));
+    }
+
+    /// Page Down 한 번 뒤 Page Up 한 번이면 되돌아온다 — 두 방향의 보폭이
+    /// 같아야(둘 다 `visible - 1`) 페이지를 넘겼다 되돌리는 동작이 제자리로
+    /// 온다. 한쪽만 겹침 규칙을 바꾸면 이 테스트가 깨진다.
+    #[test]
+    fn page_down_then_up_returns_to_the_same_row() {
+        let down = page_target_row(PageDir::Down, 30, 10, 1000).unwrap();
+        assert_eq!(page_target_row(PageDir::Up, down, 10, 1000), Some(30));
+    }
+
+    /// 겹침 한 행이 실제로 지켜지는가 — 다음 페이지의 첫 행은 이전 페이지의
+    /// **마지막 행**이다(문맥이 끊기지 않는다).
+    #[test]
+    fn page_down_overlaps_exactly_one_row() {
+        let visible = 20;
+        let first = 0;
+        let last_visible = first + visible - 1; // 지금 보이는 마지막 행
+        assert_eq!(
+            page_target_row(PageDir::Down, first, visible, 1000),
+            Some(last_visible),
+            "다음 페이지의 첫 행 = 지금 페이지의 마지막 행(한 행 겹침)"
+        );
+    }
+
+    /// 다른 위젯(찾기 입력란 등)이 포커스를 쥐고 있으면 Page 키는 양보한다.
+    /// **실제 게이트 함수**를 호출한다 — 가드 식을 테스트에 베끼면 실제
+    /// 가드를 뒤집어도 이 테스트는 자기 사본만 보고 통과한다.
+    #[test]
+    fn page_keys_yield_to_focused_widget() {
+        // 아무것도 막지 않은 기본 상태에서는 살아 있다.
+        assert!(page_keys_live(true, false, false, false, false));
+        // 포커스를 쥔 위젯이 있으면 죽는다.
+        assert!(
+            !page_keys_live(true, false, true, false, false),
+            "찾기 입력란에 타이핑 중이면 Page Down이 문서를 넘기면 안 된다"
+        );
+    }
+
+    /// 인라인 셀 편집 중에는 Page 키가 문서로 새지 않는다(TextEdit이 가져간다).
+    #[test]
+    fn page_keys_ignored_while_editing_cell() {
+        assert!(!page_keys_live(true, true, false, false, false));
+    }
+
+    /// 문서가 없거나 확인·저장 다이얼로그가 떠 있으면 양보한다
+    /// (`find_keys_live`와 같은 규율).
+    #[test]
+    fn page_keys_yield_to_dialogs_and_empty_app() {
+        assert!(!page_keys_live(false, false, false, false, false), "문서가 없으면 죽는다");
+        assert!(!page_keys_live(true, false, false, true, false), "확인 다이얼로그");
+        assert!(!page_keys_live(true, false, false, false, true), "저장 다이얼로그");
+    }
+
+    /// 게이트 어댑터가 실제 `App`/`Context` 상태를 제대로 읽는가.
+    /// `page_keys_live_for`가 인자를 잘못 조립하면(예: 포커스를 늘 false로
+    /// 넘기면) 순수 함수 테스트는 통과해도 이 테스트가 깨진다.
+    #[test]
+    fn page_keys_live_for_reads_real_state() {
+        let mut app = find_test_doc(&["a", "b"]);
+        let ctx = egui::Context::default();
+        assert!(page_keys_live_for(&app, &ctx), "기본 상태에서는 살아 있다");
+        app.doc_mut().unwrap().editing_cell = Some((0, 0));
+        assert!(!page_keys_live_for(&app, &ctx), "셀 편집 중이면 죽는다");
+        app.doc_mut().unwrap().editing_cell = None;
+        app.show_save_dialog = true;
+        assert!(!page_keys_live_for(&app, &ctx), "저장 다이얼로그가 떠 있으면 죽는다");
+        app.show_save_dialog = false;
+        // 실제 위젯에 포커스를 줘 본다 — `App`이 아니라 egui Context에서
+        // 읽어야 하는 유일한 인자다.
+        let id = egui::Id::new("page_focus_probe");
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut s = String::new();
+                let resp = ui.add(egui::TextEdit::singleline(&mut s).id(id));
+                resp.request_focus();
+            });
+        });
+        assert_eq!(ctx.memory(|m| m.focused()), Some(id), "사전 조건: 포커스가 잡혔다");
+        assert!(!page_keys_live_for(&app, &ctx), "다른 위젯이 포커스를 쥐면 죽는다");
+    }
+
+    /// 텍스트 모드: 페이지 이동이 화면 행(=논리 행) 기준으로 스크롤 요청을
+    /// 남기고 정렬을 TOP으로 지시한다.
+    #[test]
+    fn page_scroll_sets_pending_row_and_top_align_in_text_mode() {
+        let mut app = find_test_doc(&(0..100).map(|_| "x").collect::<Vec<_>>());
+        let doc = app.doc_mut().unwrap();
+        assert_eq!(doc.sep, SeparatorMode::None, "사전 조건: 텍스트 모드");
+        doc.first_visible_row = 0;
+        doc.visible_rows = 20;
+        apply_page_scroll(doc, PageDir::Down);
+        assert_eq!(doc.pending_scroll_row, Some(19), "한 행 겹쳐 19로");
+        assert_eq!(
+            doc.pending_scroll_align,
+            egui::Align::TOP,
+            "페이지 이동은 목표 행이 맨 위에 와야 다음 페이지가 이어진다"
+        );
+        // 렌더가 소비한 셈 치고 첫 행을 옮긴 뒤 Page Up.
+        doc.pending_scroll_row = None;
+        doc.first_visible_row = 19;
+        apply_page_scroll(doc, PageDir::Up);
+        assert_eq!(doc.pending_scroll_row, Some(0));
+    }
+
+    /// 표 모드: 마지막 행 클램프가 **헤더를 뺀** 데이터 행 수 기준이어야
+    /// 한다(`render_table`의 `data_rows`와 같은 값). 헤더를 안 빼면 Page Down이
+    /// 존재하지 않는 화면 행을 가리켜 마지막 행 하나가 안 보인다.
+    #[test]
+    fn page_scroll_clamps_to_data_rows_in_table_mode() {
+        // 헤더 1 + 데이터 9 = 논리 10행 → 화면 행은 0..=8.
+        let mut app = extract_test_app(b"h1,h2\n1,a\n2,b\n3,c\n4,d\n5,e\n6,f\n7,g\n8,h\n9,i\n");
+        let doc = app.doc_mut().unwrap();
+        assert!(doc.has_header, "사전 조건: 헤더가 감지된다");
+        assert_eq!(doc_line_count(doc), 10);
+        assert_eq!(doc_screen_row_count(doc), 9, "헤더는 본문 행이 아니다");
+        doc.first_visible_row = 0;
+        doc.visible_rows = 50; // 한 화면이 문서보다 크다.
+        apply_page_scroll(doc, PageDir::Down);
+        assert_eq!(
+            doc.pending_scroll_row,
+            Some(8),
+            "마지막 **화면** 행(=데이터 행 수 - 1)까지만 간다"
+        );
+        // 헤더가 없으면 논리 행 = 화면 행이다.
+        doc.has_header = false;
+        assert_eq!(doc_screen_row_count(doc), 10);
+    }
+
+    /// 빈 문서에서는 스크롤 요청을 만들지 않는다 — 갈 곳이 없는데 0을 남기면
+    /// 매 키 입력마다 무의미한 요청이 쌓인다.
+    #[test]
+    fn page_scroll_on_empty_doc_requests_nothing() {
+        let mut app = find_test_doc(&[]);
+        let doc = app.doc_mut().unwrap();
+        assert_eq!(doc_line_count(doc), 0);
+        doc.visible_rows = 20;
+        apply_page_scroll(doc, PageDir::Down);
+        assert_eq!(doc.pending_scroll_row, None);
+        apply_page_scroll(doc, PageDir::Up);
+        assert_eq!(doc.pending_scroll_row, None);
+    }
+
+    /// 회귀 방지: 페이지를 넘긴 뒤(정렬 TOP) 찾기를 하면 정렬이 다시
+    /// **Center**로 돌아와야 한다. `focus_match`가 정렬을 매번 명시하지 않고
+    /// 잔여 상태를 물려받으면, 페이지 한 번 넘긴 뒤의 Find Next가 조용히
+    /// 상단 정렬로 바뀐다.
+    #[test]
+    fn find_restores_center_align_after_paging() {
+        let mut app = find_test_doc(&["a", "b", "hit", "c"]);
+        let doc = app.doc_mut().unwrap();
+        doc.visible_rows = 2;
+        apply_page_scroll(doc, PageDir::Down);
+        assert_eq!(doc.pending_scroll_align, egui::Align::TOP, "사전 조건: TOP");
+        doc.find_query = "hit".to_owned();
+        apply_find_action(doc, FindAction::Next);
+        assert_eq!(
+            doc.pending_scroll_align,
+            egui::Align::Center,
+            "찾기는 언제나 매치를 화면 중앙에 둔다"
+        );
+        assert_eq!(doc.pending_scroll_row, Some(2));
+    }
+
+    /// 페이지 이동은 **캐럿을 옮기지 않는다**(요청은 "넘겨보기"뿐이다).
+    /// 편집 모드에서도 선택/캐럿이 그대로여야 한다.
+    #[test]
+    fn page_scroll_does_not_move_the_caret() {
+        let mut app = find_test_doc(&["a", "b", "c", "d", "e"]);
+        let doc = app.doc_mut().unwrap();
+        assert!(doc.edit.is_some(), "사전 조건: 편집 모드");
+        let caret = doc.text_caret;
+        let sel = doc.text_sel;
+        doc.visible_rows = 2;
+        apply_page_scroll(doc, PageDir::Down);
+        assert_eq!(doc.text_caret, caret, "캐럿은 그대로");
+        assert_eq!(doc.text_sel, sel, "선택도 그대로");
+        assert_eq!(doc.cell_sel, None, "표 모드 선택도 건드리지 않는다");
+    }
+
+    /// Page Down 키가 실제로 `consume_key`로 잡히고 `apply_page_scroll`까지
+    /// 이어지는가. `update()`가 `eframe::Frame`을 요구해 직접 부를 수 없으므로
+    /// 그 블록이 쓰는 **실제 게이트/적용 함수**를 그대로 태운다
+    /// (`ctrl_f_opens_find_panel`과 같은 규율).
+    #[test]
+    fn page_down_key_is_consumed_and_scrolls() {
+        let mut app = find_test_doc(&(0..100).map(|_| "x").collect::<Vec<_>>());
+        app.doc_mut().unwrap().visible_rows = 20;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::PageDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(input, |ctx| {
+            assert!(page_keys_live_for(&app, ctx), "사전 조건: Page 키가 살아 있다");
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown)) {
+                apply_page_scroll(app.doc_mut().unwrap(), PageDir::Down);
+            }
+        });
+        assert_eq!(
+            app.doc().unwrap().pending_scroll_row,
+            Some(19),
+            "Page Down 키가 실제로 소비되어 페이지 이동이 일어난다"
+        );
+    }
+
+    /// **관측 자체**가 실제로 일어나는가. Page Up/Down은 렌더가
+    /// `first_visible_row`/`visible_rows`를 기록해 준다는 전제 위에 서 있는데,
+    /// 순수 함수 테스트는 그 전제를 확인하지 못한다(기록 코드를 통째로 지워도
+    /// 다 통과한다). 그래서 진짜 egui 프레임에서 `render_text`를 돌려
+    /// 두 필드가 채워지는지 본다.
+    ///
+    /// 스크롤 요청을 남긴 뒤 렌더하면 그 행이 화면 맨 위로 오므로
+    /// (`scroll_to_row` + `Align::TOP`), 다음 프레임의 `first_visible_row`가
+    /// 그 언저리로 따라와야 한다 — "요청 → 스크롤 → 관측"이 한 바퀴 도는지를
+    /// 이 한 테스트가 고정한다.
+    #[test]
+    fn render_records_first_visible_row_and_page_size() {
+        let mut app = find_test_doc(&(0..500).map(|_| "x").collect::<Vec<_>>());
+        let ctx = egui::Context::default();
+        let mut clip = String::new();
+        // egui 기본 화면은 매우 커서 500행이 거의 다 들어간다 — 그러면
+        // 페이지 이동이 몇 행 못 움직여 관측이 끊겼는지 알 수 없다.
+        // 창을 작게 잡아 한 화면이 문서보다 훨씬 작게 만든다.
+        let mut input = egui::RawInput::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        input.screen_rect = Some(screen);
+        let draw = |app: &mut App, clip: &mut String| {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_text(ui, app.doc_mut().unwrap(), 0, clip);
+                });
+            });
+        };
+        draw(&mut app, &mut clip);
+        {
+            let doc = app.doc().unwrap();
+            assert_eq!(doc.first_visible_row, 0, "처음에는 맨 위를 보고 있다");
+            assert!(
+                doc.visible_rows > 0 && doc.visible_rows < 100,
+                "작은 창의 한 화면 행 수가 기록되어야 한다(got {})",
+                doc.visible_rows
+            );
+        }
+        // 페이지를 넘긴다 → 다음 프레임에 스크롤이 일어나고, 그다음 프레임의
+        // 관측값이 따라와야 한다.
+        let target = {
+            let doc = app.doc_mut().unwrap();
+            apply_page_scroll(doc, PageDir::Down);
+            doc.pending_scroll_row.unwrap()
+        };
+        assert!(target > 0, "사전 조건: 실제로 움직일 목표가 생겼다");
+        // 요청 소비 → 스크롤 → 옮겨진 자리에서 재관측. egui의 스크롤은 한
+        // 프레임에 끝나지 않고 부드럽게(`stable_dt` 기준) 수렴하므로 여유를
+        // 준다 — 프레임 수 자체는 이 테스트의 관심사가 아니다.
+        for _ in 0..40 {
+            draw(&mut app, &mut clip);
+        }
+        let doc = app.doc().unwrap();
+        assert_eq!(
+            doc.pending_scroll_row, None,
+            "렌더가 스크롤 요청을 소비한다"
+        );
+        // `Align::TOP`은 목표 행의 **위 경계**를 화면 위에 맞추는데,
+        // `body.rows`는 위쪽에 걸친 행까지 그리므로 관측되는 첫 행은
+        // `target` 또는 `target - 1`이다. 어느 쪽이든 "페이지가 실제로
+        // 넘어갔고 렌더가 그 자리를 관측했다"는 성질은 같으므로 그 범위로
+        // 고정한다(픽셀 반올림에 테스트를 묶지 않는다).
+        assert!(
+            doc.first_visible_row + 1 >= target && doc.first_visible_row <= target,
+            "페이지를 넘긴 뒤 화면 첫 행이 목표 근처여야 한다 \
+             (first_visible_row={}, target={target})",
+            doc.first_visible_row
+        );
+    }
+
+    /// 한 화면 행 수는 **헤더 한 줄을 뺀** 본문 높이로 구한다 — 안 빼면
+    /// Page Down이 매번 한 행씩 더 건너뛰어 그 행이 조용히 안 읽힌다.
+    #[test]
+    fn visible_row_count_excludes_the_header_row() {
+        // 헤더 1줄 + 본문 10줄.
+        assert_eq!(visible_row_count(ROW_HEIGHT * 11.0), 10);
+        // 헤더만 들어가는 높이면 본문 0행.
+        assert_eq!(visible_row_count(ROW_HEIGHT), 0);
+        assert_eq!(visible_row_count(0.0), 0);
+        // 음수(창이 접힌 극단)에서도 패닉하지 않는다.
+        assert_eq!(visible_row_count(-100.0), 0);
     }
 }
