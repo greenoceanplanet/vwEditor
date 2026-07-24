@@ -84,6 +84,16 @@ pub struct Document {
     /// 준다 — 매 프레임 `request_focus()`를 부르면 다른 위젯을 클릭해도
     /// 포커스가 즉시 되돌아와 아무것도 조작할 수 없게 된다.
     pub find_focus_pending: bool,
+    /// 스크롤 마커용: 검색어가 있는 논리 행 번호(전체 문서). 마커만 이걸 쓴다.
+    /// 전체 매치 하이라이트는 보이는 행만 즉석 계산하므로 이 목록을 쓰지 않는다.
+    /// (읽는 쪽은 다음 태스크의 스크롤 마커 거터 렌더다.)
+    #[allow(dead_code)]
+    pub match_rows: Vec<u32>,
+    /// `match_rows`가 어떤 (검색어, 옵션)으로 만들어졌는지. 현재 find_query/
+    /// find_opts와 다르거나 None이면 재스캔(다음 태스크의 렌더 루프가 판단).
+    /// 편집/정렬/바꾸기/undo로 버퍼가 바뀌면 `invalidate_match_scan`이 None으로
+    /// 지운다.
+    pub match_query: Option<(String, crate::find::FindOptions)>,
     /// 찾은 매치가 보이도록 스크롤할 화면 행 번호. 본문 렌더가 소비한다.
     ///
     /// **왜 그 자리에서 곧바로 스크롤하지 않는가.** 본문은 `TableBuilder`
@@ -361,8 +371,8 @@ impl App {
             text_caret: crate::edit::TextPos { line: 0, col: 0 },
             text_drag_active: false,
             pending_column_op: None,
-            // 찾기 상태 초기값. `FindOptions`에 `Default`를 derive해 두어
-            // (match_case: false, whole_word: false) 여기가 옵션 기본값을
+            // 찾기 상태 초기값. `FindOptions`가 `Default`를 구현해 두어
+            // (match_case: false, scope: Partial) 여기가 옵션 기본값을
             // 반복해 적지 않는다. `Document` 생성 헬퍼를 따로 두지 않은 이유:
             // 지금 생성 지점은 여기 한 곳뿐이고, 헬퍼를 두면 필드를 추가할 때
             // "구조체 리터럴이 컴파일 에러로 빠진 필드를 알려 준다"는 안전망이
@@ -375,6 +385,8 @@ impl App {
             last_match: None,
             find_status: String::new(),
             find_focus_pending: false,
+            match_rows: Vec::new(),
+            match_query: None,
             pending_scroll_row: None,
         });
     }
@@ -1327,6 +1339,9 @@ fn undo_once(doc: &mut Document) {
         return;
     }
     e.dirty = true;
+    // 버퍼가 되돌려졌으니 스크롤 마커 스캔 캐시도 무효화한다.
+    invalidate_match_scan(doc);
+    let Some(e) = doc.edit.as_mut() else { return };
     let len = e.lines.len();
     // 표 모드 상태: 되돌리기로 행이 줄면 낡은 인덱스가 남는다.
     doc.editing_cell = None;
@@ -1376,6 +1391,22 @@ fn doc_line_count(doc: &Document) -> usize {
         Some(e) => e.lines.len(),
         None => doc.index.line_count(),
     }
+}
+
+/// 찾기의 Whole cell 판정에 넘길 구분자. 표 모드면 `Some(delim)`, 텍스트
+/// 모드면 `None`(그 경우 Whole cell은 "행 전체 일치"로 해석된다).
+fn doc_delimiter(doc: &Document) -> Option<u8> {
+    match doc.sep {
+        SeparatorMode::Char(d) => Some(d),
+        SeparatorMode::None => None,
+    }
+}
+
+/// 버퍼/내용이 바뀌었을 때 스크롤 마커 스캔 캐시를 무효화한다. `match_query`를
+/// None으로 지우면 다음 렌더 프레임(다음 태스크)이 재스캔하게 된다. 편집/정렬/
+/// 바꾸기/undo 등 버퍼를 바꾸는 지점마다 `e.dirty = true`와 함께 부른다.
+fn invalidate_match_scan(doc: &mut Document) {
+    doc.match_query = None;
 }
 
 /// 다음/이전 찾기의 기준 위치. 마지막으로 찾은 자리가 있으면 거기서,
@@ -1563,12 +1594,145 @@ fn search_from(
     forward: bool,
 ) -> Option<crate::find::Match> {
     let n = doc_line_count(doc);
+    let delim = doc_delimiter(doc);
     let get_line = |i: usize| logical_line(doc, i);
     if forward {
-        crate::find::find_next(n, from, &doc.find_query, &doc.find_opts, get_line)
+        crate::find::find_next(n, from, &doc.find_query, &doc.find_opts, delim, get_line)
     } else {
-        crate::find::find_prev(n, from, &doc.find_query, &doc.find_opts, get_line)
+        crate::find::find_prev(n, from, &doc.find_query, &doc.find_opts, delim, get_line)
     }
+}
+
+/// 문서 전체에서 `find_query`가 있는 논리 행 번호를 모은다(스크롤 마커용).
+/// 비싸므로(최악 0.85초/2GB) 호출부가 query/opts 변경 시에만 부른다. query가
+/// 비면 빈 Vec. 결과는 **항상 `matching_lines` 브루트포스와 같은 행 집합**이다 —
+/// memmem 프리필터는 후보를 좁힐 뿐이고, 최종 판정은 `find_in_line_scoped`가 한다.
+///
+/// **설계 S-3의 (나) 방식.** `find.rs`는 mmap/Source를 모르므로, 벤치가 증명한
+/// "파일 전체 memmem + offset 이진탐색" 최적화는 여기(app.rs)에서 한다.
+///
+/// **ignore_case 프리필터 판단(중요).** memmem은 대소문자를 구분한다.
+/// - **match_case=true**: 원본 바이트에 그대로 memmem(벤치의 빠른 경로).
+/// - **match_case=false**: needle을 소문자로 접고 hay도 소문자로 접어 비교해야
+///   `"Ab"` 같은 **혼합 대소문자**를 놓치지 않는다. "needle 대문자/소문자 두 벌을
+///   memmem" 방식은 혼합 케이스(`ab`↔`Ab`)를 놓쳐 **위음성**이 생기므로 채택하지
+///   않았다(프리필터가 실제 매치를 버리면 브루트포스와 결과가 달라진다).
+///   대신 ignore_case에서는 memmem 바이트 프리필터를 건너뛰고 **행 단위**
+///   `find_in_line_scoped`로 판정한다(느리지만 정확). 편집 모드는 행이 이미
+///   RAM에 있으니 그대로 순회하고, 뷰 모드는 `logical_line`으로 행을 디코딩해
+///   순회한다 — 둘 다 `matching_lines`와 동일한 판정 경로다.
+///
+/// 요약: ignore_case의 정확성을 위해 프리필터를 포기했고, 그 대가는 흔치 않은
+/// "대소문자 무시 + 초대형 파일" 조합에서의 스캔 속도뿐이다. match_case 스캔은
+/// 벤치가 증명한 빠른 경로를 그대로 쓴다.
+///
+/// (호출부는 다음 태스크의 렌더 루프다 — 여기서는 구현·테스트만 한다.)
+#[allow(dead_code)]
+fn scan_all_matches(doc: &Document) -> Vec<u32> {
+    let query = &doc.find_query;
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let opts = &doc.find_opts;
+    let delim = doc_delimiter(doc);
+
+    match &doc.edit {
+        // ---- 편집 모드: EditBuffer.lines 순회 ----
+        Some(e) => {
+            let finder = (opts.match_case).then(|| memchr::memmem::Finder::new(query.as_bytes()));
+            let mut out = Vec::new();
+            for (i, line) in e.lines.iter().enumerate() {
+                // match_case면 memmem으로 후보를 먼저 거른다(정확성은 scoped가 보장).
+                // ignore_case면 프리필터 없이 바로 scoped(위 주석의 이유).
+                if let Some(f) = &finder {
+                    if f.find(line.as_bytes()).is_none() {
+                        continue;
+                    }
+                }
+                if !crate::find::find_in_line_scoped(line, query, opts, delim).is_empty() {
+                    out.push(i as u32);
+                }
+            }
+            out
+        }
+        // ---- 뷰 모드: mmap 바이트 전체 memmem + offset 이진탐색 ----
+        None => {
+            if opts.match_case {
+                scan_view_memmem(doc, query, opts, delim)
+            } else {
+                // ignore_case: 행 단위 폴백(프리필터 위음성 방지).
+                let n = doc.index.line_count();
+                let mut out = Vec::new();
+                for i in 0..n {
+                    let Some(text) = logical_line(doc, i) else { continue };
+                    if !crate::find::find_in_line_scoped(&text, query, opts, delim).is_empty() {
+                        out.push(i as u32);
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+/// 뷰 모드 + match_case의 빠른 경로. 파일 바이트 전체에 memmem을 돌려 히트
+/// offset을 얻고, 인덱스 snapshot의 offset 배열에 이진탐색해 행 번호로 바꾼다.
+/// 같은 행에 여러 히트가 연속으로 나오면 한 번만 담는다. 그 후보 행만
+/// `find_in_line_scoped`로 정밀 판정한다(whole_word/cell·인코딩 정합성).
+#[allow(dead_code)]
+fn scan_view_memmem(
+    doc: &Document,
+    query: &str,
+    opts: &crate::find::FindOptions,
+    delim: Option<u8>,
+) -> Vec<u32> {
+    let (offsets, total_bytes) = doc.index.snapshot();
+    if offsets.is_empty() {
+        return Vec::new();
+    }
+    let bytes = doc.source.as_bytes();
+    // needle을 **문서 인코딩**으로 인코딩해 memmem을 돌린다. UTF-8 바이트를 그대로
+    // 쓰면 CP949/UTF-16 파일에서는 needle 바이트가 파일에 나타나지 않아 프리필터가
+    // 모든 행을 놓친다(위음성). ASCII needle은 UTF-8/CP949에서 같은 바이트라
+    // 이 인코딩이 무해하고, 비ASCII는 반드시 필요하다. 정밀 판정은 어차피
+    // 디코딩 후 `find_in_line_scoped`가 하므로 프리필터의 위양성은 안전하다.
+    let needle_bytes = crate::save::encode_bytes(query, doc.enc);
+    if needle_bytes.is_empty() {
+        return Vec::new();
+    }
+    let finder = memchr::memmem::Finder::new(&needle_bytes);
+    let mut out = Vec::new();
+    let mut last_row: Option<u32> = None;
+    for hit in finder.find_iter(bytes) {
+        // hit(바이트 offset)이 속한 행 = offset이 hit 이하인 마지막 줄 시작.
+        // partition_point는 "off <= hit"인 원소 개수를 주므로 -1이 그 행이다.
+        let row = offsets.partition_point(|&off| off <= hit as u64).saturating_sub(1);
+        let row_u32 = row as u32;
+        // 연속 히트가 같은 행이면 건너뛴다(정밀 판정도 한 번만 하게).
+        if last_row == Some(row_u32) {
+            continue;
+        }
+        last_row = Some(row_u32);
+        // 정밀 판정: 인코딩 디코딩 + whole_word/cell을 실제로 확인한다.
+        // (memmem은 원바이트 부분 일치라 CP949 등에서 위양성이 있을 수 있고,
+        //  whole_word/cell은 memmem이 판정하지 못한다.)
+        let Some((s, en)) = crate::index::LineIndex::range_in(&offsets, total_bytes, row) else {
+            continue;
+        };
+        // `decode_logical_line`과 **완전히 같은** 방법으로 디코딩·개행 제거해야
+        // 정밀 판정이 `matching_lines`(= logical_line 경유)와 어긋나지 않는다:
+        // 전체 슬라이스를 디코딩한 뒤 뒤쪽 `\r`/`\n`을 모두 trim한다.
+        let text = crate::parse::decode_line(doc.source.slice(s, en), doc.enc)
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+        if !crate::find::find_in_line_scoped(&text, query, opts, delim).is_empty() {
+            out.push(row_u32);
+        }
+    }
+    // find_iter는 offset 오름차순이라 out도 행 오름차순이지만, 연속 중복만
+    // 걸렀으므로 비연속으로 같은 행이 다시 나올 일은 없다(offset이 단조 증가하고
+    // 한 행의 바이트 범위는 연속이므로 같은 행 히트는 반드시 인접한다).
+    out
 }
 
 /// 현재 매치 한 곳을 치환하고 다음 매치로 옮긴다. 현재 매치가 없으면
@@ -1580,9 +1744,10 @@ fn replace_one(doc: &mut Document) {
     }
     // 치환 대상 = 지금 선택돼 있는 매치. 그게 정말 지금도 매치인지 다시
     // 확인한다(편집·되돌리기로 그 자리 글자가 바뀌었을 수 있다).
+    let delim = doc_delimiter(doc);
     let target = doc.last_match.filter(|m| {
         logical_line(doc, m.line).is_some_and(|text| {
-            crate::find::find_in_line(&text, &doc.find_query, &doc.find_opts)
+            crate::find::find_in_line_scoped(&text, &doc.find_query, &doc.find_opts, delim)
                 .iter()
                 .any(|&(c, l)| c == m.col && l == m.len)
         })
@@ -1630,6 +1795,10 @@ fn replace_one(doc: &mut Document) {
         e.lines[m.line] = new;
         e.dirty = true;
     }
+    if changed {
+        // 버퍼가 바뀌었으니 스크롤 마커 스캔 캐시를 무효화한다.
+        invalidate_match_scan(doc);
+    }
     // 다음 매치로. 치환문 길이만큼 자리가 밀렸으므로 치환 **끝** 자리를
     // 기준으로 삼아야 방금 넣은 글자를 다시 잡지 않는다(치환문이 검색어를
     // 포함하는 경우 — "a" → "aa" — 무한 제자리걸음이 된다). 변경이 없었어도
@@ -1671,8 +1840,9 @@ fn replace_all_in_doc(doc: &mut Document) {
     let query = doc.find_query.clone();
     let rep = doc.replace_text.clone();
     let opts = doc.find_opts.clone();
+    let delim = doc_delimiter(doc);
     let Some(e) = doc.edit.as_mut() else { return };
-    let (changed, total) = crate::find::replace_all(&e.lines, &query, &rep, &opts);
+    let (changed, total) = crate::find::replace_all(&e.lines, &query, &rep, &opts, delim);
     if total == 0 {
         doc.find_status = "Not found".to_owned();
         doc.last_match = None;
@@ -1707,6 +1877,8 @@ fn replace_all_in_doc(doc: &mut Document) {
         e.lines[i] = text;
     }
     e.dirty = true;
+    // 버퍼가 바뀌었으므로 스크롤 마커 스캔 캐시를 무효화한다(다음 프레임 재스캔).
+    invalidate_match_scan(doc);
     // 치환이 끝나면 이전 매치 위치는 의미가 없다(그 자리 글자가 바뀌었다).
     doc.last_match = None;
     // 그래머: 1개면 단수, 그 외(0 포함)는 복수(Minor 4, replace_one과 일관).
@@ -1866,6 +2038,8 @@ fn build_extracted_doc(
         last_match: None,
         find_status: String::new(),
         find_focus_pending: false,
+        match_rows: Vec::new(),
+        match_query: None,
         pending_scroll_row: None,
     }
 }
@@ -1956,6 +2130,7 @@ impl App {
             total.saturating_sub(plan.scan_from),
             &doc.find_query,
             &doc.find_opts,
+            doc_delimiter(doc),
             |i| logical_line(doc, i + plan.scan_from),
         )
         .into_iter()
@@ -2090,7 +2265,17 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
             // 이어진다"처럼 기준이 뒤섞인다.
             let before = doc.find_opts.clone();
             ui.checkbox(&mut doc.find_opts.match_case, "Match case");
-            ui.checkbox(&mut doc.find_opts.whole_word, "Whole word");
+            // 3지 라디오(Partial/WholeWord/WholeCell) UI는 다음 태스크(S-8)다.
+            // 여기서는 기존 "Whole word" 체크박스 동작만 새 `scope`로 이관해
+            // 컴파일과 기존 거동을 유지한다 — 켜면 WholeWord, 끄면 Partial.
+            let mut whole_word = doc.find_opts.scope == crate::find::MatchScope::WholeWord;
+            if ui.checkbox(&mut whole_word, "Whole word").changed() {
+                doc.find_opts.scope = if whole_word {
+                    crate::find::MatchScope::WholeWord
+                } else {
+                    crate::find::MatchScope::Partial
+                };
+            }
             if doc.find_opts != before {
                 doc.last_match = None;
                 doc.find_status.clear();
@@ -2680,6 +2865,8 @@ fn apply_edit_sort(doc: &mut Document, specs: &[SortSpec], delim: u8, data_start
     // 편집 모드 정렬은 permutation이 남지 않는다(이미 lines에 반영됨).
     doc.sort = None;
     doc.sort_job = None;
+    // 행 순서가 바뀌었으니 스크롤 마커 스캔 캐시를 무효화한다.
+    invalidate_match_scan(doc);
 }
 
 /// 툴바의 정렬 컨트롤. 컬럼이 선택돼 있고 인덱싱이 완료(Phase::Complete)일 때만
@@ -3426,6 +3613,8 @@ fn commit_editing_cell(doc: &mut Document, delim: u8) {
     e.undo
         .push(crate::edit::EditOp::Replace(vec![(lrow, before)]));
     e.dirty = true;
+    // 셀 값이 바뀌었으니 스크롤 마커 스캔 캐시를 무효화한다.
+    invalidate_match_scan(doc);
 }
 
 /// [r0..=r1] 범위 각 행의 **현재** 전체 텍스트를 `EditOp::Replace`로 만든다.
@@ -3631,6 +3820,12 @@ fn apply_cell_menu_action_confirmed(
             doc.cell_sel = Some((r, c0, r, c1));
             doc.editing_cell = None;
         }
+    }
+
+    // Copy만 버퍼를 바꾸지 않는다. 그 외 셀 메뉴 동작은 버퍼를 바꿀 수 있으므로
+    // 스크롤 마커 스캔 캐시를 무효화한다(no-op였어도 재스캔 결과는 같다).
+    if act != CellMenuAction::Copy {
+        invalidate_match_scan(doc);
     }
 }
 
@@ -4439,6 +4634,13 @@ fn apply_text_intent(
                 e.undo.push(op);
             }
         }
+    }
+
+    // 버퍼를 바꾸는 인텐트였으면 스크롤 마커 스캔 캐시를 무효화한다(다음 프레임
+    // 재스캔). no-op였어도 재스캔 결과가 같을 뿐이라 정확성에는 문제가 없고,
+    // 무효화는 mutating 인텐트에만 걸리므로 매 커서 이동에 재스캔이 돌지 않는다.
+    if mutating {
+        invalidate_match_scan(doc);
     }
 }
 
@@ -6552,6 +6754,163 @@ mod tests {
         assert!(doc.edit.is_none(), "뷰 모드에서 버퍼가 생기지 않는다");
     }
 
+    // ---- scan_all_matches (E1-5) ----
+
+    /// 뷰 모드 인메모리 문서를 만드는 헬퍼(`build_extracted_doc` 재사용).
+    fn scan_view_doc(lines: &[&str], enc: Encoding, sep: SeparatorMode) -> Document {
+        let has_header = false;
+        let owned: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        build_extracted_doc(
+            &owned,
+            enc,
+            sep,
+            has_header,
+            crate::edit::Newline::Lf,
+            "scan-test".to_owned(),
+        )
+    }
+
+    /// `scan_all_matches`의 결과를 `matching_lines` 브루트포스와 같은 행 집합으로
+    /// 비교하는 공통 검사. 두 경로가 반드시 일치해야 한다.
+    fn assert_scan_equals_brute(doc: &Document) {
+        let got = scan_all_matches(doc);
+        let n = doc_line_count(doc);
+        let delim = doc_delimiter(doc);
+        let brute: Vec<u32> = crate::find::matching_lines(
+            n,
+            &doc.find_query,
+            &doc.find_opts,
+            delim,
+            |i| logical_line(doc, i),
+        )
+        .into_iter()
+        .map(|i| i as u32)
+        .collect();
+        assert_eq!(got, brute, "scan_all_matches가 브루트포스와 다르다");
+    }
+
+    #[test]
+    fn scan_all_matches_view_mode_matches_brute_force() {
+        // UTF-8, Partial/WholeWord/WholeCell + CP949 인코딩을 두루 확인한다.
+        let cases: &[(&[&str], Encoding, SeparatorMode)] = &[
+            (&["a,b,c", "hit,x", "y,hit", "no"], Encoding::Utf8, SeparatorMode::Char(b',')),
+            (&["가,나", "다,가", "가나,x"], Encoding::Cp949, SeparatorMode::Char(b',')),
+            (&["The quick", "brown hit", "hit the fox"], Encoding::Utf8, SeparatorMode::None),
+        ];
+        let scopes = [
+            crate::find::MatchScope::Partial,
+            crate::find::MatchScope::WholeWord,
+            crate::find::MatchScope::WholeCell,
+        ];
+        for (lines, enc, sep) in cases {
+            for needle in ["hit", "가", "가나", "the"] {
+                for &scope in &scopes {
+                    for match_case in [true, false] {
+                        let mut doc = scan_view_doc(lines, *enc, *sep);
+                        doc.find_query = needle.to_owned();
+                        doc.find_opts = crate::find::FindOptions { match_case, scope };
+                        assert_scan_equals_brute(&doc);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scan_all_matches_edit_mode() {
+        // 편집 버퍼 순회 경로. 여러 scope로 브루트포스와 일치하는지.
+        let (mut app, _d) = edit_doc(b"a,b\nhit,x\ny,hit\nno,no\n", false);
+        let doc = app.doc_mut().unwrap();
+        for needle in ["hit", "b"] {
+            for scope in [
+                crate::find::MatchScope::Partial,
+                crate::find::MatchScope::WholeWord,
+                crate::find::MatchScope::WholeCell,
+            ] {
+                for match_case in [true, false] {
+                    doc.find_query = needle.to_owned();
+                    doc.find_opts = crate::find::FindOptions { match_case, scope };
+                    assert_scan_equals_brute(doc);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scan_ignore_case_matches_brute_force() {
+        // ignore_case에서 프리필터가 무엇을 거르든 최종 결과 == 브루트포스.
+        // ASCII needle과 비ASCII(한글) needle 둘 다, 뷰/편집 모드 모두.
+        // 혼합 대소문자("Ab")를 프리필터가 놓치지 않는지가 핵심이다.
+        let lines: &[&str] = &["Ab", "aB", "AB", "ab", "가나", "가나다"];
+        let mut view = scan_view_doc(lines, Encoding::Utf8, SeparatorMode::None);
+        for needle in ["ab", "가나"] {
+            view.find_query = needle.to_owned();
+            view.find_opts = crate::find::FindOptions {
+                match_case: false,
+                scope: crate::find::MatchScope::Partial,
+            };
+            assert_scan_equals_brute(&view);
+        }
+        // 편집 모드도 같은 데이터로.
+        let (mut app, _d) = edit_doc(b"Ab\naB\nAB\nab\n\xea\xb0\x80\xeb\x82\x98\n", false);
+        let doc = app.doc_mut().unwrap();
+        doc.sep = SeparatorMode::None;
+        for needle in ["ab", "가나"] {
+            doc.find_query = needle.to_owned();
+            doc.find_opts = crate::find::FindOptions {
+                match_case: false,
+                scope: crate::find::MatchScope::Partial,
+            };
+            assert_scan_equals_brute(doc);
+        }
+    }
+
+    #[test]
+    fn scan_whole_cell_excludes_partial_rows() {
+        // WholeCell 스캔은 부분 매치 행(셀 전체가 아닌 행)을 뺀다.
+        // "hit,x"(셀 0 = hit) 매치, "hitting,y"(부분)는 제외.
+        let mut doc = scan_view_doc(
+            &["hit,x", "hitting,y", "z,hit"],
+            Encoding::Utf8,
+            SeparatorMode::Char(b','),
+        );
+        doc.find_query = "hit".to_owned();
+        doc.find_opts = crate::find::FindOptions {
+            match_case: true,
+            scope: crate::find::MatchScope::WholeCell,
+        };
+        assert_eq!(scan_all_matches(&doc), vec![0, 2], "부분 매치 행은 빠진다");
+        assert_scan_equals_brute(&doc);
+    }
+
+    #[test]
+    fn scan_empty_query_is_empty() {
+        let doc = scan_view_doc(&["a", "b"], Encoding::Utf8, SeparatorMode::None);
+        // find_query가 비어 있으면 빈 Vec.
+        assert!(scan_all_matches(&doc).is_empty());
+    }
+
+    #[test]
+    fn edit_invalidates_match_query() {
+        // 버퍼를 바꾸는 경로에서 match_query가 None이 되는지(재스캔 트리거).
+        // 셀 편집과 정렬 두 경로를 확인한다.
+        let (mut app, delim) = edit_doc(b"h,v\nCharlie,3\nAlice,1\n", true);
+        let doc = app.doc_mut().unwrap();
+        // 캐시가 채워진 것처럼 흉내낸다.
+        doc.match_query = Some(("h".to_owned(), crate::find::FindOptions::default()));
+        // 셀 편집 커밋 → 무효화.
+        doc.editing_cell = Some((1, 0));
+        doc.cell_edit_text = "X".into();
+        commit_editing_cell(doc, delim);
+        assert!(doc.match_query.is_none(), "셀 편집이 match_query를 무효화");
+
+        // 정렬 경로도.
+        doc.match_query = Some(("h".to_owned(), crate::find::FindOptions::default()));
+        let spec = SortSpec { col: 0, kind: SortKind::Text, dir: SortDir::Asc, ci: true };
+        apply_edit_sort(doc, &[spec], delim, 1);
+        assert!(doc.match_query.is_none(), "정렬이 match_query를 무효화");
+    }
+
     /// 뷰 모드에서도 찾기 자체는 된다(mmap + 인덱스 경로).
     #[test]
     fn find_works_in_view_mode() {
@@ -6664,7 +7023,10 @@ mod tests {
         // open_path가 넣는 기본값.
         assert_eq!(
             doc.find_opts,
-            crate::find::FindOptions { match_case: false, whole_word: false }
+            crate::find::FindOptions {
+                match_case: false,
+                scope: crate::find::MatchScope::Partial
+            }
         );
         assert!(!doc.show_find && doc.find_query.is_empty() && doc.last_match.is_none());
         doc.find_query = "hit".to_owned();
@@ -7410,7 +7772,7 @@ mod tests {
             "대소문자 구분이 켜지면 HIT는 빠진다"
         );
         app.active = 0;
-        app.doc_mut().unwrap().find_opts.whole_word = true;
+        app.doc_mut().unwrap().find_opts.scope = crate::find::MatchScope::WholeWord;
         app.extract_matching_rows();
         assert_eq!(
             read_all(&app.docs[2]),

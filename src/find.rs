@@ -7,13 +7,33 @@
 
 use crate::edit::TextPos;
 
+/// 매치 범위. 서로 배타적(UI에서 라디오 3지). 기존 `whole_word: bool`을
+/// 대체한다 — `false`는 `Partial`, `true`는 `WholeWord`에 대응하고, 여기에
+/// 셀 전체 일치(`WholeCell`)를 더했다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchScope {
+    /// 부분 일치(기본). 행 어디든 needle이 나오면 매치.
+    Partial,
+    /// 단어 단위. 매치 앞뒤가 단어 문자가 아닐 때만.
+    WholeWord,
+    /// 셀 전체 일치. 셀(필드) 전체가 needle과 정확히 같을 때만. 표 모드에서만
+    /// 의미가 있고, 텍스트 모드(delim==None)에서는 "행 전체 일치"로 해석한다.
+    WholeCell,
+}
+
 /// 찾기 옵션.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindOptions {
     /// 대소문자 구분.
     pub match_case: bool,
-    /// 단어 단위로만 일치.
-    pub whole_word: bool,
+    /// 매치 범위(부분/단어/셀).
+    pub scope: MatchScope,
+}
+
+impl Default for FindOptions {
+    fn default() -> Self {
+        FindOptions { match_case: false, scope: MatchScope::Partial }
+    }
 }
 
 /// 한 행 안에서 찾은 위치. col은 **문자(char) 인덱스** — 이 코드베이스의
@@ -102,7 +122,7 @@ pub fn find_in_line(hay: &str, needle: &str, opts: &FindOptions) -> Vec<(usize, 
             i += 1;
             continue;
         }
-        if opts.whole_word {
+        if opts.scope == MatchScope::WholeWord {
             let before_ok = start == 0 || !is_word_char(hay_chars[start - 1]);
             let after_ok = end >= hay_len || !is_word_char(hay_chars[end]);
             if !(before_ok && after_ok) {
@@ -116,6 +136,86 @@ pub fn find_in_line(hay: &str, needle: &str, opts: &FindOptions) -> Vec<(usize, 
         i += n.len();
     }
     out
+}
+
+/// 대소문자 규칙을 적용해 두 문자열이 **전체**로 같은지 비교한다. `match_case`면
+/// 그대로 `==`, 아니면 양쪽 `to_lowercase()`. Whole cell 판정은 부분 일치가
+/// 아니라 셀 전체가 needle과 정확히 같은지를 보므로 이 한 줄로 충분하다.
+fn eq_scoped(a: &str, b: &str, match_case: bool) -> bool {
+    if match_case {
+        a == b
+    } else {
+        a.to_lowercase() == b.to_lowercase()
+    }
+}
+
+/// 한 행에서 needle이 나오는 (col, len)들(char 인덱스). scope에 따라:
+///
+/// - `Partial`/`WholeWord`: `find_in_line`에 그대로 위임한다(delim은 무시).
+/// - `WholeCell` + `delim == Some(d)`: `d`로 셀을 나눠 **셀 전체가 needle과
+///   정확히 같은** 셀만 (그 셀의 char 시작 인덱스, 셀 char 길이)로 돌려준다.
+/// - `WholeCell` + `delim == None`: 행 전체가 needle과 같으면 `(0, char_len)`
+///   하나, 아니면 빈 결과("행 전체 일치"로 해석).
+///
+/// **따옴표 처리와 표시 정합성(설계 판단).** 셀 경계는 `parse::field_slice`로
+/// 얻는다 — `split_fields`(csv_core)와 필드 개수·경계가 정확히 일치함이
+/// `parse.rs`의 전수 테스트로 보장된다. 그런데 두 함수의 "값"은 다르다:
+/// `field_slice`는 바깥 따옴표를 **포함한** 원본 슬라이스를 주고,
+/// `split_fields`는 화면에 표시되는 값(따옴표 벗김, `""`→`"`)을 준다.
+/// - **비교**는 사용자가 화면에서 보는 값과 맞아야 하므로 `split_fields`가 주는
+///   표시 값으로 한다(따옴표 안 `bb`를 needle `bb`가 잡는다).
+/// - **반환 range**는 `find_in_line`처럼 **원본 hay의 char 인덱스**여야 한다
+///   (하이라이트/커서가 원본 행 위에서 움직이므로). 그래서 `field_slice`가 준
+///   바이트 range(따옴표 포함)를 char 인덱스로 환산해 돌려준다. 표 모드의 셀
+///   하이라이트는 다음 태스크에서 셀 텍스트에 delim=None으로 다시 부르므로,
+///   따옴표를 포함한 원본 range와 표시 값의 차이가 문제되지 않는다.
+pub fn find_in_line_scoped(
+    hay: &str,
+    needle: &str,
+    opts: &FindOptions,
+    delim: Option<u8>,
+) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    if opts.scope != MatchScope::WholeCell {
+        return find_in_line(hay, needle, opts);
+    }
+    match delim {
+        None => {
+            // 텍스트 모드: 행 전체가 needle과 같을 때만.
+            if eq_scoped(hay, needle, opts.match_case) {
+                vec![(0, hay.chars().count())]
+            } else {
+                Vec::new()
+            }
+        }
+        Some(d) => {
+            let bytes = hay.as_bytes();
+            // 표시 값(따옴표 벗김)으로 비교하고, 원본 바이트 range로 char 인덱스를
+            // 환산한다. 두 함수는 필드 개수·경계가 일치하므로 col로 zip할 수 있다.
+            let display = crate::parse::split_fields(hay, d);
+            let mut out = Vec::new();
+            for (col, cell_display) in display.iter().enumerate() {
+                if !eq_scoped(cell_display, needle, opts.match_case) {
+                    continue;
+                }
+                // 원본 hay에서 이 셀의 바이트 range(따옴표 포함)를 얻어 char로 환산.
+                let Some(slice) = crate::parse::field_slice(bytes, d, col) else {
+                    continue;
+                };
+                // 슬라이스 시작의 바이트 오프셋. field_slice는 hay 내부를 가리키는
+                // 슬라이스이므로 포인터 차로 오프셋을 구한다(할당 없음).
+                let start_byte = slice.as_ptr() as usize - bytes.as_ptr() as usize;
+                let end_byte = start_byte + slice.len();
+                // 바이트 오프셋 → char 인덱스. hay를 한 번 훑어 경계를 센다.
+                let start_char = hay[..start_byte].chars().count();
+                let cell_char_len = hay[start_byte..end_byte].chars().count();
+                out.push((start_char, cell_char_len));
+            }
+            out
+        }
+    }
 }
 
 /// 치환문에 든 `\n`/`\r`를 공백으로 바꾼다. `lines[i]`에 개행이 박히면
@@ -134,16 +234,22 @@ pub(crate) fn sanitize_for_line(s: &str) -> String {
 }
 
 /// 한 행 안에서 needle을 replacement로 모두 바꾼 새 문자열과 바뀐 횟수.
+/// scope가 WholeCell이면 **셀 전체**를 replacement로 갈아 끼운다(부분이 아니라).
+/// delimiter는 그대로 두고, replacement의 개행만 `sanitize_for_line`으로 막는다.
 pub fn replace_in_line(
     hay: &str,
     needle: &str,
     replacement: &str,
     opts: &FindOptions,
+    delim: Option<u8>,
 ) -> (String, usize) {
     if needle.is_empty() {
         return (hay.to_owned(), 0);
     }
-    let hits = find_in_line(hay, needle, opts);
+    // Whole cell은 매치 구간(= 셀 전체, 따옴표 포함 범위)을 그대로 갈아 끼우면
+    // 되므로 `find_in_line_scoped`가 준 range를 그대로 쓴다. Partial/WholeWord은
+    // 위임되어 기존과 동일한 range를 준다.
+    let hits = find_in_line_scoped(hay, needle, opts, delim);
     if hits.is_empty() {
         return (hay.to_owned(), 0);
     }
@@ -185,6 +291,7 @@ pub fn find_next(
     from: TextPos,
     needle: &str,
     opts: &FindOptions,
+    delim: Option<u8>,
     get_line: impl Fn(usize) -> Option<String>,
 ) -> Option<Match> {
     if line_count == 0 || needle.is_empty() {
@@ -196,7 +303,7 @@ pub fn find_next(
     for step in 0..=line_count {
         let line = (start + step) % line_count;
         let Some(text) = get_line(line) else { continue };
-        for (col, len) in find_in_line(&text, needle, opts) {
+        for (col, len) in find_in_line_scoped(&text, needle, opts, delim) {
             // 첫 바퀴의 시작 행에서는 from보다 뒤만, 마지막(wrap 후 되돌아온)
             // 시작 행에서는 from 자리까지 포함해 본다 — 매치가 하나뿐일 때
             // 자기 자신으로 돌아오게 하는 것이 이 포함 처리다.
@@ -218,6 +325,7 @@ pub fn find_prev(
     from: TextPos,
     needle: &str,
     opts: &FindOptions,
+    delim: Option<u8>,
     get_line: impl Fn(usize) -> Option<String>,
 ) -> Option<Match> {
     if line_count == 0 || needle.is_empty() {
@@ -228,7 +336,7 @@ pub fn find_prev(
         // 뒤로 도는 인덱스. usize 언더플로를 피하려고 line_count를 더해 돈다.
         let line = (start + line_count - step % line_count) % line_count;
         let Some(text) = get_line(line) else { continue };
-        for (col, len) in find_in_line(&text, needle, opts).into_iter().rev() {
+        for (col, len) in find_in_line_scoped(&text, needle, opts, delim).into_iter().rev() {
             if step == 0 && line == start && col >= from.col {
                 continue;
             }
@@ -253,6 +361,7 @@ pub fn replace_all(
     needle: &str,
     replacement: &str,
     opts: &FindOptions,
+    delim: Option<u8>,
 ) -> (Vec<(usize, String)>, usize) {
     if needle.is_empty() {
         return (Vec::new(), 0);
@@ -260,7 +369,7 @@ pub fn replace_all(
     let mut changed = Vec::new();
     let mut total = 0usize;
     for (i, line) in lines.iter().enumerate() {
-        let (new, n) = replace_in_line(line, needle, replacement, opts);
+        let (new, n) = replace_in_line(line, needle, replacement, opts, delim);
         if n > 0 {
             total += n;
             changed.push((i, new));
@@ -288,6 +397,7 @@ pub fn matching_lines(
     line_count: usize,
     needle: &str,
     opts: &FindOptions,
+    delim: Option<u8>,
     get_line: impl Fn(usize) -> Option<String>,
 ) -> Vec<usize> {
     if needle.is_empty() {
@@ -296,7 +406,7 @@ pub fn matching_lines(
     let mut out = Vec::new();
     for i in 0..line_count {
         let Some(text) = get_line(i) else { continue };
-        if !find_in_line(&text, needle, opts).is_empty() {
+        if !find_in_line_scoped(&text, needle, opts, delim).is_empty() {
             out.push(i);
         }
     }
@@ -307,8 +417,11 @@ pub fn matching_lines(
 mod tests {
     use super::*;
 
+    /// 기존 테스트가 `(match_case, whole_word)`로 옵션을 만들던 관습을 유지한다 —
+    /// `whole_word: true`는 `WholeWord`, `false`는 `Partial`로 이관(의미 불변).
     fn opts(match_case: bool, whole_word: bool) -> FindOptions {
-        FindOptions { match_case, whole_word }
+        let scope = if whole_word { MatchScope::WholeWord } else { MatchScope::Partial };
+        FindOptions { match_case, scope }
     }
 
     fn lines(strs: &[&str]) -> Vec<String> {
@@ -427,21 +540,21 @@ mod tests {
 
     #[test]
     fn replace_in_line_counts_and_result() {
-        let (s, n) = replace_in_line("a b a b", "a", "X", &opts(true, false));
+        let (s, n) = replace_in_line("a b a b", "a", "X", &opts(true, false), None);
         assert_eq!(s, "X b X b");
         assert_eq!(n, 2);
     }
 
     #[test]
     fn replace_in_line_no_match_is_unchanged() {
-        let (s, n) = replace_in_line("abc", "zzz", "X", &opts(true, false));
+        let (s, n) = replace_in_line("abc", "zzz", "X", &opts(true, false), None);
         assert_eq!(s, "abc");
         assert_eq!(n, 0);
     }
 
     #[test]
     fn replace_in_line_empty_needle_is_noop() {
-        let (s, n) = replace_in_line("abc", "", "X", &opts(true, false));
+        let (s, n) = replace_in_line("abc", "", "X", &opts(true, false), None);
         assert_eq!(s, "abc");
         assert_eq!(n, 0);
     }
@@ -449,11 +562,11 @@ mod tests {
     #[test]
     fn replace_in_line_sanitizes_newline_in_replacement() {
         // lines[i] 불변식 회귀 테스트 — 치환문의 개행은 공백이 된다.
-        let (s, n) = replace_in_line("a,b", "b", "x\ny", &opts(true, false));
+        let (s, n) = replace_in_line("a,b", "b", "x\ny", &opts(true, false), None);
         assert_eq!(s, "a,x y");
         assert_eq!(n, 1);
         assert!(!s.contains('\n'));
-        let (s2, _) = replace_in_line("a", "a", "p\r\nq", &opts(true, false));
+        let (s2, _) = replace_in_line("a", "a", "p\r\nq", &opts(true, false), None);
         assert_eq!(s2, "p  q", "\\r\\n 두 문자가 각각 공백으로");
         assert!(!s2.contains('\r'));
     }
@@ -461,7 +574,7 @@ mod tests {
     #[test]
     fn replace_in_line_longer_replacement() {
         // 치환문이 원문보다 길어도 뒤 매치의 인덱스가 어긋나면 안 된다.
-        let (s, n) = replace_in_line("a-a-a", "a", "LONG", &opts(true, false));
+        let (s, n) = replace_in_line("a-a-a", "a", "LONG", &opts(true, false), None);
         assert_eq!(s, "LONG-LONG-LONG");
         assert_eq!(n, 3);
     }
@@ -469,14 +582,14 @@ mod tests {
     #[test]
     fn replace_in_line_multibyte_slicing_is_safe() {
         // char 인덱스를 바이트로 옮기지 않으면 여기서 패닉하거나 깨진다.
-        let (s, n) = replace_in_line("가나ABC가나", "ABC", "다", &opts(false, false));
+        let (s, n) = replace_in_line("가나ABC가나", "ABC", "다", &opts(false, false), None);
         assert_eq!(s, "가나다가나");
         assert_eq!(n, 1);
     }
 
     #[test]
     fn replace_in_line_case_insensitive_keeps_surrounding_text() {
-        let (s, n) = replace_in_line("Hello HELLO", "hello", "hi", &opts(false, false));
+        let (s, n) = replace_in_line("Hello HELLO", "hello", "hi", &opts(false, false), None);
         assert_eq!(s, "hi hi");
         assert_eq!(n, 2);
     }
@@ -486,10 +599,10 @@ mod tests {
         let v = lines(&["x a", "b a", "a c"]);
         let n = 3;
         // 0행 col2 매치 다음 → 1행 col2.
-        let m = find_next(n, TextPos { line: 0, col: 2 }, "a", &opts(true, false), getter(v.clone()));
+        let m = find_next(n, TextPos { line: 0, col: 2 }, "a", &opts(true, false), None, getter(v.clone()));
         assert_eq!(m, Some(Match { line: 1, col: 2, len: 1 }));
         // 마지막 매치(2행 col0) 뒤에서 찾으면 처음 매치(0행 col2)로 감싼다.
-        let m = find_next(n, TextPos { line: 2, col: 0 }, "a", &opts(true, false), getter(v));
+        let m = find_next(n, TextPos { line: 2, col: 0 }, "a", &opts(true, false), None, getter(v));
         assert_eq!(m, Some(Match { line: 0, col: 2, len: 1 }));
     }
 
@@ -497,7 +610,7 @@ mod tests {
     fn find_next_does_not_return_from_position() {
         // from이 매치 자리(0,0)면 그 다음 매치(0,2)를 준다.
         let v = lines(&["a a a"]);
-        let m = find_next(1, TextPos { line: 0, col: 0 }, "a", &opts(true, false), getter(v));
+        let m = find_next(1, TextPos { line: 0, col: 0 }, "a", &opts(true, false), None, getter(v));
         assert_eq!(m, Some(Match { line: 0, col: 2, len: 1 }));
     }
 
@@ -505,21 +618,21 @@ mod tests {
     fn find_next_single_match_wraps_to_itself() {
         // 매치가 하나뿐이고 그게 from 자리면 한 바퀴 돌아 자기 자신(에디터 관례).
         let v = lines(&["zzz", "hit", "zzz"]);
-        let m = find_next(3, TextPos { line: 1, col: 0 }, "hit", &opts(true, false), getter(v));
+        let m = find_next(3, TextPos { line: 1, col: 0 }, "hit", &opts(true, false), None, getter(v));
         assert_eq!(m, Some(Match { line: 1, col: 0, len: 3 }));
     }
 
     #[test]
     fn find_next_returns_none_when_absent() {
         let v = lines(&["a", "b", "c"]);
-        let m = find_next(3, TextPos { line: 0, col: 0 }, "zzz", &opts(true, false), getter(v));
+        let m = find_next(3, TextPos { line: 0, col: 0 }, "zzz", &opts(true, false), None, getter(v));
         assert_eq!(m, None);
     }
 
     #[test]
     fn find_next_skips_lines_that_return_none() {
         // 뷰 모드에서 인덱싱이 안 끝난 행은 get_line이 None을 준다.
-        let m = find_next(4, TextPos { line: 0, col: 0 }, "hit", &opts(true, false), |i| {
+        let m = find_next(4, TextPos { line: 0, col: 0 }, "hit", &opts(true, false), None, |i| {
             match i {
                 0 => Some("nothing".to_string()),
                 1 => None,
@@ -534,7 +647,7 @@ mod tests {
     #[test]
     fn find_next_empty_document_is_none() {
         assert_eq!(
-            find_next(0, TextPos { line: 0, col: 0 }, "a", &opts(true, false), |_| None),
+            find_next(0, TextPos { line: 0, col: 0 }, "a", &opts(true, false), None, |_| None),
             None
         );
     }
@@ -543,7 +656,7 @@ mod tests {
     fn find_next_empty_needle_is_none() {
         let v = lines(&["abc"]);
         assert_eq!(
-            find_next(1, TextPos { line: 0, col: 0 }, "", &opts(true, false), getter(v)),
+            find_next(1, TextPos { line: 0, col: 0 }, "", &opts(true, false), None, getter(v)),
             None
         );
     }
@@ -552,7 +665,7 @@ mod tests {
     fn find_next_from_beyond_last_line_is_clamped() {
         // 편집으로 행이 줄어 last_match가 범위를 벗어나도 패닉하지 않는다.
         let v = lines(&["a", "b"]);
-        let m = find_next(2, TextPos { line: 99, col: 0 }, "a", &opts(true, false), getter(v));
+        let m = find_next(2, TextPos { line: 99, col: 0 }, "a", &opts(true, false), None, getter(v));
         assert_eq!(m, Some(Match { line: 0, col: 0, len: 1 }));
     }
 
@@ -561,10 +674,10 @@ mod tests {
         let v = lines(&["x a", "b a", "a c"]);
         let n = 3;
         // 2행 col0 매치 앞 → 1행 col2.
-        let m = find_prev(n, TextPos { line: 2, col: 0 }, "a", &opts(true, false), getter(v.clone()));
+        let m = find_prev(n, TextPos { line: 2, col: 0 }, "a", &opts(true, false), None, getter(v.clone()));
         assert_eq!(m, Some(Match { line: 1, col: 2, len: 1 }));
         // 첫 매치(0행 col2) 앞에서 찾으면 마지막 매치(2행 col0)로 감싼다.
-        let m = find_prev(n, TextPos { line: 0, col: 2 }, "a", &opts(true, false), getter(v));
+        let m = find_prev(n, TextPos { line: 0, col: 2 }, "a", &opts(true, false), None, getter(v));
         assert_eq!(m, Some(Match { line: 2, col: 0, len: 1 }));
     }
 
@@ -572,14 +685,14 @@ mod tests {
     fn find_prev_picks_last_match_on_the_line() {
         // 같은 행에 여러 매치가 있으면 from보다 앞쪽 중 **가장 뒤**를 준다.
         let v = lines(&["a a a"]);
-        let m = find_prev(1, TextPos { line: 0, col: 4 }, "a", &opts(true, false), getter(v));
+        let m = find_prev(1, TextPos { line: 0, col: 4 }, "a", &opts(true, false), None, getter(v));
         assert_eq!(m, Some(Match { line: 0, col: 2, len: 1 }));
     }
 
     #[test]
     fn find_prev_single_match_wraps_to_itself() {
         let v = lines(&["zzz", "hit", "zzz"]);
-        let m = find_prev(3, TextPos { line: 1, col: 0 }, "hit", &opts(true, false), getter(v));
+        let m = find_prev(3, TextPos { line: 1, col: 0 }, "hit", &opts(true, false), None, getter(v));
         assert_eq!(m, Some(Match { line: 1, col: 0, len: 3 }));
     }
 
@@ -587,7 +700,7 @@ mod tests {
     fn find_prev_returns_none_when_absent() {
         let v = lines(&["a", "b"]);
         assert_eq!(
-            find_prev(2, TextPos { line: 1, col: 0 }, "zzz", &opts(true, false), getter(v)),
+            find_prev(2, TextPos { line: 1, col: 0 }, "zzz", &opts(true, false), None, getter(v)),
             None
         );
     }
@@ -595,7 +708,7 @@ mod tests {
     #[test]
     fn find_prev_empty_document_is_none() {
         assert_eq!(
-            find_prev(0, TextPos { line: 0, col: 0 }, "a", &opts(true, false), |_| None),
+            find_prev(0, TextPos { line: 0, col: 0 }, "a", &opts(true, false), None, |_| None),
             None
         );
     }
@@ -609,7 +722,7 @@ mod tests {
         let mut pos = TextPos { line: 0, col: 0 };
         let mut seen = Vec::new();
         for _ in 0..3 {
-            let m = find_next(n, pos, "a", &opts(true, false), getter(v.clone())).unwrap();
+            let m = find_next(n, pos, "a", &opts(true, false), None, getter(v.clone())).unwrap();
             seen.push((m.line, m.col));
             pos = TextPos { line: m.line, col: m.col };
         }
@@ -619,7 +732,7 @@ mod tests {
     #[test]
     fn replace_all_returns_only_changed_lines() {
         let v = lines(&["a", "b", "a", "c"]);
-        let (changed, total) = replace_all(&v, "a", "Z", &opts(true, false));
+        let (changed, total) = replace_all(&v, "a", "Z", &opts(true, false), None);
         assert_eq!(changed, vec![(0, "Z".to_string()), (2, "Z".to_string())]);
         assert_eq!(total, 2);
     }
@@ -628,7 +741,7 @@ mod tests {
     fn replace_all_counts_total() {
         // 한 행에 여러 개 있으면 그만큼 센다.
         let v = lines(&["a a a", "b", "a"]);
-        let (changed, total) = replace_all(&v, "a", "Z", &opts(true, false));
+        let (changed, total) = replace_all(&v, "a", "Z", &opts(true, false), None);
         assert_eq!(changed.len(), 2, "바뀐 행만");
         assert_eq!(total, 4, "치환 횟수는 행 수가 아니라 매치 수");
     }
@@ -636,7 +749,7 @@ mod tests {
     #[test]
     fn replace_all_empty_needle_changes_nothing() {
         let v = lines(&["a", "b"]);
-        let (changed, total) = replace_all(&v, "", "Z", &opts(true, false));
+        let (changed, total) = replace_all(&v, "", "Z", &opts(true, false), None);
         assert!(changed.is_empty());
         assert_eq!(total, 0);
     }
@@ -645,7 +758,7 @@ mod tests {
     fn replace_all_respects_options() {
         let v = lines(&["Test testing", "test"]);
         // 대소문자 무시 + 단어 단위 → "testing"은 제외, "Test"와 "test"만.
-        let (changed, total) = replace_all(&v, "test", "X", &opts(false, true));
+        let (changed, total) = replace_all(&v, "test", "X", &opts(false, true), None);
         assert_eq!(total, 2);
         assert_eq!(changed, vec![(0, "X testing".to_string()), (1, "X".to_string())]);
     }
@@ -653,7 +766,7 @@ mod tests {
     #[test]
     fn matching_lines_collects_row_numbers() {
         let v = lines(&["alpha", "beta hit", "gamma", "hit again"]);
-        let got = matching_lines(4, "hit", &opts(true, false), getter(v));
+        let got = matching_lines(4, "hit", &opts(true, false), None, getter(v));
         assert_eq!(got, vec![1, 3], "매치가 있는 행번호만 훑은 순서 그대로");
     }
 
@@ -661,21 +774,21 @@ mod tests {
     fn matching_lines_counts_each_row_once() {
         // 한 행에 세 번 나와도 그 행은 결과에 한 번뿐이다(행 단위 추출).
         let v = lines(&["hit hit hit", "none"]);
-        let got = matching_lines(2, "hit", &opts(true, false), getter(v));
+        let got = matching_lines(2, "hit", &opts(true, false), None, getter(v));
         assert_eq!(got, vec![0]);
     }
 
     #[test]
     fn matching_lines_empty_needle_is_empty() {
         let v = lines(&["a", "b"]);
-        assert!(matching_lines(2, "", &opts(true, false), getter(v)).is_empty());
+        assert!(matching_lines(2, "", &opts(true, false), None, getter(v)).is_empty());
     }
 
     #[test]
     fn matching_lines_skips_none_lines() {
         // 뷰 모드에서 인덱싱이 아직 닿지 않은 행은 get_line이 None을 준다 —
         // 건너뛸 뿐 그 자리에서 멈추지 않는다(뒤의 매치도 찾아야 한다).
-        let got = matching_lines(4, "hit", &opts(true, false), |i| match i {
+        let got = matching_lines(4, "hit", &opts(true, false), None, |i| match i {
             0 => Some("hit".to_string()),
             1 => None,
             2 => None,
@@ -689,12 +802,12 @@ mod tests {
     fn matching_lines_respects_match_case() {
         let v = lines(&["HIT", "hit"]);
         assert_eq!(
-            matching_lines(2, "hit", &opts(true, false), getter(v.clone())),
+            matching_lines(2, "hit", &opts(true, false), None, getter(v.clone())),
             vec![1],
             "대소문자 구분이 켜지면 소문자 행만"
         );
         assert_eq!(
-            matching_lines(2, "hit", &opts(false, false), getter(v)),
+            matching_lines(2, "hit", &opts(false, false), None, getter(v)),
             vec![0, 1],
             "꺼지면 둘 다"
         );
@@ -704,12 +817,12 @@ mod tests {
     fn matching_lines_respects_whole_word() {
         let v = lines(&["testing", "a test here"]);
         assert_eq!(
-            matching_lines(2, "test", &opts(true, true), getter(v.clone())),
+            matching_lines(2, "test", &opts(true, true), None, getter(v.clone())),
             vec![1],
             "단어 단위면 'testing'은 매치가 아니다"
         );
         assert_eq!(
-            matching_lines(2, "test", &opts(true, false), getter(v)),
+            matching_lines(2, "test", &opts(true, false), None, getter(v)),
             vec![0, 1]
         );
     }
@@ -718,9 +831,135 @@ mod tests {
     fn replace_all_never_introduces_newlines() {
         // 불변식 회귀: 어떤 치환문이 와도 결과 행에 개행이 없다.
         let v = lines(&["a,b", "c,a"]);
-        let (changed, _) = replace_all(&v, "a", "1\n2\r3", &opts(true, false));
+        let (changed, _) = replace_all(&v, "a", "1\n2\r3", &opts(true, false), None);
         for (_, text) in &changed {
             assert!(!text.contains('\n') && !text.contains('\r'));
         }
+    }
+
+    // ---- MatchScope / Whole cell (E1) ----
+
+    /// WholeCell 옵션을 만드는 헬퍼.
+    fn cell_opts(match_case: bool) -> FindOptions {
+        FindOptions { match_case, scope: MatchScope::WholeCell }
+    }
+
+    #[test]
+    fn match_scope_default_is_partial() {
+        assert_eq!(FindOptions::default().scope, MatchScope::Partial);
+    }
+
+    #[test]
+    fn whole_cell_matches_exact_cell_only() {
+        // "a,bb,ccc"에서 delim=',', needle="bb" → 셀 1(col 2, len 2)만.
+        let hits = find_in_line_scoped("a,bb,ccc", "bb", &cell_opts(true), Some(b','));
+        assert_eq!(hits, vec![(2, 2)]);
+        // needle="b"는 부분 매치일 뿐 셀 전체가 아니므로 매치 없음.
+        assert!(find_in_line_scoped("a,bb,ccc", "b", &cell_opts(true), Some(b',')).is_empty());
+    }
+
+    #[test]
+    fn whole_cell_char_index_with_hangul() {
+        // "가,나다,x"의 char 열: 가(0) ,(1) 나(2) 다(3) ,(4) x(5).
+        // needle="나다" → 셀 1의 시작은 char 2, 길이 2(바이트가 아니다).
+        let hits = find_in_line_scoped("가,나다,x", "나다", &cell_opts(true), Some(b','));
+        assert_eq!(hits, vec![(2, 2)]);
+        // 돌려준 col/len으로 원본을 char 단위로 자르면 정확히 셀 값이어야 한다.
+        let chars: Vec<char> = "가,나다,x".chars().collect();
+        let (col, len) = hits[0];
+        let got: String = chars[col..col + len].iter().collect();
+        assert_eq!(got, "나다");
+    }
+
+    #[test]
+    fn whole_cell_ignore_case() {
+        // "A,BB,c"에서 needle="bb" + ignore_case → 셀 1 매치.
+        let hits = find_in_line_scoped("A,BB,c", "bb", &cell_opts(false), Some(b','));
+        assert_eq!(hits, vec![(2, 2)]);
+        // match_case면 매치 없음.
+        assert!(find_in_line_scoped("A,BB,c", "bb", &cell_opts(true), Some(b',')).is_empty());
+    }
+
+    #[test]
+    fn whole_cell_text_mode_matches_whole_line() {
+        // delim=None: 행 전체가 needle과 같을 때만.
+        let hits = find_in_line_scoped("hello", "hello", &cell_opts(true), None);
+        assert_eq!(hits, vec![(0, 5)]);
+        // 부분만 같으면 매치 없음.
+        assert!(find_in_line_scoped("hello world", "hello", &cell_opts(true), None).is_empty());
+        // ignore_case도 행 전체 규칙을 따른다.
+        let hits = find_in_line_scoped("HELLO", "hello", &cell_opts(false), None);
+        assert_eq!(hits, vec![(0, 5)]);
+    }
+
+    #[test]
+    fn whole_cell_respects_quotes() {
+        // 따옴표 안 콤마는 셀을 쪼개지 않는다(field_slice/split_fields 재사용 확인).
+        // `"a,b",c` → 셀 0 = 표시값 "a,b", 셀 1 = "c".
+        // needle "a,b"는 표시값(따옴표 벗김)과 같으므로 셀 0을 잡는다.
+        // 반환 range는 원본(따옴표 포함) 슬라이스 기준: char 0..5 (`"a,b"`).
+        let hits = find_in_line_scoped("\"a,b\",c", "a,b", &cell_opts(true), Some(b','));
+        assert_eq!(hits, vec![(0, 5)]);
+        // 따옴표 안 콤마 때문에 needle "a"는 셀 전체가 아니라 매치 없음.
+        assert!(find_in_line_scoped("\"a,b\",c", "a", &cell_opts(true), Some(b',')).is_empty());
+        // 셀 1은 "c" 그대로.
+        assert_eq!(
+            find_in_line_scoped("\"a,b\",c", "c", &cell_opts(true), Some(b',')),
+            vec![(6, 1)]
+        );
+    }
+
+    #[test]
+    fn scoped_partial_delegates_to_find_in_line() {
+        // Partial/WholeWord은 delim과 무관하게 find_in_line과 완전히 같다.
+        let hay = "abc abc x";
+        for sc in [MatchScope::Partial, MatchScope::WholeWord] {
+            let o = FindOptions { match_case: true, scope: sc };
+            assert_eq!(
+                find_in_line_scoped(hay, "abc", &o, Some(b',')),
+                find_in_line(hay, "abc", &o),
+                "scope {sc:?}는 delim을 무시하고 find_in_line에 위임"
+            );
+            assert_eq!(
+                find_in_line_scoped(hay, "abc", &o, None),
+                find_in_line(hay, "abc", &o),
+            );
+        }
+    }
+
+    #[test]
+    fn find_next_respects_whole_cell() {
+        // "a,bb"(0행), "bb,a"(1행)에서 needle="bb" WholeCell → 셀 전체가 bb인 곳만.
+        let v = lines(&["a,bb", "bb,a"]);
+        let o = cell_opts(true);
+        // 0행 col2(bb) 다음 → 1행 col0(bb).
+        let m = find_next(2, TextPos { line: 0, col: 2 }, "bb", &o, Some(b','), getter(v.clone()));
+        assert_eq!(m, Some(Match { line: 1, col: 0, len: 2 }));
+        // 부분 매치("b")는 WholeCell에서 잡히지 않는다.
+        let m = find_next(2, TextPos { line: 0, col: 0 }, "b", &o, Some(b','), getter(v));
+        assert_eq!(m, None);
+    }
+
+    #[test]
+    fn replace_all_whole_cell_replaces_entire_cell() {
+        // 셀 전체가 needle과 같은 셀만, 셀 전체를 replacement로 바꾼다.
+        let v = lines(&["a,bb,bbc", "bb,x"]);
+        let (changed, total) = replace_all(&v, "bb", "Z", &cell_opts(true), Some(b','));
+        // 0행: 셀 1(bb)만 → "a,Z,bbc". "bbc"는 부분이라 안 바뀐다.
+        // 1행: 셀 0(bb) → "Z,x".
+        assert_eq!(total, 2);
+        assert_eq!(
+            changed,
+            vec![(0, "a,Z,bbc".to_string()), (1, "Z,x".to_string())]
+        );
+    }
+
+    #[test]
+    fn replace_whole_cell_sanitizes_newline() {
+        // Whole cell replacement의 개행도 공백으로 sanitize(불변식 유지).
+        let (s, n) = replace_in_line("a,bb,c", "bb", "x\ny", &cell_opts(true), Some(b','));
+        assert_eq!(s, "a,x y,c");
+        assert_eq!(n, 1);
+        assert!(!s.contains('\n'));
     }
 }
