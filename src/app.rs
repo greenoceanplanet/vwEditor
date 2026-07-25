@@ -2234,64 +2234,14 @@ fn cell_bytes_are_display(line_bytes: &[u8]) -> bool {
     memchr::memchr(b'"', line_bytes).is_none()
 }
 
-/// ASCII 대문자 한 바이트를 소문자로 접는다. 그 밖의 바이트(숫자·기호·비ASCII
-/// ≥0x80)는 그대로 둔다 — 멀티바이트 시퀀스의 바이트를 건드리면 원래 없던
-/// 바이트열이 생겨 위양성/위음성이 둘 다 가능해진다.
-fn ascii_lower(b: u8) -> u8 {
-    if b.is_ascii_uppercase() {
-        b + 32
-    } else {
-        b
-    }
-}
-
-/// ASCII 대소문자 무시 바이트 탐색. `needle_lower`는 **호출부가 미리 소문자로
-/// 접어** 넘긴다(행마다 다시 접지 않게). hay는 비교 시점에 한 바이트씩 접으므로
-/// 할당이 없다.
-///
-/// **왜 양쪽을 다 접는가.** 예전 판단은 "needle의 대문자 변형 하나로 memmem을
-/// 돌린다"였고 그건 `Ab` 같은 혼합 대소문자를 놓쳤다(위음성). hay와 needle을
-/// **둘 다** ASCII 소문자로 접으면 `Ab`/`aB`/`AB`/`ab`가 전부 같은 바이트열이
-/// 되므로 ASCII 범위에서 정확하다. 비ASCII 바이트(≥0x80)는 `ascii_lower`가
-/// 건드리지 않으므로 **그대로 리터럴 비교**된다 — 한글처럼 대소문자가 없는
-/// needle에서는 그게 곧 정답이다(`query_is_case_foldable_by_bytes` 참조).
-///
-/// 첫 바이트는 `memchr2`(소문자/대문자 두 바이트)로 건너뛰어 스캔한다 —
-/// 벤치에서 순진한 바이트 루프보다 눈에 띄게 빨랐다(374ms vs 408ms/2GB).
-fn find_ci_ascii(hay: &[u8], needle_lower: &[u8]) -> Option<usize> {
-    find_ci_ascii_from(hay, needle_lower, 0)
-}
-
-/// `find_ci_ascii`를 `from` 바이트 위치부터 시작한다. 모든 출현을 훑는
-/// `find_ci_ascii_all`이 재진입할 때 쓴다.
-fn find_ci_ascii_from(hay: &[u8], needle_lower: &[u8], from: usize) -> Option<usize> {
-    let n = needle_lower.len();
-    if n == 0 || hay.len() < n || from > hay.len() - n {
-        return None;
-    }
-    let lo = needle_lower[0];
-    // 소문자로 접힌 첫 바이트의 대문자 짝. ASCII 소문자가 아니면(숫자·기호·
-    // 비ASCII) 짝이 자기 자신이라 memchr 한 개로 충분하다.
-    let up = if lo.is_ascii_lowercase() { lo - 32 } else { lo };
-    let mut start = from;
-    while start + n <= hay.len() {
-        let rest = &hay[start..];
-        let pos = if lo == up {
-            memchr::memchr(lo, rest)
-        } else {
-            memchr::memchr2(lo, up, rest)
-        };
-        let i = start + pos?;
-        if i + n > hay.len() {
-            return None;
-        }
-        if hay[i + 1..i + n].iter().zip(&needle_lower[1..]).all(|(&h, &d)| ascii_lower(h) == d) {
-            return Some(i);
-        }
-        start = i + 1;
-    }
-    None
-}
+/// ASCII 바이트 접기(`ascii_lower`)와 그 위에 선 대소문자 무시 바이트 탐색
+/// (`find_ci_ascii` / `find_ci_ascii_from`)도 `find.rs`로 옮겼다(Task M) —
+/// `query_is_case_foldable_by_bytes`와 **같은 한 벌의 판정**을 이루기 때문이다
+/// (그 판정이 참일 때 비로소 이 탐색이 유니코드 접기와 같은 답을 낸다).
+/// 치환의 프리필터(`find::replace_all`)가 스캔 경로와 정확히 같은 탐색을 써야
+/// 하는데, 사본을 만들면 한쪽만 고쳐져 두 경로가 갈린다. 근거 주석은 그쪽에 있고
+/// 여기 스캔 경로와 테스트는 이 `use`로 그 한 벌을 그대로 부른다.
+use crate::find::{ascii_lower, find_ci_ascii, find_ci_ascii_from};
 
 /// 겹치지 않는 모든 출현 위치(Whole cell 경계 판정에 필요 — 히트마다
 /// `classify_cell_hit`을 돌려야 하므로 첫 히트만으로는 부족하다).
@@ -2313,83 +2263,15 @@ fn find_ci_ascii_all(hay: &[u8], needle_lower: &[u8]) -> Vec<usize> {
     out
 }
 
-/// needle의 모든 문자가 **바이트 접기(`ascii_lower`)만으로 대소문자 무시 비교가
-/// 성립하는가**.
-///
-/// **왜 `is_ascii()`로는 너무 좁은가.** 예전 판정은 "비ASCII가 하나라도 있으면
-/// 폴백"이었다. 그 근거("유니코드 접기는 바이트로 안전하지 않다")는 옳지만
-/// 대상을 지나치게 넓게 잡았다 — **대소문자 개념이 아예 없는 문자**는 접어도
-/// 자기 자신이라, ignore_case여도 바이트 비교가 match_case와 **완전히 같은
-/// 질문**이 된다. 전 유니코드 프로브로 확인한 사실:
-/// - 한글 음절(U+AC00~U+D7A3) 11,172자 중 `to_lowercase()`로 바뀌는 것: **0개**
-/// - 그 밖의 비ASCII 중 바뀌는 것: 1,462자(`À`→`à`, `É`, `İ`, `Σ` 등 라틴/그리스/키릴)
-///
-/// 그래서 한글·한자·가나·숫자·기호로 이뤄진 needle은 빠른 경로를 타도 된다.
-/// 실제로 이 함수가 걸러야 하는 것은 **바이트로 접을 수 없는** 비ASCII
-/// 대소문자 문자뿐이다.
-///
-/// 판정:
-/// - ASCII 문자는 `ascii_lower`가 바이트 단위로 정확히 접으므로 항상 참
-///   (`A`~`Z`는 거짓이 아니다 — 예전과 똑같이 빠른 경로를 탄다).
-/// - 비ASCII 문자는 **소문자화도 대문자화도 자기 자신일 때만** 참.
-///
-/// **왜 소문자화만 보면 안 되는가(반드시 양방향).** 브루트포스
-/// (`find::eq_scoped` / `find::folded`)는 hay와 needle을 **둘 다** 접어 비교한다.
-/// 그래서 needle이 `é`(이미 소문자 — `to_lowercase()`가 자기 자신)여도, 파일의
-/// `É`가 접혀 `é`가 되므로 브루트포스는 매치라고 답한다. 반면 바이트 경로는
-/// `ascii_lower`가 비ASCII를 건드리지 않아 `É`(0xC3 0x89)와 `é`(0xC3 0xA9)를
-/// 다른 바이트로 본다 → **위음성 = 계약 위반**. 대문자화까지 자기 자신이어야
-/// "이 문자로 접혀 오는 다른 문자가 없다"가 보장된다.
-///
-/// **전 유니코드 전수 검증(프로브).** 이 조건(`is_ascii() || (lo==self &&
-/// up==self)`)을 통과하는 비ASCII 문자 중, 다른 문자가 소문자화로 그 문자가 되는
-/// 경우는 **0개**다. 반대로 소문자화만 보는 조건에는 그런 구멍이 1,453개
-/// 있었다(`ß`, `à`, `á`, …). 한글 음절 11,172자·CJK 통합한자·가나는 전부 통과한다.
-///
-/// **구멍: 1글자씩 봐서는 다다자 확장의 "조각"을 못 잡는다.** 위 검증은 각 문자를
-/// **홀로** 봤을 때 다른 한 문자가 그리로 접혀 오는지만 본다. 그런데
-/// `char::to_lowercase()`는 **여러 문자로 확장**되기도 한다 — U+0130
-/// `İ`(LATIN CAPITAL LETTER I WITH DOT ABOVE)의 소문자화는 **두 글자**
-/// `i`+U+0307(COMBINING DOT ABOVE)이다. `i`는 ASCII라 통과, U+0307은 대소문자가
-/// 없어(`lo==up==self`) 통과 — 그래서 needle `"i\u{0307}"`가 이 판정을
-/// 문자 단위로는 전부 통과해 버린다. 하지만 브루트포스(`find::folded`)는
-/// 문서의 `İ` 한 글자를 접어 정확히 이 두 글자 시퀀스를 만들어 내므로, 그 행은
-/// 브루트포스는 매치이고 바이트 경로는 (`İ`의 UTF-8 바이트 `0xC4 0xB0`가
-/// `i`+U+0307의 바이트 `0x69 0xCC 0x87`와 전혀 다르므로) 못 잡는다 → 위음성.
-///
-/// **막는 법.** "다다자 확장에 등장하는 문자"의 집합을 전 유니코드에서 구하면
-/// U+0307 단 하나뿐이다(`multichar_lower_expansion_pieces_are_exactly_u0307`가
-/// 이 사실 자체를 전수 검증한다) — 그래서 U+0307을 needle에서 거부하면 이
-/// 구멍이 완전히 막힌다. 다른 다다자 확장이 훗날 추가되더라도(유니코드
-/// 데이터는 버전마다 바뀔 수 있음) 이 함수가 쓰는 상수가 아니라 그 테스트가
-/// 먼저 깨져 알려준다.
-///
-/// **왜 한글/한자/가나는 안전한가.** 이들은 애초에 대소문자 매핑이 없어(위 전수
-/// 검증 1) 다다자 확장의 결과물도, 조각도 될 수 없다 — 이 배제 규칙 추가가
-/// `인도네시아` 같은 needle을 막지 않는다.
-///
-/// **알려진 한계(이 함수 밖, 기존 동작).** 비ASCII → **ASCII**로 접히는 문자가
-/// 유니코드 전체에 딱 하나 있다: U+212A KELVIN SIGN(`K`) → `k`. 그래서 ASCII
-/// needle `k`로 U+212A가 든 행을 찾으면 브루트포스는 매치, 바이트 경로는
-/// 비매치다(위음성). **K-1 이전부터 있던 구멍이고 이 판정과 무관하다** —
-/// 막으려면 `k`/`K`가 든 모든 ASCII needle을 폴백으로 보내야 하는데, 흔한 글자
-/// 하나 때문에 빠른 경로를 통째로 잃는 대가가 유니코드 호환 문자 하나보다
-/// 훨씬 크다. 의도적으로 남겨 두고 여기 기록한다.
-///
-/// 빈 문자열은 참이다(모든 문자가 조건을 만족 — 공허참). 빈 needle을 막는 것은
-/// `bytefast_ci_ok`의 `!query.is_empty()`이고, 그 책임을 여기 겹쳐 두면 판정 두
-/// 곳이 갈린다.
-fn query_is_case_foldable_by_bytes(query: &str) -> bool {
-    query.chars().all(|c| {
-        // U+0307: 다른 문자(U+0130)의 다다자 소문자 확장 "조각"으로만 등장하는
-        // 유일한 문자(전수 검증: 아래 테스트 참조) — 단독으로는 캐이스리스라
-        // 이 검사가 없으면 통과해 버린다.
-        c != '\u{0307}'
-            && (c.is_ascii()
-                || (c.to_lowercase().eq(std::iter::once(c))
-                    && c.to_uppercase().eq(std::iter::once(c))))
-    })
-}
+/// needle이 **바이트 접기만으로 대소문자 무시 비교가 성립하는가**를 묻는
+/// `query_is_case_foldable_by_bytes`는 `find.rs`로 옮겼다(Task M). 그 판정이 묻는
+/// 것은 "유니코드 접기(`find::folded`/`find::eq_scoped`)와 바이트 접기가 같은
+/// 답을 내는가"이므로 접기 규칙을 정의하는 쪽에 있어야 하고, 치환의 바이트 경로
+/// (`find::replace_cells_bytes`)도 같은 판정을 쓰는데 순수 로직 모듈이 UI
+/// 모듈(`app.rs`)을 역참조하게 만들 수는 없기 때문이다. **판정은 여전히 한 벌**이며
+/// 근거 주석(전 유니코드 프로브·U+0307 구멍·U+212A 한계)도 전부 그쪽에 있다 —
+/// 여기 호출부와 테스트는 이 `use`를 통해 그 한 벌을 그대로 부른다.
+use crate::find::query_is_case_foldable_by_bytes;
 
 /// ignore_case에서 ASCII 바이트 접기 빠른 경로를 쓸 수 있는가.
 ///
