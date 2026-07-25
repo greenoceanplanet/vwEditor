@@ -233,6 +233,97 @@ pub(crate) fn sanitize_for_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
+/// 찾기/바꾸기 입력란의 이스케이프 시퀀스를 실제 문자로 푼다. 탭처럼 키보드로
+/// 입력란에 직접 칠 수 없는 문자를 찾기 위한 것이다(TextEdit에서 Tab 키는
+/// 포커스 이동이라 탭 문자가 들어가지 않는다).
+///
+/// 해석하는 것은 셋뿐이다:
+/// - `\t` → 탭(U+0009)
+/// - `\\` → 백슬래시 하나
+/// - `\xNN` → 16진수 **정확히 2자리**가 가리키는 문자(대소문자 무관)
+///
+/// 그 밖의 `\?`는 백슬래시와 그 글자를 **그대로** 남긴다(관대한 해석). 문자열
+/// 끝에 홀로 남은 `\`도 그대로다.
+///
+/// **`\n`/`\r`을 일부러 지원하지 않는다.** 이 프로그램은 문서를 행 배열로
+/// 다루고 `lines[i]`에 개행이 없다는 불변식이 표 모드 행번호·정렬·저장을
+/// 떠받친다(`sanitize_for_line`이 같은 이유로 존재한다). 개행은 행의 **내용**이
+/// 아니라 행과 행의 **경계**이므로 애초에 "행 안에서 찾을" 대상이 아니다.
+/// 그렇다고 `\n`을 **오류로 만들지도 않는다** — 위 관대 규칙에 따라 `\` + `n`
+/// 두 글자로 남으므로, 사용자가 `\n`을 쳐도 그 두 글자를 찾을 뿐 아무것도
+/// 깨지지 않는다. 이 "안전하게 아무 일도 일어나지 않음"이 의도된 동작이다.
+///
+/// **`\xNN`은 바이트가 아니라 유니코드 코드포인트다.** `char::from_u32`로 풀기
+/// 때문에 `\x80`~`\xFF`는 U+0080~U+00FF(라틴-1) 문자가 된다 — 예: `\xE9`는
+/// `é`이지 CP949의 어떤 바이트가 아니다. 이 코드베이스의 매칭은 전부 디코딩된
+/// `String`(char 인덱스) 위에서 도므로 "바이트"라는 개념을 여기 들여올 수
+/// 없고, `char`는 유니코드 스칼라라 U+0080~U+00FF가 전부 유효하다. 사용자가
+/// 말한 "아스키 코드"에 해당하는 `\x00`~`\x7F` 범위에서는 두 해석이 같다.
+/// (툴팁도 "character code (hex)"로 이 의미를 적는다.)
+///
+/// **반환이 `String`인 이유.** 백슬래시가 하나도 없으면 결과가 입력과 같으므로
+/// `Cow::Borrowed`로 할당을 없앨 수 있지만, 그러면 모든 호출부가 `Cow`를 받아
+/// 수명을 끌고 다녀야 한다 — 호출부는 `Highlight.query`에 넣거나(소유 필요)
+/// `replace_all_in_doc`처럼 `doc`을 가변 대여하기 전에 값을 떼어 놔야 하는
+/// 곳들이라 어차피 곧바로 `to_owned()`가 붙는다. 대신 백슬래시가 없으면
+/// **문자별 순회 없이** `to_owned()` 한 번으로 끝내는 빠른 경로를 둔다
+/// (`memchr`). 이 함수는 매 프레임이 아니라 사용자가 버튼을 누를 때만 불리므로
+/// 그 이상의 최적화는 필요 없다.
+pub fn unescape(s: &str) -> String {
+    // 백슬래시가 없으면 해석할 것이 없다 — char 순회 없이 통째로 복사한다.
+    if memchr::memchr(b'\\', s.as_bytes()).is_none() {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.peek().copied() {
+            Some('t') => {
+                it.next();
+                out.push('\t');
+            }
+            Some('\\') => {
+                it.next();
+                out.push('\\');
+            }
+            Some('x') => {
+                // `\x` 뒤 **정확히 2자리**만 읽는다 — `\x414`는 `\x41` + `4` =
+                // `A4`다. 2자리가 안 오거나 16진수가 아니면(`\xZZ`, `\x9`, `\x`)
+                // 관대 규칙대로 통째로 그대로 남긴다. 그러려면 실패했을 때
+                // 되돌릴 수 있어야 하므로 반복자를 소비하기 전에 **복제본**으로
+                // 먼저 시험한다(`peekable`은 한 글자만 미리 볼 수 있다).
+                let mut probe = it.clone();
+                probe.next(); // 'x'
+                let h1 = probe.next().and_then(|c| c.to_digit(16));
+                let h2 = probe.next().and_then(|c| c.to_digit(16));
+                match (h1, h2) {
+                    (Some(a), Some(b)) => {
+                        // 0x00~0xFF는 전부 유효한 유니코드 스칼라라
+                        // `from_u32`가 실패할 수 없지만, unwrap 대신 실패 시
+                        // 그대로 두는 쪽으로 적어 둔다(관대 규칙과 일관).
+                        match char::from_u32(a * 16 + b) {
+                            Some(ch) => {
+                                it = probe;
+                                out.push(ch);
+                            }
+                            None => out.push('\\'),
+                        }
+                    }
+                    _ => out.push('\\'),
+                }
+            }
+            // 지원하지 않는 `\n`, 오타 `\z`, 그리고 문자열 끝의 홀로 남은 `\`.
+            // 백슬래시만 흘려보내면 다음 글자는 다음 반복에서 그대로 담긴다.
+            _ => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// 한 행 안에서 needle을 replacement로 모두 바꾼 새 문자열과 바뀐 횟수.
 /// scope가 WholeCell이면 **셀 전체**를 replacement로 갈아 끼운다(부분이 아니라).
 /// delimiter는 그대로 두고, replacement의 개행만 `sanitize_for_line`으로 막는다.
@@ -966,5 +1057,107 @@ mod tests {
         assert_eq!(s, "a,x y,c");
         assert_eq!(n, 1);
         assert!(!s.contains('\n'));
+    }
+
+    // ---- unescape ----------------------------------------------------------
+
+    #[test]
+    fn unescape_tab() {
+        // 이 기능의 존재 이유. `\t` 두 글자가 진짜 탭 한 글자가 된다.
+        assert_eq!(unescape(r"a\tb"), "a\tb");
+        assert_eq!(unescape(r"\t").chars().count(), 1);
+    }
+
+    #[test]
+    fn unescape_backslash() {
+        // `\\`는 백슬래시 **하나**. 두 글자가 한 글자로 줄어드는지가 핵심이다.
+        assert_eq!(unescape(r"a\\b"), r"a\b");
+        assert_eq!(unescape(r"C:\\temp"), r"C:\temp");
+        // `\\t`는 백슬래시 + t이지 탭이 아니다(백슬래시가 먼저 소비된다).
+        assert_eq!(unescape(r"\\t"), r"\t");
+    }
+
+    #[test]
+    fn unescape_hex() {
+        assert_eq!(unescape(r"\x41"), "A");
+        assert_eq!(unescape(r"\x09"), "\t");
+        assert_eq!(unescape(r"\x7F"), "\u{7F}");
+        // 16진수 자릿수는 대소문자를 가리지 않는다.
+        assert_eq!(unescape(r"\x4a"), unescape(r"\x4A"));
+        assert_eq!(unescape(r"\x4a"), "J");
+        // 앞뒤 글자와 섞여도 그 자리만 바뀐다.
+        assert_eq!(unescape(r"a\x41b"), "aAb");
+    }
+
+    #[test]
+    fn unescape_hex_out_of_ascii() {
+        // 확정된 해석: `\xNN`은 바이트가 아니라 **유니코드 코드포인트**다.
+        // 0x80~0xFF는 U+0080~U+00FF(라틴-1) 문자가 된다 — 한 글자다.
+        assert_eq!(unescape(r"\xE9"), "é");
+        assert_eq!(unescape(r"\xFF"), "ÿ");
+        assert_eq!(unescape(r"\x80"), "\u{80}");
+        assert_eq!(unescape(r"\xFF").chars().count(), 1);
+        // 유니코드 코드포인트이므로 UTF-8 인코딩은 2바이트다(바이트 해석이라면 1).
+        assert_eq!(unescape(r"\xFF").len(), 2);
+    }
+
+    #[test]
+    fn unescape_leaves_unknown_as_is() {
+        // **회귀 못박기**: `\n`은 개행이 되지 않는다. 지원하지 않는 시퀀스는
+        // 오류가 아니라 백슬래시 + 그 글자 두 글자로 그대로 남는다.
+        assert_eq!(unescape(r"\n"), r"\n");
+        assert!(!unescape(r"a\nb").contains('\n'));
+        assert_eq!(unescape(r"\r"), r"\r");
+        assert_eq!(unescape(r"\z"), r"\z");
+        assert_eq!(unescape(r"\0"), r"\0");
+        assert_eq!(unescape(r"\u1234"), r"\u1234");
+        // 한글 등 비ASCII가 뒤따라도 그대로(char 단위로 흘려보낸다).
+        assert_eq!(unescape(r"\가"), r"\가");
+    }
+
+    #[test]
+    fn unescape_trailing_backslash() {
+        assert_eq!(unescape(r"abc\"), r"abc\");
+        assert_eq!(unescape(r"\"), r"\");
+    }
+
+    #[test]
+    fn unescape_bad_hex_left_as_is() {
+        // 16진수 2자리가 안 오면 관대 규칙 — 통째로 그대로 남는다.
+        assert_eq!(unescape(r"\xZZ"), r"\xZZ");
+        assert_eq!(unescape(r"\x9"), r"\x9");
+        assert_eq!(unescape(r"\x"), r"\x");
+        assert_eq!(unescape(r"\x4"), r"\x4");
+        assert_eq!(unescape(r"\xG1"), r"\xG1");
+        // 실패해도 뒤 글자를 잡아먹지 않는다.
+        assert_eq!(unescape(r"\xZZa"), r"\xZZa");
+    }
+
+    #[test]
+    fn unescape_hex_reads_exactly_two() {
+        // `\x414`는 `\x41`(A) + 남은 `4`.
+        assert_eq!(unescape(r"\x414"), "A4");
+        assert_eq!(unescape(r"\x4141"), "A41");
+    }
+
+    #[test]
+    fn unescape_no_backslash_is_identity() {
+        // 빠른 경로(memchr)를 타는 입력들. 느린 경로와 같은 결과여야 한다.
+        for s in ["", "abc", "a,b\tc", "한글 텍스트", "x\u{7F}y"] {
+            assert_eq!(unescape(s), s, "백슬래시가 없으면 입력 그대로");
+        }
+    }
+
+    #[test]
+    fn unescape_fast_path_agrees_with_slow_path() {
+        // 빠른 경로가 별도 코드라 결과가 갈릴 수 있다. 백슬래시 없는 입력에
+        // 대해 "느린 경로를 강제로 태운 결과"와 같은지 확인한다 — 앞에 `\\`를
+        // 붙이면 반드시 느린 경로를 타므로, 그 결과에서 백슬래시 하나를 떼면
+        // 빠른 경로 결과와 같아야 한다.
+        for s in ["abc", "a,b", "한글", "x\u{7F}y", "tab\there"] {
+            let via_slow = unescape(&format!(r"\\{s}"));
+            assert_eq!(via_slow, format!(r"\{s}"));
+            assert_eq!(&via_slow[1..], unescape(s), "두 경로 결과가 같아야 한다");
+        }
     }
 }

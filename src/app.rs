@@ -91,6 +91,19 @@ pub struct Document {
     pub find_query: String,
     pub replace_text: String,
     pub find_opts: crate::find::FindOptions,
+    /// 찾기/바꾸기 입력란의 이스케이프 시퀀스(`\t`, `\\`, `\xNN`)를 해석할지.
+    ///
+    /// **기본 꺼짐.** `C:\temp`처럼 백슬래시가 든 값을 글자 그대로 찾는 경우가
+    /// 흔하다 — 항상 해석하면 그 흔한 사용이 조용히 망가진다(EmEditor·VS Code도
+    /// 같은 이유로 체크박스다).
+    ///
+    /// **`FindOptions`에 넣지 않은 이유.** `FindOptions`는 `find.rs`의 **매칭
+    /// 규칙**(대소문자·scope)이고 이것은 "입력란의 글자를 어떻게 읽을 것인가"라
+    /// 층이 다르다. 게다가 `Highlight` 스냅샷이 `FindOptions`를 통째로 얼려
+    /// 들고 다니는데, 스냅샷의 `query`에는 **이미 해석이 끝난** 문자열이 들어가므로
+    /// 그 옆에 "해석할지" 플래그가 함께 얼려 있으면 렌더가 이미 푼 것을 또 풀지
+    /// 말지 헷갈리게 된다(`effective_query` 주석 참조).
+    pub find_escapes: bool,
     /// 마지막으로 찾은 위치(다음 찾기의 기준). None이면 문서 처음부터.
     pub last_match: Option<crate::find::Match>,
     /// 직전 검색 결과 안내 문구(예: "3 replacements", "Not found"). 패널에 표시.
@@ -429,6 +442,7 @@ impl App {
             find_query: String::new(),
             replace_text: String::new(),
             find_opts: crate::find::FindOptions::default(),
+            find_escapes: false,
             last_match: None,
             find_status: String::new(),
             find_focus_pending: false,
@@ -1284,6 +1298,9 @@ impl eframe::App for App {
             // (빈 검색어로 "Enter text to find"만 띄우는 것은 소음이다).
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F3)) {
                 if let Some(doc) = self.doc_mut() {
+                    // "사용자가 입력란에 뭔가 쳤는가"를 보는 자리다 — 버튼 활성
+                    // 조건과 같은 근거이므로 **날 문자열**을 본다(디코딩 결과가
+                    // 빌 수 없으므로 어차피 판정은 같지만, 근거를 통일한다).
                     if !doc.find_query.is_empty() {
                         apply_find_action(doc, FindAction::Next);
                     }
@@ -1868,10 +1885,48 @@ fn find_all_status(match_row_count: usize) -> String {
     }
 }
 
+/// 실제 검색에 쓸 검색어. `find_escapes`가 켜져 있으면 `\t` 등을 실제 문자로
+/// 푼다(`find::unescape`). 꺼져 있으면 입력란의 날 문자열 그대로다.
+///
+/// **모든 소비 지점이 이 함수를 거쳐야 한다.** `doc.find_query`를 직접 쓰는
+/// 경로가 하나라도 남으면 그 경로만 이스케이프가 안 먹어 "Find Next는 탭을
+/// 찾는데 Find All은 못 찾는" 식으로 조용히 갈린다 — 그중 하나가
+/// `scan_all_matches`라면 "`scan_all_matches`의 행 집합 == `matching_lines`
+/// 브루트포스의 행 집합"이라는 절대 계약까지 무너진다(두 쪽에 서로 다른
+/// needle이 들어가므로). 그래서 검색어를 소비하는 지점은 프로덕션이든
+/// 테스트든 전부 이 함수를 지난다.
+///
+/// 빈 문자열은 빈 문자열 그대로다(`unescape("") == ""`), 그리고 비어 있지 않은
+/// 입력은 최소 한 글자를 남기므로 **디코딩이 검색어를 비게 만들 수는 없다** —
+/// 빈 검색어 가드가 날 문자열을 보든 디코딩 결과를 보든 판정이 같다는 뜻이다.
+/// 그래도 가드는 이 함수 결과를 보게 통일해 두었다(같은 값을 두 근거로 보는
+/// 코드를 남기지 않는다). 다만 **버튼 활성 조건은 다르다** —
+/// `find_all_button_enabled`/`extract_button_enabled` 주석 참조.
+fn effective_query(doc: &Document) -> String {
+    if doc.find_escapes {
+        crate::find::unescape(&doc.find_query)
+    } else {
+        doc.find_query.clone()
+    }
+}
+
+/// 실제 치환에 쓸 문자열. 같은 이유로(`effective_query` 주석) 치환문을 쓰는
+/// 지점도 전부 이 함수를 지난다 — `\t`로 찾은 탭을 다시 `\t`로 되돌려 넣거나,
+/// 반대로 탭을 다른 글자로 바꾸려면 치환문 쪽도 같은 규칙으로 읽혀야 한다.
+/// (개행 방어는 여기가 아니라 치환 직전의 `sanitize_for_line`이 한다. `\n`은
+///  애초에 `unescape`가 풀지 않으므로 이 함수가 개행을 만들어 낼 일도 없다.)
+fn effective_replacement(doc: &Document) -> String {
+    if doc.find_escapes {
+        crate::find::unescape(&doc.replace_text)
+    } else {
+        doc.replace_text.clone()
+    }
+}
+
 /// 뷰 모드에서 조용히 무시된다 — UI가 이미 그 버튼을 비활성화하지만,
 /// 단축키 경로도 같은 함수를 지나므로 여기서 한 번 더 막는다.
 fn apply_find_action(doc: &mut Document, act: FindAction) {
-    if doc.find_query.is_empty() {
+    if effective_query(doc).is_empty() {
         doc.find_status = "Enter text to find".to_owned();
         return;
     }
@@ -1885,7 +1940,12 @@ fn apply_find_action(doc: &mut Document, act: FindAction) {
             let rows = scan_all_matches(doc);
             doc.find_status = find_all_status(rows.len());
             doc.highlight = Some(Highlight {
-                query: doc.find_query.clone(),
+                // 스냅샷에는 **디코딩된** 검색어를 넣는다. 그래야 렌더가
+                // `find_escapes`를 전혀 몰라도 되고(스냅샷 하나만 보면 된다),
+                // Find All 뒤에 체크박스를 꺼도 하이라이트가 그대로 유지된다
+                // — 스냅샷의 뜻이 "그때 그 검색어로 찾은 결과"이기 때문이다.
+                // `opts`를 그때 값으로 얼려 두는 것과 정확히 같은 규율이다.
+                query: effective_query(doc),
                 opts: doc.find_opts.clone(),
                 rows,
             });
@@ -1920,10 +1980,11 @@ fn search_from(
     let n = doc_line_count(doc);
     let delim = doc_delimiter(doc);
     let get_line = |i: usize| logical_line(doc, i);
+    let query = effective_query(doc);
     if forward {
-        crate::find::find_next(n, from, &doc.find_query, &doc.find_opts, delim, get_line)
+        crate::find::find_next(n, from, &query, &doc.find_opts, delim, get_line)
     } else {
-        crate::find::find_prev(n, from, &doc.find_query, &doc.find_opts, delim, get_line)
+        crate::find::find_prev(n, from, &query, &doc.find_opts, delim, get_line)
     }
 }
 
@@ -1961,7 +2022,9 @@ fn search_from(
 /// (호출부는 Find All(`apply_find_action`의 `FindAction::All`)과 추출뿐이다 —
 /// 매 프레임 자동 호출은 없앴다. 사용자가 명시적으로 눌렀을 때만 돈다.)
 fn scan_all_matches(doc: &Document) -> Vec<u32> {
-    let query = &doc.find_query;
+    // 날 `doc.find_query`가 아니라 디코딩된 검색어로 스캔한다 — 브루트포스
+    // (`matching_lines`)와 **같은 needle**이 들어가야 위의 절대 계약이 성립한다.
+    let query = &effective_query(doc);
     if query.is_empty() {
         return Vec::new();
     }
@@ -2873,9 +2936,13 @@ fn replace_one(doc: &mut Document) {
     // 치환 대상 = 지금 선택돼 있는 매치. 그게 정말 지금도 매치인지 다시
     // 확인한다(편집·되돌리기로 그 자리 글자가 바뀌었을 수 있다).
     let delim = doc_delimiter(doc);
+    // 재검증도 `search_from`이 매치를 만들 때 쓴 것과 **같은** 검색어여야 한다 —
+    // 여기만 날 문자열을 보면 `\t`로 찾아 놓은 매치가 매번 재검증에 실패해
+    // 바꾸기가 늘 "그냥 다음 찾기"로 흘러 버린다.
+    let query = effective_query(doc);
     let target = doc.last_match.filter(|m| {
         logical_line(doc, m.line).is_some_and(|text| {
-            crate::find::find_in_line_scoped(&text, &doc.find_query, &doc.find_opts, delim)
+            crate::find::find_in_line_scoped(&text, &query, &doc.find_opts, delim)
                 .iter()
                 .any(|&(c, l)| c == m.col && l == m.len)
         })
@@ -2896,7 +2963,7 @@ fn replace_one(doc: &mut Document) {
         }
         return;
     };
-    let rep = crate::find::sanitize_for_line(&doc.replace_text);
+    let rep = crate::find::sanitize_for_line(&effective_replacement(doc));
     let Some(e) = doc.edit.as_mut() else { return };
     let Some(old) = e.lines.get(m.line).cloned() else { return };
     // char 인덱스를 바이트로 옮겨 그 구간만 갈아 끼운다. 한 줄 전체를
@@ -2961,8 +3028,8 @@ fn replace_one(doc: &mut Document) {
 /// 다른 전 행 연산이 확인 없이 하는 일과 같은 급이다. 따라서 여기에
 /// `PendingColumnOp`와 같은 확인 단계를 새로 만들지 않는다.
 fn replace_all_in_doc(doc: &mut Document) {
-    let query = doc.find_query.clone();
-    let rep = doc.replace_text.clone();
+    let query = effective_query(doc);
+    let rep = effective_replacement(doc);
     let opts = doc.find_opts.clone();
     let delim = doc_delimiter(doc);
     let Some(e) = doc.edit.as_mut() else { return };
@@ -3065,13 +3132,22 @@ const EXTRACT_LOCKED_STATUS: &str = "Close the open dialog first";
 /// 버튼의 활성/비활성 판정을 렌더 클로저 안에 인라인으로 두면, 그 판정을
 /// 지워도(항상 활성, 또는 버튼 자체를 지워도) 렌더 결과만 보는 테스트로는
 /// 잡아낼 수 없다.
+///
+/// **날 문자열을 받는다(디코딩된 값이 아니라).** 이 판정이 묻는 것은 "사용자가
+/// 입력란에 뭔가 쳤는가"이지 "그 결과가 무엇인가"가 아니다. 실제로는 두 근거가
+/// 언제나 같은 값을 준다 — `unescape("")`는 `""`이고 비어 있지 않은 입력은 어떤
+/// 규칙을 타든 최소 한 글자를 남기므로 디코딩이 검색어를 비게 만들 수 없다
+/// (`effective_query` 주석). 그래서 값이 아니라 **뜻**이 맞는 쪽을 고른다:
+/// 버튼은 입력란의 상태를 비추는 UI이므로 입력란의 글자를 본다. 부수적으로 이
+/// 함수는 `Document`를 알 필요가 없어져 `&str` 하나로 테스트된다.
 fn extract_button_enabled(find_query: &str) -> bool {
     !find_query.is_empty()
 }
 
 /// Find All 버튼을 활성화할지. 검색어가 비면 스캔할 게 없으므로 비활성이다
-/// (추출 버튼과 같은 규칙). `render_find_panel` 안에 인라인으로 두면 지우거나
-/// 뒤집어도 렌더 결과만 보는 테스트로는 잡히지 않으므로 순수 함수로 뽑는다.
+/// (추출 버튼과 같은 규칙, 날 문자열을 보는 이유도 같다). `render_find_panel`
+/// 안에 인라인으로 두면 지우거나 뒤집어도 렌더 결과만 보는 테스트로는 잡히지
+/// 않으므로 순수 함수로 뽑는다.
 fn find_all_button_enabled(find_query: &str) -> bool {
     !find_query.is_empty()
 }
@@ -3166,6 +3242,10 @@ fn build_extracted_doc(
         find_query: String::new(),
         replace_text: String::new(),
         find_opts: crate::find::FindOptions::default(),
+        // 이스케이프 해석 여부도 검색어/옵션과 함께 원본에서 물려받는다
+        // (`extract_matching_rows`가 덮어쓴다) — 새 탭에서 같은 검색어로 Find
+        // Next를 눌렀을 때 원본과 같은 것을 찾아야 한다.
+        find_escapes: false,
         last_match: None,
         find_status: String::new(),
         find_focus_pending: false,
@@ -3248,7 +3328,7 @@ impl App {
             return;
         }
         let Some(doc) = self.docs.get(self.active) else { return };
-        if doc.find_query.is_empty() {
+        if effective_query(doc).is_empty() {
             if let Some(doc) = self.doc_mut() {
                 doc.find_status = "Enter text to find".to_owned();
             }
@@ -3309,8 +3389,13 @@ impl App {
         // 원본의 검색어/옵션을 새 탭에 물려준다 — 추출본은 "그 검색어로 Find
         // All을 한 셈"이므로 열자마자 하이라이트가 보여야 하고, 사용자가 새
         // 탭에서 곧바로 Find Next도 할 수 있어야 한다.
+        // 새 탭에는 **날 검색어와 이스케이프 토글을 함께** 물려준다. 디코딩된
+        // 값만 넘기면 새 탭의 입력란에 탭 문자가 그대로 박혀 보이지 않는 글자가
+        // 되고, 사용자가 원본 탭에서 친 `\t`라는 입력이 사라진다. 둘을 함께
+        // 넘기면 새 탭의 `effective_query`가 원본과 똑같은 값을 만든다.
         let carry_query = doc.find_query.clone();
         let carry_opts = doc.find_opts.clone();
+        let carry_escapes = doc.find_escapes;
         let mut new_doc = build_extracted_doc(
             &lines,
             doc.enc,
@@ -3323,11 +3408,14 @@ impl App {
         // 문서에서는 (헤더를 뺀) 모든 데이터 행이 매치이지만, 셀 안 부분 매치
         // 위치까지 원본과 똑같이 그리려면 실제 스캔이 가장 단순·정확하다 —
         // "추출 = 새 탭에 Find All을 자동으로 한 셈"을 그대로 코드로 옮긴다.
-        new_doc.find_query = carry_query.clone();
+        new_doc.find_query = carry_query;
         new_doc.find_opts = carry_opts.clone();
+        new_doc.find_escapes = carry_escapes;
         let hl_rows = scan_all_matches(&new_doc);
         new_doc.highlight = Some(Highlight {
-            query: carry_query,
+            // 스냅샷에는 디코딩된 값(Find All과 같은 규율). 방금 세운 필드
+            // 셋으로 계산하므로 `scan_all_matches`가 쓴 needle과 반드시 같다.
+            query: effective_query(&new_doc),
             opts: carry_opts,
             rows: hl_rows,
         });
@@ -3379,6 +3467,36 @@ fn whole_cell_enabled(doc: &Document) -> bool {
 fn find_opts_changed(before: &crate::find::FindOptions, after: &crate::find::FindOptions) -> bool {
     before != after
 }
+
+/// 이번 프레임에 **검색 기준**이 바뀌었는가 — 옵션이든 이스케이프 해석 여부든.
+/// 바뀌었다면 `find_opts_changed`가 하던 것과 같은 이유로 `last_match`/
+/// `find_status`를 리셋해야 한다: 이스케이프를 켜는 순간 `\t`는 두 글자가 아니라
+/// 탭 한 글자가 되므로, 이전 검색어로 잡아 둔 매치 자리는 새 기준의 매치가
+/// 아니다. 그 자리를 기준으로 Find Next를 이어 가면 "체크박스를 켰는데 다음
+/// 찾기가 예전 자리에서 이어진다"가 된다.
+///
+/// **`highlight`는 여기서 건드리지 않는다**(확정된 동작) — Find All 스냅샷은
+/// 다음 Find All까지 유지된다. 그래서 이 함수도 리셋 여부만 판단하고 무엇을
+/// 리셋할지는 호출부가 정한다.
+///
+/// 인라인 `!=` 두 개로 두지 않고 함수로 뽑는 이유는 `find_opts_changed`와 같다 —
+/// egui 체크박스 클릭을 좌표로 시뮬레이션하지 않는 이상 렌더 안의 판정은 테스트로
+/// 구동할 방법이 없다. 값만 넘겨 직접 검증한다.
+fn find_inputs_changed(
+    before_opts: &crate::find::FindOptions,
+    after_opts: &crate::find::FindOptions,
+    before_esc: bool,
+    after_esc: bool,
+) -> bool {
+    find_opts_changed(before_opts, after_opts) || before_esc != after_esc
+}
+
+/// 이스케이프 체크박스 툴팁. 규칙 전부와 **`\n`이 지원되지 않는다는 것**,
+/// 그리고 그래도 오류가 아니라 두 글자 그대로 찾힌다는 것을 알려야 한다 —
+/// 사용자가 `\n`을 쳤을 때 아무 안내 없이 "못 찾음"만 뜨면 기능이 고장 난
+/// 것처럼 보인다. `render_find_panel` 안의 문자열 리터럴로 두면 문구를 지워도
+/// 아무 테스트가 깨지지 않으므로 상수로 뽑는다(`EXTRACT_LOCKED_STATUS`와 같은 결).
+const FIND_ESCAPES_TOOLTIP: &str = "\\t = tab, \\\\ = backslash, \\xNN = character code (hex, e.g. \\x41 = A).\n\\n is not supported: a line is a row here, so it stays as the two characters \\ and n.\nAny other \\x sequence is left as typed.";
 
 /// 찾기 상태 문구. `find_status`(Replace 결과나 "Not found" 등)가 있으면 그걸
 /// 우선한다 — 사용자가 방금 누른 버튼의 결과이므로 매치 개수보다 관심사가
@@ -3468,6 +3586,7 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
             // 바꿔도 자동 스캔이 없으므로 여기서는 last_match/find_status만
             // 리셋한다 — 하이라이트를 새 옵션으로 맞추려면 Find All을 다시 누른다.
             let before = doc.find_opts.clone();
+            let before_esc = doc.find_escapes;
             let mut scope = doc.find_opts.scope;
             ui.horizontal(|ui| {
                 ui.radio_value(&mut scope, crate::find::MatchScope::Partial, "Partial");
@@ -3481,8 +3600,14 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
                 });
             });
             doc.find_opts.scope = scope;
-            ui.checkbox(&mut doc.find_opts.match_case, "Match case");
-            if find_opts_changed(&before, &doc.find_opts) {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut doc.find_opts.match_case, "Match case");
+                // 이스케이프 해석은 매칭 규칙(`FindOptions`)이 아니라 "입력란을
+                // 어떻게 읽을 것인가"이므로 별도 필드를 직접 토글한다.
+                ui.checkbox(&mut doc.find_escapes, "Escape sequences")
+                    .on_hover_text(FIND_ESCAPES_TOOLTIP);
+            });
+            if find_inputs_changed(&before, &doc.find_opts, before_esc, doc.find_escapes) {
                 doc.last_match = None;
                 doc.find_status.clear();
             }
@@ -8401,13 +8526,18 @@ mod tests {
 
     /// `scan_all_matches`의 결과를 `matching_lines` 브루트포스와 같은 행 집합으로
     /// 비교하는 공통 검사. 두 경로가 반드시 일치해야 한다.
+    ///
+    /// 브루트포스에도 **`effective_query`를 넘긴다**(날 `doc.find_query`가
+    /// 아니라). 계약이 말하는 것은 "두 경로가 같은 needle에 대해 같은 행 집합을
+    /// 준다"이므로, 이스케이프가 켜진 문서에서 한쪽에만 날 문자열을 넣으면 이
+    /// 검사는 계약이 아니라 배선 실수를 재현할 뿐이다.
     fn assert_scan_equals_brute(doc: &Document) {
         let got = scan_all_matches(doc);
         let n = doc_line_count(doc);
         let delim = doc_delimiter(doc);
         let brute: Vec<u32> = crate::find::matching_lines(
             n,
-            &doc.find_query,
+            &effective_query(doc),
             &doc.find_opts,
             delim,
             |i| logical_line(doc, i),
@@ -9732,7 +9862,7 @@ mod tests {
         doc.find_query = "hit".to_owned();
         let brute: Vec<u32> = crate::find::matching_lines(
             doc_line_count(&doc),
-            &doc.find_query,
+            &effective_query(&doc),
             &doc.find_opts,
             doc_delimiter(&doc),
             |i| logical_line(&doc, i),
@@ -10870,7 +11000,7 @@ mod tests {
             let total = doc_line_count(doc);
             crate::find::matching_lines(
                 total.saturating_sub(plan.scan_from),
-                &doc.find_query,
+                &effective_query(doc),
                 &doc.find_opts,
                 doc_delimiter(doc),
                 |i| logical_line(doc, i + plan.scan_from),
@@ -11655,5 +11785,228 @@ mod tests {
         let (_align, row) = gutter_click_target(doc, 2, doc.sep);
         // has_header=true → data_start=1 → 논리 2행은 화면 1행.
         assert_eq!(row, 1);
+    }
+
+    // ---- 찾기/바꾸기 이스케이프 시퀀스 (Task L) ----------------------------
+
+    /// TSV 편집 문서를 만든다. `edit_doc`은 `.csv`로 열어 구분자가 `,`로
+    /// 고정되므로, 탭이 **구분자**인 상황(사용자의 실제 목적)을 만들려면
+    /// 확장자를 달리해 열어야 한다.
+    fn tsv_edit_doc(content: &[u8]) -> App {
+        let p = temp_ext(content, "tsv");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        doc.has_header = false;
+        enter_edit_mode(doc);
+        app
+    }
+
+    #[test]
+    fn effective_query_respects_toggle() {
+        let (mut app, _d) = edit_doc(b"a,b\n", false);
+        let doc = app.doc_mut().unwrap();
+        // 꺼짐: 윈도우 경로가 글자 그대로 남는다(기본값이 꺼짐인 이유).
+        doc.find_query = r"C:\temp".to_owned();
+        assert!(!doc.find_escapes, "기본값은 꺼짐");
+        assert_eq!(effective_query(doc), r"C:\temp");
+        doc.find_query = r"a\tb".to_owned();
+        assert_eq!(effective_query(doc), r"a\tb", "꺼져 있으면 두 글자 그대로");
+        // 켜짐: `\t`가 탭 한 글자가 된다.
+        doc.find_escapes = true;
+        assert_eq!(effective_query(doc), "a\tb");
+        assert_eq!(effective_query(doc), crate::find::unescape(r"a\tb"));
+    }
+
+    #[test]
+    fn effective_replacement_respects_toggle() {
+        let (mut app, _d) = edit_doc(b"a,b\n", false);
+        let doc = app.doc_mut().unwrap();
+        doc.replace_text = r"x\ty".to_owned();
+        assert_eq!(effective_replacement(doc), r"x\ty", "꺼짐: 날 문자열");
+        doc.find_escapes = true;
+        assert_eq!(effective_replacement(doc), "x\ty", "켜짐: 실제 탭");
+    }
+
+    /// 사용자의 실제 목적을 직접 검증한다: TSV의 구분자 탭을 `\t`로 찾는다.
+    #[test]
+    fn tab_search_finds_tsv_separator() {
+        let mut app = tsv_edit_doc(b"a\tb\nnotab\nc\td\n");
+        let doc = app.doc_mut().unwrap();
+        assert_eq!(doc.sep, SeparatorMode::Char(b'\t'), "사전 조건: 탭 구분");
+        doc.find_query = r"\t".to_owned();
+        // 꺼져 있으면 `\`+`t` 두 글자를 찾으므로 아무 행도 안 걸린다.
+        apply_find_action(doc, FindAction::All);
+        assert!(
+            doc.highlight.as_ref().unwrap().rows.is_empty(),
+            "이스케이프가 꺼져 있으면 리터럴 두 글자를 찾는다"
+        );
+        // 켜면 실제 탭이 있는 행만 걸린다.
+        doc.find_escapes = true;
+        apply_find_action(doc, FindAction::All);
+        assert_eq!(doc.highlight.as_ref().unwrap().rows, vec![0, 2]);
+    }
+
+    /// Find All 스냅샷에는 **디코딩된** 검색어가 들어간다(L-4).
+    #[test]
+    fn find_all_snapshot_stores_decoded_query() {
+        let mut app = tsv_edit_doc(b"a\tb\n");
+        let doc = app.doc_mut().unwrap();
+        doc.find_escapes = true;
+        doc.find_query = r"\t".to_owned();
+        apply_find_action(doc, FindAction::All);
+        let hl = doc.highlight.as_ref().unwrap();
+        assert_eq!(hl.query, "\t", "스냅샷은 날 문자열이 아니라 실제 탭을 담는다");
+        assert_ne!(hl.query, doc.find_query);
+    }
+
+    /// Find All 뒤에 체크박스를 꺼도 스냅샷은 그대로다 — 스냅샷의 뜻이
+    /// "그때 그 검색어로 찾은 결과"이기 때문(`opts`를 얼려 두는 것과 같은 규율).
+    #[test]
+    fn highlight_survives_escape_toggle_off() {
+        let mut app = tsv_edit_doc(b"a\tb\nnotab\n");
+        let doc = app.doc_mut().unwrap();
+        doc.find_escapes = true;
+        doc.find_query = r"\t".to_owned();
+        apply_find_action(doc, FindAction::All);
+        let before = doc.highlight.clone();
+        assert_eq!(before.as_ref().unwrap().rows, vec![0]);
+        // 체크박스를 끈다(렌더 경로가 하는 일 = 필드 토글 + 리셋 판정).
+        doc.find_escapes = false;
+        assert_eq!(doc.highlight, before, "하이라이트는 다음 Find All까지 유지");
+        assert_eq!(doc.highlight.as_ref().unwrap().query, "\t");
+    }
+
+    /// 이스케이프 토글도 옵션 변경과 같은 결로 검색 기준을 바꾸므로
+    /// `last_match`/`find_status`를 리셋해야 한다. **`highlight`는 유지.**
+    /// 판정은 순수 함수 `find_inputs_changed`가 한다(인라인 복붙 금지).
+    #[test]
+    fn escape_toggle_resets_last_match() {
+        let o = crate::find::FindOptions::default();
+        let mut o2 = o.clone();
+        o2.match_case = true;
+        // 아무것도 안 바뀌면 리셋하지 않는다.
+        assert!(!find_inputs_changed(&o, &o, false, false));
+        assert!(!find_inputs_changed(&o, &o, true, true));
+        // 옵션만 바뀌어도(기존 동작), 이스케이프만 바뀌어도(새 동작) 리셋한다.
+        assert!(find_inputs_changed(&o, &o2, false, false), "옵션 변경");
+        assert!(find_inputs_changed(&o, &o, false, true), "이스케이프 켬");
+        assert!(find_inputs_changed(&o, &o, true, false), "이스케이프 끔");
+        assert!(find_inputs_changed(&o, &o2, false, true), "둘 다 바뀜");
+
+        // 그 판정이 실제로 리셋으로 이어지는지 — 렌더가 하는 일을 그대로 옮긴다.
+        let mut app = tsv_edit_doc(b"a\tb\n");
+        let doc = app.doc_mut().unwrap();
+        doc.find_escapes = true;
+        doc.find_query = r"\t".to_owned();
+        apply_find_action(doc, FindAction::All);
+        apply_find_action(doc, FindAction::Next);
+        assert!(doc.last_match.is_some(), "사전 조건: 커서가 잡혀 있다");
+        let hl = doc.highlight.clone();
+        let before_opts = doc.find_opts.clone();
+        let before_esc = doc.find_escapes;
+        doc.find_escapes = false;
+        if find_inputs_changed(&before_opts, &doc.find_opts, before_esc, doc.find_escapes) {
+            doc.last_match = None;
+            doc.find_status.clear();
+        }
+        assert!(doc.last_match.is_none(), "기준이 바뀌었으므로 커서를 버린다");
+        assert_eq!(doc.highlight, hl, "하이라이트는 건드리지 않는다");
+    }
+
+    /// 편집 모드에서 `\t`를 다른 글자로 Replace All 하면 실제 탭이 바뀌고,
+    /// Ctrl+Z 한 번으로 전부 복구된다.
+    #[test]
+    fn replace_tab_with_text() {
+        let mut app = tsv_edit_doc(b"a\tb\nc\td\nnotab\n");
+        let doc = app.doc_mut().unwrap();
+        let before = doc.edit.as_ref().unwrap().lines.clone();
+        doc.find_escapes = true;
+        doc.find_query = r"\t".to_owned();
+        doc.replace_text = "|".to_owned();
+        apply_find_action(doc, FindAction::ReplaceAll);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["a|b", "c|d", "notab"]));
+        assert_eq!(doc.find_status, "2 replacements");
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, before, "undo 한 번에 전부 복구");
+    }
+
+    /// 반대 방향 — 치환문 쪽 `\t`도 실제 탭이 된다(`effective_replacement` 배선).
+    #[test]
+    fn replace_inserts_real_tab() {
+        let (mut app, _d) = edit_doc(b"a|b\n", false);
+        let doc = app.doc_mut().unwrap();
+        doc.find_escapes = true;
+        doc.find_query = "|".to_owned();
+        doc.replace_text = r"\t".to_owned();
+        apply_find_action(doc, FindAction::ReplaceAll);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["a\tb"]));
+    }
+
+    /// **배선 누락 방지의 핵심 테스트.** 같은 문서·같은 입력에서 Find Next /
+    /// Find All / 추출이 **같은 행 집합**을 본다. L-3 표의 소비 지점이 하나라도
+    /// 날 `doc.find_query`를 쓰면 그 경로만 행 집합이 달라져 여기서 깨진다.
+    #[test]
+    fn escaped_query_used_by_every_path() {
+        let mut app = tsv_edit_doc(b"a\tb\nnotab\nc\td\ne\tf\n");
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.find_escapes = true;
+            doc.find_query = r"\t".to_owned();
+        }
+        // (1) Find All 스냅샷.
+        {
+            let doc = app.doc_mut().unwrap();
+            apply_find_action(doc, FindAction::All);
+            assert_eq!(doc.highlight.as_ref().unwrap().rows, vec![0, 2, 3]);
+            // (2) scan_all_matches == 브루트포스(절대 계약, 디코딩된 needle로).
+            assert_scan_equals_brute(doc);
+            // (3) Find Next를 반복해 순회한 행들.
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                apply_find_action(doc, FindAction::Next);
+                seen.push(doc.last_match.unwrap().line as u32);
+            }
+            seen.dedup();
+            assert_eq!(seen, vec![0, 2, 3], "Find Next도 같은 행들을 순회한다");
+        }
+        // (4) 추출이 만든 새 탭의 행 수와, 새 탭이 물려받은 상태.
+        app.extract_matching_rows();
+        let new_doc = app.doc().unwrap();
+        assert!(new_doc.is_extracted);
+        assert_eq!(doc_line_count(new_doc), 3, "매치 행 3개가 추출된다");
+        assert!(new_doc.find_escapes, "이스케이프 토글도 새 탭에 물려준다");
+        assert_eq!(new_doc.find_query, r"\t", "입력란에는 날 문자열이 보인다");
+        assert_eq!(
+            new_doc.highlight.as_ref().unwrap().query,
+            "\t",
+            "새 탭 스냅샷도 디코딩된 값"
+        );
+        assert_eq!(
+            new_doc.highlight.as_ref().unwrap().rows,
+            vec![0, 1, 2],
+            "추출본은 전 행이 매치다"
+        );
+    }
+
+    /// 이스케이프가 켜져 있어도 버튼 활성 조건은 **날 문자열**을 본다 —
+    /// "사용자가 입력란에 뭔가 쳤는가"를 묻는 판정이기 때문. 두 근거가 실제로
+    /// 같은 값을 준다는 것도 함께 못박는다(디코딩이 검색어를 비게 만들 수 없다).
+    #[test]
+    fn button_guards_use_raw_query() {
+        assert!(!find_all_button_enabled(""));
+        assert!(!extract_button_enabled(""));
+        // 디코딩하면 사라질 것 같은 입력들도 전부 "쳤다"로 판정된다.
+        for raw in [r"\", r"\x", r"\t", r"\n", r"C:\temp"] {
+            assert!(find_all_button_enabled(raw), "{raw:?}는 활성");
+            assert!(extract_button_enabled(raw), "{raw:?}는 활성");
+            assert!(
+                !crate::find::unescape(raw).is_empty(),
+                "{raw:?}: 디코딩이 검색어를 비게 만들지 않는다"
+            );
+        }
+        assert!(crate::find::unescape("").is_empty(), "빈 입력만 빈 결과");
     }
 }
