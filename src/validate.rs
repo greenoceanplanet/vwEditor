@@ -7,7 +7,8 @@ use crate::index::LineIndex;
 use crate::parse::{decode_line, split_fields, Encoding};
 use crate::source::Source;
 use rayon::prelude::*;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// 한 행이 전체 규칙과 어긋나는 유형.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +197,7 @@ pub fn scan_lines(
 ///   있지 않도록 한다.
 ///
 /// 결과는 논리 행번호 오름차순.
+#[allow(clippy::too_many_arguments)]
 pub fn scan_errors(
     source: &Arc<Source>,
     index: &LineIndex,
@@ -243,6 +245,101 @@ pub fn scan_errors(
             local
         })
         .reduce(ScanResult::default, |a, b| merge_results(a, b, limit))
+}
+
+/// 오류 목록에 담을 최대 행 수. 초과분은 `ScanResult::dropped`로 센다.
+///
+/// 상한이 필요한 이유: 구분자를 잘못 고르면 **모든 행**이 오류가 된다
+/// (1,500만 행짜리 파일에서 `RowError` 1,500만 개 = 수 GB). 목록을 다 담아도
+/// 사람이 볼 수 있는 양이 아니다.
+pub const MAX_ROW_ERRORS: usize = 10_000;
+
+/// 백그라운드 오류 검사 작업. `sort::SortJob`과 같은 규율이다 — UI를 막지
+/// 않고, 폴링으로 결과를 수거하며, 취소할 수 있다.
+pub struct ScanJob {
+    result: Arc<Mutex<Option<ScanResult>>>,
+    finished: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ScanJob {
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
+    }
+
+    /// 완료됐으면 결과를 꺼낸다(한 번만). 미완료면 `None`.
+    pub fn take_result(&mut self) -> Option<ScanResult> {
+        if !self.is_finished() {
+            return None;
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        self.result.lock().unwrap().take()
+    }
+
+    /// 취소를 요청한다. 스레드는 다음 청크 경계에서 멈춘다.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 스레드를 join하지 않고 버려도 프로세스가 종료될 때까지 코어를 붙들지
+/// 않도록, 드롭 시 취소를 신호한다. join까지 기다리지는 않는다 — UI 스레드가
+/// 탭을 닫는 순간 멈추면 안 되기 때문이다.
+impl Drop for ScanJob {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// mmap을 백그라운드에서 스캔한다. 인덱싱이 끝난 뒤에 부를 것.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_scan(
+    source: Arc<Source>,
+    index: LineIndex,
+    enc: Encoding,
+    delim: u8,
+    expected_cols: usize,
+    data_start: usize,
+    ctx: egui::Context,
+) -> ScanJob {
+    let result = Arc::new(Mutex::new(None));
+    let finished = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let (result_bg, finished_bg, cancel_bg) = (result.clone(), finished.clone(), cancel.clone());
+    let handle = std::thread::spawn(move || {
+        let is_cancelled = {
+            let cancel = cancel_bg.clone();
+            move || cancel.load(Ordering::Relaxed)
+        };
+        let r = scan_errors(
+            &source,
+            &index,
+            enc,
+            delim,
+            expected_cols,
+            data_start,
+            MAX_ROW_ERRORS,
+            Some(&is_cancelled),
+        );
+        // 취소된 결과는 부분적이라 버린다 — 반쪽짜리 목록을 "검사 완료"로
+        // 보여 주면 사용자가 남은 오류를 없는 것으로 오해한다.
+        if !cancel_bg.load(Ordering::Relaxed) {
+            *result_bg.lock().unwrap() = Some(r);
+        }
+        finished_bg.store(true, Ordering::Relaxed);
+        ctx.request_repaint();
+    });
+
+    ScanJob {
+        result,
+        finished,
+        cancel,
+        handle: Some(handle),
+    }
 }
 
 #[cfg(test)]
@@ -655,5 +752,200 @@ mod tests {
 
         assert_eq!(from_mmap, from_lines);
         assert!(!from_mmap.errors.is_empty(), "검증이 공집합을 비교하면 무의미");
+    }
+
+    // ---- ScanJob (백그라운드) ----
+
+    #[test]
+    fn spawn_scan_delivers_same_result_as_direct_scan() {
+        let (src, idx) = open_indexed(b"a,b,c\n1,2,3\n4,5\n6,7,8\n");
+        let direct = scan_errors(
+            &src,
+            &idx,
+            Encoding::Utf8,
+            b',',
+            3,
+            1,
+            MAX_ROW_ERRORS,
+            None,
+        );
+        let mut job = spawn_scan(
+            src.clone(),
+            idx.clone(),
+            Encoding::Utf8,
+            b',',
+            3,
+            1,
+            egui::Context::default(),
+        );
+        // 완료까지 기다린다(테스트라 폴링해도 무방).
+        let got = loop {
+            if let Some(r) = job.take_result() {
+                break r;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(got, direct);
+    }
+
+    /// 완료 전에는 결과를 내주지 않는다(폴링 계약).
+    #[test]
+    fn take_result_is_none_until_finished() {
+        let (src, idx) = open_indexed(b"a,b\n1\n");
+        let mut job = spawn_scan(
+            src,
+            idx,
+            Encoding::Utf8,
+            b',',
+            2,
+            1,
+            egui::Context::default(),
+        );
+        if !job.is_finished() {
+            assert!(job.take_result().is_none());
+        }
+        // 완료되면 정확히 한 번만 내준다.
+        while !job.is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(job.take_result().is_some());
+        assert!(job.take_result().is_none(), "결과는 한 번만 꺼낸다");
+    }
+
+    /// 실파일 오류 검사 성능 + **전 행 차등 검증** 벤치.
+    ///
+    /// 병렬 스캔이 빠르기만 하고 틀리면 소용없으므로, 같은 파일을
+    /// **단일 스레드 기준 구현**으로 한 번 더 훑어 결과를 대조한다. 기준
+    /// 구현은 `check_line`을 그대로 쓰되 병렬·청크·병합을 거치지 않는다 —
+    /// 검증 대상은 그 세 가지다.
+    ///
+    ///   TV_BENCH_FILE=... cargo test --release bench_validate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_validate() {
+        use std::time::Instant;
+        let Ok(path) = std::env::var("TV_BENCH_FILE") else {
+            eprintln!("TV_BENCH_FILE 미지정 — 스킵");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let delim = match path.extension().and_then(|e| e.to_str()) {
+            Some("tsv") | Some("tab") => b'\t',
+            _ => b',',
+        };
+
+        let src = Arc::new(crate::source::open(&path).unwrap());
+        let idx = LineIndex::new(src.len());
+        let ctx = egui::Context::default();
+        crate::indexer::spawn_indexer(src.clone(), idx.clone(), Encoding::Utf8, ctx)
+            .join()
+            .unwrap();
+        let rows = idx.line_count();
+        let gb = src.len() as f64 / 1e9;
+
+        // 기대 컬럼 수 = 헤더 필드 수.
+        let expected = {
+            let (s, e) = idx.line_range(0).unwrap();
+            let text = decode_line(src.slice(s, e), Encoding::Utf8);
+            split_fields(text.trim_end_matches(['\r', '\n']), delim).len()
+        };
+        eprintln!(
+            "file={} size={gb:.2}GB rows={rows} expected_cols={expected}",
+            path.display()
+        );
+
+        // 상한을 사실상 없애 전수 비교가 되게 한다.
+        let no_limit = usize::MAX;
+        let t = Instant::now();
+        let parallel = scan_errors(
+            &src,
+            &idx,
+            Encoding::Utf8,
+            delim,
+            expected,
+            1,
+            no_limit,
+            None,
+        );
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "병렬 스캔: {ms:8.1} ms  ({:.1} M rows/s)  오류 {}행",
+            rows as f64 / 1e6 / (ms / 1000.0),
+            parallel.total()
+        );
+
+        // 단일 스레드 기준 구현.
+        let (offsets, total_bytes) = idx.snapshot();
+        let bytes = src.as_bytes();
+        let t = Instant::now();
+        let mut reference: Vec<RowError> = Vec::new();
+        for logical in 1..rows {
+            let Some((s, e)) = LineIndex::range_in(&offsets, total_bytes, logical) else {
+                continue;
+            };
+            let text = decode_line(&bytes[s as usize..e as usize], Encoding::Utf8);
+            let line = text.trim_end_matches(['\r', '\n']);
+            if let Some(issue) = check_line(line, delim, expected) {
+                reference.push(RowError { logical, issue, preview: preview_of(line) });
+            }
+        }
+        let ref_ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "단일 스레드: {ref_ms:8.1} ms  (병렬이 {:.1}배 빠름)",
+            ref_ms / ms
+        );
+
+        assert_eq!(
+            parallel.errors, reference,
+            "전 행 차등 검증 실패 — 병렬 결과가 기준과 다르다"
+        );
+        eprintln!("전 행 차등 검증: {} 행 중 불일치 0", rows - 1);
+        let (fc, uq, de) = parallel.counts();
+        eprintln!("유형별: 필드수 {fc} / 따옴표 {uq} / 디코드 {de}");
+
+        // 상한 동작도 실파일에서 확인한다 — 상한이 걸린 목록은 (a) 오름차순이고
+        // (b) 기준 결과의 **앞에서부터** 정확히 그만큼이어야 한다.
+        if parallel.total() > 4 {
+            let cap = parallel.total() / 2;
+            let capped = scan_errors(
+                &src,
+                &idx,
+                Encoding::Utf8,
+                delim,
+                expected,
+                1,
+                cap,
+                None,
+            );
+            assert_eq!(capped.errors.len(), cap);
+            assert_eq!(capped.total(), parallel.total(), "총계는 상한과 무관");
+            assert_eq!(
+                capped.errors,
+                reference[..cap],
+                "상한이 걸려도 앞에서부터 그대로"
+            );
+            eprintln!("상한 검증: {cap}개 수집 / {}개 버림 — 앞에서부터 일치", capped.dropped);
+        }
+    }
+
+    /// 취소된 작업은 **부분 결과를 내주지 않는다**. 반쪽 목록을 "검사 완료"로
+    /// 보여 주면 남은 오류를 없는 것으로 오해한다.
+    #[test]
+    fn cancelled_job_yields_no_result() {
+        let (src, idx) = open_indexed(b"a,b\n1\n2\n3\n");
+        let mut job = spawn_scan(
+            src,
+            idx,
+            Encoding::Utf8,
+            b',',
+            2,
+            1,
+            egui::Context::default(),
+        );
+        job.cancel();
+        while !job.is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(job.take_result().is_none());
     }
 }

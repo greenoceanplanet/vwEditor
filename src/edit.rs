@@ -458,6 +458,22 @@ pub struct UndoStack {
     /// `sizes`의 합. 증감으로만 유지한다.
     bytes: usize,
     budget: usize,
+    /// 편집이 일어날 때마다 1 늘어나는 카운터. 되돌리기도 편집이므로 함께 센다
+    /// (같은 값으로 되돌아가지 않는다 — 되돌린 뒤의 내용은 그 전과 다르다).
+    ///
+    /// **용도: 캐시 무효화.** 오류 행 목록처럼 "이 시점의 데이터"를 설명하는
+    /// 결과가, 데이터가 바뀐 뒤에도 최신인 척 남아 있으면 안 된다.
+    ///
+    /// **왜 `dirty`나 스택 길이가 아니라 이것인가.** `dirty`는 한 번 서면 계속
+    /// 서 있어 "그 뒤로 또 바뀌었는가"를 답하지 못한다. 스택 길이는 상한
+    /// (`UNDO_LIMIT`·바이트 예산)에 걸리면 push를 해도 그대로거나 줄어들 수
+    /// 있어 편집을 놓친다.
+    ///
+    /// **왜 편집 지점마다 세지 않고 여기서 세는가.** 편집을 수행하는 자리는
+    /// `app.rs`에 열 곳이 넘는데, 전부가 예외 없이 `push`를 지난다. 지점마다
+    /// 손으로 세면 나중에 추가되는 편집 하나가 조용히 빠지고, 그때 증상은
+    /// "오류 목록이 가끔 안 맞는다"라 추적하기 가장 나쁜 종류다.
+    revision: u64,
 }
 
 /// 기본 되돌리기 깊이(사용자 확정).
@@ -540,7 +556,13 @@ impl UndoStack {
     /// 바이트 예산을 직접 정해 만든다(테스트용 — 512MB를 실제로 채우려면
     /// 테스트가 수백 MB를 할당해야 한다).
     pub fn with_budget(limit: usize, budget: usize) -> Self {
-        UndoStack { ops: Vec::new(), sizes: Vec::new(), limit, bytes: 0, budget }
+        UndoStack { ops: Vec::new(), sizes: Vec::new(), limit, bytes: 0, budget, revision: 0 }
+    }
+
+    /// 지금까지 일어난 편집 횟수. 값 자체에는 의미가 없고 **달라졌는지**만 본다
+    /// (`revision` 필드 주석 참조).
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn len(&self) -> usize {
@@ -559,6 +581,9 @@ impl UndoStack {
     /// 되돌리기 한 단계를 쌓는다. 단계 수나 바이트 예산을 넘으면 가장 오래된
     /// 것부터 버린다. **편집을 적용하기 직전에** 호출해야 한다(이전 상태를 담으므로).
     pub fn push(&mut self, op: EditOp) {
+        // 되돌리기를 못 쌓는 경우(limit 0)에도 **편집은 일어났다**. 아래
+        // 조기 반환보다 먼저 세지 않으면 그 편집이 캐시 무효화에서 누락된다.
+        self.revision += 1;
         if self.limit == 0 {
             return;
         }
@@ -584,8 +609,11 @@ impl UndoStack {
     /// 범위를 벗어난 인덱스는 조용히 건너뛴다(패닉 없음).
     pub fn undo(&mut self, lines: &mut Vec<String>) -> bool {
         let Some(op) = self.ops.pop() else {
+            // 되돌릴 게 없으면 내용도 안 바뀌었다 — revision을 올리지 않는다.
             return false;
         };
+        // 되돌리기도 내용을 바꾸므로 편집이다.
+        self.revision += 1;
         // 되돌린 단계는 스택에서 빠지므로 회계에서도 빼야 한다 — 안 그러면
         // undo를 반복할수록 남은 예산이 실제보다 작다고 착각한다.
         if let Some(b) = self.sizes.pop() {
@@ -1153,6 +1181,62 @@ mod tests {
             }
         }
         assert_eq!(cases, (1 + 5 + 25 + 125) * 3);
+    }
+
+    /// revision은 편집마다 **달라져야** 한다 — 캐시 무효화가 이 값에만
+    /// 기대기 때문이다.
+    #[test]
+    fn revision_advances_on_every_push() {
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        let start = st.revision();
+        for i in 0..5 {
+            st.push(EditOp::Replace(vec![(i, "x".to_string())]));
+        }
+        assert_eq!(st.revision(), start + 5);
+    }
+
+    /// 되돌리기도 내용을 바꾸므로 revision이 올라간다. 되돌아가서 **같은 값**이
+    /// 되면 "편집 → 되돌리기" 뒤의 캐시가 최신인 척 되살아난다.
+    #[test]
+    fn revision_advances_on_undo_too() {
+        let mut lines = v(&["a", "b"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        st.push(EditOp::Replace(vec![(0, lines[0].clone())]));
+        lines[0] = "X".to_string();
+        let after_push = st.revision();
+        assert!(st.undo(&mut lines));
+        assert_ne!(st.revision(), after_push, "되돌리기도 편집이다");
+    }
+
+    /// 되돌릴 것이 없으면 내용도 그대로이므로 revision은 그대로여야 한다.
+    #[test]
+    fn revision_unchanged_when_undo_has_nothing() {
+        let mut lines = v(&["a"]);
+        let mut st = UndoStack::new(UNDO_LIMIT);
+        let before = st.revision();
+        assert!(!st.undo(&mut lines));
+        assert_eq!(st.revision(), before);
+    }
+
+    /// 스택 상한에 걸려 op가 버려져도 revision은 올라간다. 스택 길이로
+    /// 무효화를 판단하면 이 경우를 놓친다(길이가 그대로다).
+    #[test]
+    fn revision_advances_even_when_ops_are_evicted() {
+        let mut st = UndoStack::new(2);
+        for i in 0..6 {
+            st.push(EditOp::Replace(vec![(i, "x".to_string())]));
+        }
+        assert_eq!(st.len(), 2, "스택 길이는 상한에 눌린다");
+        assert_eq!(st.revision(), 6, "그래도 편집은 6번 일어났다");
+    }
+
+    /// 되돌리기를 아예 못 쌓는 설정(limit 0)에서도 편집은 일어난다.
+    #[test]
+    fn revision_advances_when_undo_disabled() {
+        let mut st = UndoStack::new(0);
+        st.push(EditOp::Replace(vec![(0, "x".to_string())]));
+        assert_eq!(st.len(), 0);
+        assert_eq!(st.revision(), 1);
     }
 
     #[test]

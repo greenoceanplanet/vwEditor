@@ -176,6 +176,24 @@ pub struct Document {
     /// 기록한다 — Page 키 처리 시점(`update()` 끝)에는 본문 `Ui`가 없어
     /// `available_height`를 다시 구할 수 없기 때문이다.
     pub visible_rows: usize,
+    /// 파싱 오류 행 검사 결과. `None`이면 아직 검사한 적이 없다(진행 중이거나
+    /// 시작 전). `Some`이면 그 시점 기준으로 검사가 **끝났다**.
+    ///
+    /// "결과 없음"과 "오류 0개"를 `Option`으로 가른다 — 둘 다 빈 목록이지만
+    /// 상태바에 쓸 문구가 정반대다("검사 중…" vs "오류 없음").
+    pub row_errors: Option<crate::validate::ScanResult>,
+    /// 진행 중인 백그라운드 검사. 완료되면 `row_errors`로 옮기고 `None`이 된다.
+    pub error_scan: Option<crate::validate::ScanJob>,
+    /// `row_errors`가 어느 시점의 편집 버퍼를 설명하는가
+    /// (`UndoStack::revision`). 지금 값과 다르면 목록이 낡은 것이므로 다시
+    /// 검사한다. 뷰 모드(`edit == None`)에서는 데이터가 변하지 않으므로 0.
+    ///
+    /// 편집 지점마다 무효화를 부르지 않고 이렇게 **관측**으로 처리하는 이유:
+    /// 편집을 수행하는 자리가 열 곳이 넘어, 손으로 거는 무효화는 나중에 추가될
+    /// 편집 하나가 조용히 빠진다.
+    pub row_errors_revision: u64,
+    /// 오류 행 창 표시 여부. 탭마다 다르므로 `App`이 아니라 여기 둔다.
+    pub show_errors_window: bool,
 }
 
 /// 확인 없이 바로 수행할 컬럼 연산의 최대 행 수. 이보다 크면 사용자에게 묻는다.
@@ -462,6 +480,10 @@ impl App {
             pending_scroll_align: egui::Align::Center,
             first_visible_row: 0,
             visible_rows: 0,
+            row_errors: None,
+            error_scan: None,
+            row_errors_revision: 0,
+            show_errors_window: false,
         });
     }
 
@@ -926,6 +948,14 @@ impl eframe::App for App {
                                 }
                                 ui.close_menu();
                             }
+                            // 오류 행 목록도 표 모드 전용이다 — "필드 수가 맞는가"
+                            // 라는 물음 자체가 컬럼이 있어야 성립한다.
+                            if ui.button("Bad Rows…").clicked() {
+                                if let Some(doc) = self.doc_mut() {
+                                    doc.show_errors_window = true;
+                                }
+                                ui.close_menu();
+                            }
                         });
                         if ui.button("Row & Column Numbers…").clicked() {
                             self.show_numbering_dialog = true;
@@ -1026,6 +1056,8 @@ impl eframe::App for App {
                         // 컬럼 인덱스가 무의미해지므로 다중 정렬 기준도 초기화.
                         doc.sort_specs.clear();
                         doc.show_sort_dialog = false;
+                        // 필드 수 자체가 다시 계산되므로 오류 목록도 통째로 무효.
+                        invalidate_error_scan(doc);
                     }
                     // 인코딩 드롭다운
                     let enc_before = doc.enc;
@@ -1042,6 +1074,8 @@ impl eframe::App for App {
                     if doc.enc != enc_before {
                         doc.sort = None;
                         doc.sort_job = None;
+                        // 디코딩이 달라지면 필드 분리도 대체문자 판정도 달라진다.
+                        invalidate_error_scan(doc);
                     }
                     // 헤더 체크박스는 표 모드에서만 의미가 있다.
                     if matches!(doc.sep, SeparatorMode::Char(_)) {
@@ -1051,6 +1085,8 @@ impl eframe::App for App {
                         if doc.has_header != hdr_before {
                             doc.sort = None;
                             doc.sort_job = None;
+                            // data_start와 기대 컬럼 수(헤더 필드 수)가 둘 다 달라진다.
+                            invalidate_error_scan(doc);
                         }
                     }
 
@@ -1073,6 +1109,18 @@ impl eframe::App for App {
                 doc.show_find = true;
                 doc.find_focus_pending = true;
             }
+        }
+
+        // 파싱 오류 행 검사. 상태바를 그리기 **전에** 돌려야 이번 프레임의
+        // 문구가 최신 상태를 반영한다(수거를 나중에 하면 완료된 검사가 한
+        // 프레임 늦게 "검사 중…"으로 보인다).
+        //
+        // 툴바가 방금 구분자/인코딩/헤더를 바꿨다면 위에서 이미 무효화됐고,
+        // 편집으로 데이터가 바뀐 경우는 `should_start_error_scan`이 개정
+        // 번호로 잡아낸다.
+        if let Some(doc) = self.doc_mut() {
+            poll_error_scan(doc);
+            start_error_scan(doc, ctx);
         }
 
         // 하단 상태바
@@ -1172,6 +1220,25 @@ impl eframe::App for App {
                             );
                         }
                     }
+                    // 파싱 오류 행 요약. 오류가 있으면 눌러서 창을 연다.
+                    if let Some(text) = error_status_text(doc) {
+                        ui.separator();
+                        let has_errors =
+                            doc.row_errors.as_ref().is_some_and(|r| r.total() > 0);
+                        if has_errors {
+                            let label = crate::theme::chrome_text(text)
+                                .color(egui::Color32::from_rgb(200, 60, 40));
+                            if ui
+                                .add(egui::Label::new(label).sense(egui::Sense::click()))
+                                .on_hover_text("Click to see the list")
+                                .clicked()
+                            {
+                                doc.show_errors_window = true;
+                            }
+                        } else {
+                            ui.label(crate::theme::chrome_text(text));
+                        }
+                    }
                 } else if self.error.is_none() {
                     // 문서도 오류도 없을 때만 안내 문구.
                     ui.label(crate::theme::chrome_text("No file open"));
@@ -1255,6 +1322,24 @@ impl eframe::App for App {
                 if want {
                     if let Some(new) = doc.convert_target {
                         convert_delimiter_in_doc(doc, new);
+                    }
+                }
+            }
+        }
+
+        // 오류 행 창. 목록 클릭은 논리 행번호로 돌아오고, 스크롤 요청으로
+        // 바꾸는 일은 거터 클릭과 **같은 함수**(`gutter_click_target`)가 한다 —
+        // 정렬 permutation 역매핑을 두 벌 두면 한쪽만 고쳐져 어긋난다.
+        if let Some(doc) = self.doc_mut() {
+            if doc.show_errors_window {
+                if let Some(logical) = render_errors_window(ctx, doc, row_base) {
+                    let (align, row) = gutter_click_target(doc, logical, doc.sep);
+                    doc.pending_scroll_align = align;
+                    doc.pending_scroll_row = Some(row);
+                    // 어느 행인지 보이도록 그 행을 선택해 둔다(찾기와 같은 방식).
+                    if let SeparatorMode::Char(d) = doc.sep {
+                        let last_col = table_col_count(doc, d).saturating_sub(1);
+                        doc.cell_sel = Some((logical, 0, logical, last_col));
                     }
                 }
             }
@@ -1820,6 +1905,139 @@ fn table_col_count(doc: &Document, delim: u8) -> usize {
         }
     }
     col_count.max(1)
+}
+
+/// 지금 편집 버퍼의 개정 번호. 뷰 모드(편집 버퍼 없음)는 데이터가 변하지
+/// 않으므로 0.
+fn doc_revision(doc: &Document) -> u64 {
+    doc.edit.as_ref().map_or(0, |e| e.undo.revision())
+}
+
+/// 갖고 있는 오류 목록이 지금 데이터를 설명하는가.
+///
+/// 결과가 없으면(아직 안 돌았으면) 낡은 것도 아니다 — `false`.
+fn error_scan_is_stale(doc: &Document) -> bool {
+    doc.row_errors.is_some() && doc.row_errors_revision != doc_revision(doc)
+}
+
+/// 오류 검사를 지금 시작해야 하는가(순수 판정).
+///
+/// egui 클로저 안에 인라인으로 두면 테스트가 구동할 수 없으므로 결정을 따로
+/// 뺀다(이 코드베이스의 `convert_enabled`·`page_target_row`와 같은 규율).
+///
+/// 시작 조건:
+/// - **표 모드**여야 한다. 텍스트 모드는 나눌 기준이 없어 "필드 수"가 없다.
+/// - 진행 중인 작업이 없어야 한다(중복 실행 방지).
+/// - 결과가 없거나, 있어도 **낡았어야** 한다(편집으로 데이터가 바뀐 뒤).
+/// - 편집 모드가 아니라면 **인덱싱이 끝나야** 한다 — 진행 중에 훑으면
+///   그때까지 인덱싱된 앞부분만 검사하고 "검사 완료"로 표시된다.
+///   편집 모드는 버퍼가 파일 전체를 이미 담고 있으므로 인덱싱과 무관하다.
+fn should_start_error_scan(doc: &Document) -> bool {
+    if !matches!(doc.sep, SeparatorMode::Char(_)) {
+        return false;
+    }
+    if doc.error_scan.is_some() {
+        return false;
+    }
+    if doc.row_errors.is_some() && !error_scan_is_stale(doc) {
+        return false;
+    }
+    doc.edit.is_some() || doc.index.status().phase == crate::index::Phase::Complete
+}
+
+/// 오류 검사 결과를 버린다 — 파싱 기준(구분자·인코딩·헤더)이 바뀌었거나
+/// 데이터가 바뀌어 **지난 결과가 더 이상 이 문서를 설명하지 못할 때**.
+///
+/// 진행 중인 작업도 취소한다. 취소하지 않으면 옛 기준으로 돌던 스캔이 나중에
+/// 끝나 **바뀐 문서에 옛 답**을 덮어쓴다 — 구분자를 콤마에서 탭으로 바꾼
+/// 직후 "오류 1,500만 개"가 뜨는 식이다.
+fn invalidate_error_scan(doc: &mut Document) {
+    if let Some(job) = doc.error_scan.take() {
+        job.cancel();
+    }
+    doc.row_errors = None;
+    doc.row_errors_revision = 0;
+}
+
+/// 검사를 시작할 수 있으면 시작한다. 편집 모드는 인메모리 버퍼가 진실이므로
+/// 그 자리에서 동기 스캔하고(이미 디코딩된 `String`이라 훨씬 싸다), 뷰 모드는
+/// mmap을 백그라운드 스레드로 훑는다.
+fn start_error_scan(doc: &mut Document, ctx: &egui::Context) {
+    if !should_start_error_scan(doc) {
+        return;
+    }
+    let SeparatorMode::Char(delim) = doc.sep else {
+        return;
+    };
+    let expected = table_col_count(doc, delim);
+    let data_start = if doc.has_header { 1 } else { 0 };
+
+    if let Some(e) = &doc.edit {
+        // 검사 **직전**의 개정 번호를 기록한다. 검사 뒤에 읽으면 그사이 일어난
+        // 편집을 이미 반영한 것으로 착각한다(여기서는 동기라 그 틈이 없지만,
+        // 순서를 뒤집을 이유도 없다).
+        doc.row_errors_revision = doc_revision(doc);
+        doc.row_errors = Some(crate::validate::scan_lines(
+            &e.lines,
+            delim,
+            expected,
+            data_start,
+            crate::validate::MAX_ROW_ERRORS,
+        ));
+        return;
+    }
+    // 뷰 모드는 편집 버퍼가 없어 데이터가 변하지 않는다 — 개정 번호는 계속 0이고
+    // (`doc_revision`), 무효화는 구분자/인코딩/헤더 변경이 직접 건다.
+    doc.error_scan = Some(crate::validate::spawn_scan(
+        doc.source.clone(),
+        doc.index.clone(),
+        doc.enc,
+        delim,
+        expected,
+        data_start,
+        ctx.clone(),
+    ));
+}
+
+/// 진행 중인 검사가 끝났으면 결과를 수거한다. 매 프레임 부른다.
+fn poll_error_scan(doc: &mut Document) {
+    let Some(job) = &mut doc.error_scan else {
+        return;
+    };
+    if !job.is_finished() {
+        return;
+    }
+    // 취소된 작업은 결과가 없다(`spawn_scan` 주석). 그때는 `row_errors`를
+    // `None`으로 둔 채 작업만 치운다 — 무효화가 곧 재검사를 부른다.
+    doc.row_errors = job.take_result();
+    doc.error_scan = None;
+}
+
+/// 상태바에 쓸 오류 요약 문구. `None`이면 아무것도 표시하지 않는다.
+///
+/// 순수 함수로 뺀 이유는 세 상태(검사 중 / 오류 없음 / 오류 N개)의 구분이
+/// 조용히 뒤바뀌기 쉬워서다 — 특히 "아직 안 돌았다"와 "돌았는데 0개"가 둘 다
+/// 빈 목록이라 한 덩어리로 뭉뚱그리기 쉽다.
+fn error_status_text(doc: &Document) -> Option<String> {
+    if !matches!(doc.sep, SeparatorMode::Char(_)) {
+        return None;
+    }
+    if doc.error_scan.is_some() {
+        return Some("Checking rows…".to_owned());
+    }
+    let r = doc.row_errors.as_ref()?;
+    let total = r.total();
+    if total == 0 {
+        return Some("No bad rows".to_owned());
+    }
+    if r.dropped > 0 {
+        // 상한에 걸렸으면 목록이 전부가 아님을 반드시 밝힌다.
+        return Some(format!(
+            "⚠ {total} bad rows (showing first {})",
+            r.errors.len()
+        ));
+    }
+    Some(format!("⚠ {total} bad rows"))
 }
 
 /// 논리 행번호 → **헤더를 뺀** 화면 행(= `render_table`의 `view_row`,
@@ -3188,6 +3406,10 @@ fn build_extracted_doc(
         pending_scroll_align: egui::Align::Center,
         first_visible_row: 0,
         visible_rows: 0,
+        row_errors: None,
+        error_scan: None,
+        row_errors_revision: 0,
+        show_errors_window: false,
     }
 }
 
@@ -3967,6 +4189,9 @@ fn convert_delimiter_in_doc(doc: &mut Document, new: u8) {
         };
         doc.find_status = "Delimiter changed (no rows affected)".to_owned();
         doc.show_convert_dialog = false;
+        // 데이터는 그대로여도 **보는 기준**이 바뀌었다 — 개정 번호는 안 움직이므로
+        // 여기서 직접 무효화하지 않으면 옛 구분자로 센 목록이 그대로 남는다.
+        invalidate_error_scan(doc);
         return;
     }
 
@@ -4003,6 +4228,9 @@ fn convert_delimiter_in_doc(doc: &mut Document, new: u8) {
     // 셀 단위 매치 위치가 무의미해졌다.
     doc.highlight = None;
     doc.last_match = None;
+    // 필드 수를 세는 기준이 통째로 달라졌다. 편집이 있었으니 개정 번호로도
+    // 잡히지만, 그 간접 경로에 기대지 않고 여기서 명시한다.
+    invalidate_error_scan(doc);
     doc.find_status = if rows == 1 {
         "1 row converted".to_owned()
     } else {
@@ -4124,6 +4352,111 @@ fn render_convert_dialog(ctx: &egui::Context, doc: &mut Document) -> bool {
         doc.show_convert_dialog = false;
     }
     want_convert
+}
+
+/// 오류 유형 하나를 목록에 쓸 문구로 바꾼다.
+///
+/// `col_base`는 컬럼 번호 표시 기준(0/1)이다. 필드 **개수**는 기준과 무관한
+/// 세는 값이라 그대로 쓰고, 여기서는 기준을 받지 않는다.
+fn issue_label(issue: crate::validate::RowIssue) -> String {
+    use crate::validate::RowIssue;
+    match issue {
+        RowIssue::FieldCount { got, expected } => {
+            format!("{got} fields (expected {expected})")
+        }
+        RowIssue::UnbalancedQuote => "unbalanced quote".to_owned(),
+        RowIssue::DecodeError => "decode failure".to_owned(),
+    }
+}
+
+/// 오류 행 창. 항목을 클릭하면 본문이 그 행으로 이동하도록 **논리 행번호를
+/// 돌려준다**(스크롤은 호출부가 건다).
+///
+/// 창 안에서 곧바로 스크롤을 걸지 않는 이유는 이 코드베이스의 규율이다 —
+/// `doc`이 클로저에 가변 대여돼 있어 `logical_to_screen_row`가 다시 빌릴 수
+/// 없고, 인텐트만 받아 두면 그 문제가 사라진다(찾기 창과 같은 방식).
+fn render_errors_window(ctx: &egui::Context, doc: &mut Document, row_base: usize) -> Option<usize> {
+    let mut open = true;
+    let mut goto: Option<usize> = None;
+
+    egui::Window::new("Bad Rows")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(560.0)
+        .show(ctx, |ui| {
+            if !matches!(doc.sep, SeparatorMode::Char(_)) {
+                ui.label(crate::theme::chrome_text(
+                    "Bad-row checking needs a delimiter — pick one in the toolbar.",
+                ));
+                return;
+            }
+            if doc.error_scan.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(crate::theme::chrome_text("Checking rows…"));
+                });
+                return;
+            }
+            let Some(result) = &doc.row_errors else {
+                // 인덱싱이 아직인 경우가 대부분이다.
+                ui.label(crate::theme::chrome_text("Not checked yet."));
+                return;
+            };
+            if result.total() == 0 {
+                ui.label(crate::theme::chrome_text("No bad rows."));
+                return;
+            }
+
+            let (fc, uq, de) = result.counts();
+            ui.label(crate::theme::chrome_text(format!(
+                "{} bad rows — {fc} field count, {uq} quote, {de} decode",
+                result.total()
+            )));
+            if result.dropped > 0 {
+                // 상한에 걸렸다는 사실을 반드시 밝힌다. 목록만 보고 "다
+                // 고쳤다"고 믿는 것이 최악이다.
+                ui.label(
+                    crate::theme::chrome_text(format!(
+                        "Showing the first {} — {} more not listed.",
+                        result.errors.len(),
+                        result.dropped
+                    ))
+                    .color(egui::Color32::from_rgb(200, 60, 40)),
+                );
+            }
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for e in &result.errors {
+                        let text = format!(
+                            "{}   {}   {}",
+                            e.logical + row_base,
+                            issue_label(e.issue),
+                            e.preview
+                        );
+                        if ui
+                            .add(
+                                egui::Label::new(crate::theme::chrome_text(text))
+                                    .sense(egui::Sense::click())
+                                    .truncate(),
+                            )
+                            .on_hover_text("Click to jump to this row")
+                            .clicked()
+                        {
+                            goto = Some(e.logical);
+                        }
+                    }
+                });
+        });
+
+    if !open {
+        doc.show_errors_window = false;
+    }
+    goto
 }
 
 /// 다중 컬럼 정렬 다이얼로그. 정렬 기준(컬럼·문자/숫자·오름/내림) 목록을
@@ -7097,6 +7430,289 @@ mod tests {
         let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
         (app, ctx)
+    }
+
+    // ---- 파싱 오류 행 검출 (Task 12/13 배선) ----
+
+    /// 텍스트 모드는 "필드 수가 맞는가"라는 물음 자체가 성립하지 않는다.
+    #[test]
+    fn error_scan_not_started_in_text_mode() {
+        let (mut app, _) = convert_doc(b"a,b,c\n1,2,3\n");
+        let doc = app.doc_mut().unwrap();
+        doc.sep = SeparatorMode::None;
+        assert!(!should_start_error_scan(doc));
+    }
+
+    /// 인덱싱이 끝나지 않았으면 시작하지 않는다 — 앞부분만 검사하고
+    /// "검사 완료"로 표시하면 뒤쪽 오류를 없는 것으로 오해한다.
+    #[test]
+    fn error_scan_waits_for_indexing_in_view_mode() {
+        let (mut app, _) = convert_doc(b"a,b,c\n1,2,3\n");
+        let doc = app.doc_mut().unwrap();
+        // 전제 확인 — 지금은 인덱싱이 끝나 시작할 수 있는 상태다.
+        assert!(should_start_error_scan(doc));
+        doc.index.set_phase(crate::index::Phase::Indexing);
+        assert!(!should_start_error_scan(doc), "인덱싱 중에는 시작하지 않는다");
+    }
+
+    /// 편집 모드는 버퍼가 파일 전체를 담고 있으므로 인덱싱 상태와 무관하다.
+    #[test]
+    fn error_scan_ignores_indexing_phase_in_edit_mode() {
+        let (mut app, _) = edit_doc(b"a,b\n1,2\n", true);
+        let doc = app.doc_mut().unwrap();
+        doc.index.set_phase(crate::index::Phase::Indexing);
+        assert!(should_start_error_scan(doc));
+    }
+
+    /// 진행 중인 검사가 있으면 **또 띄우지 않는다**. 이 가드가 없으면 매
+    /// 프레임(초당 수십 번) 스레드가 새로 생겨 대용량 파일에서 코어를 전부
+    /// 잡아먹는다.
+    ///
+    /// 백그라운드 작업이 살아 있는 상태를 봐야 하므로 뷰 모드(mmap 경로)로
+    /// 검사하고, 완료를 기다리지 않은 채 판정한다.
+    #[test]
+    fn error_scan_not_started_while_one_is_running() {
+        let (mut app, ctx) = convert_doc(b"a,b\n1,2\n3,4\n");
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        assert!(doc.error_scan.is_some(), "전제: 백그라운드 작업이 떴다");
+        // 아직 수거하지 않았다 — 이 상태에서 또 시작하면 안 된다.
+        assert!(
+            !should_start_error_scan(doc),
+            "진행 중인 검사가 있으면 다시 시작하지 않는다"
+        );
+        // 실제로 start를 불러도 작업이 바뀌지 않는지(교체되지 않는지) 본다.
+        start_error_scan(doc, &ctx);
+        poll_scan_to_completion(doc);
+        assert!(doc.row_errors.is_some());
+    }
+
+    /// 검사 중에는 상태바가 "검사 중"이라고 말해야 한다. "오류 없음"으로
+    /// 보이면 사용자가 아직 안 끝난 검사를 끝난 것으로 읽는다.
+    #[test]
+    fn error_status_text_says_checking_while_running() {
+        let (mut app, ctx) = convert_doc(b"a,b\n1,2\n3,4\n");
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        assert!(doc.error_scan.is_some(), "전제: 진행 중");
+        assert_eq!(
+            error_status_text(doc).as_deref(),
+            Some("Checking rows…"),
+            "진행 중에는 결과가 아니라 진행 중임을 말한다"
+        );
+        poll_scan_to_completion(doc);
+        assert_ne!(error_status_text(doc).as_deref(), Some("Checking rows…"));
+    }
+
+    /// 결과가 이미 있고 데이터도 그대로면 다시 돌리지 않는다.
+    #[test]
+    fn error_scan_not_restarted_when_result_is_fresh() {
+        let (mut app, ctx) = convert_doc(b"a,b\n1,2\n");
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        poll_scan_to_completion(doc);
+        assert!(doc.row_errors.is_some());
+        assert!(!should_start_error_scan(doc), "같은 데이터를 또 훑지 않는다");
+    }
+
+    /// **편집 모드에서도** 데이터가 그대로면 다시 돌리지 않는다.
+    ///
+    /// 이걸 놓치면 편집 모드인 동안 매 프레임(초당 수십 번) 전 행을 다시
+    /// 훑는다 — 1,500만 행에서는 앱이 멈춘 것처럼 보인다. 뷰 모드 테스트는
+    /// 이 경우를 잡지 못한다(뷰 모드는 개정 번호가 늘 0이라 우연히 맞는다).
+    #[test]
+    fn error_scan_not_restarted_in_edit_mode_when_unchanged() {
+        let (mut app, _) = edit_doc(b"a,b\n1,2\n", true);
+        let ctx = egui::Context::default();
+        let doc = app.doc_mut().unwrap();
+
+        // 편집을 몇 번 해서 개정 번호를 0이 아니게 만든다 — 0이면 초기값과
+        // 우연히 같아져 이 테스트가 무의미해진다.
+        let e = doc.edit.as_mut().unwrap();
+        for _ in 0..3 {
+            e.undo.push(crate::edit::EditOp::Replace(vec![(1, e.lines[1].clone())]));
+        }
+        assert_ne!(doc_revision(doc), 0, "전제: 개정 번호가 0이 아니다");
+
+        start_error_scan(doc, &ctx);
+        assert!(doc.row_errors.is_some());
+        assert!(
+            !should_start_error_scan(doc),
+            "편집 없이 프레임만 흘러도 다시 훑지 않는다"
+        );
+    }
+
+    /// 편집으로 데이터가 바뀌면 목록이 낡았으므로 다시 돌린다.
+    /// 이것이 없으면 사용자가 오류를 고쳐도 목록에 계속 남는다.
+    #[test]
+    fn error_scan_restarts_after_edit() {
+        let (mut app, _) = edit_doc(b"a,b\n1\n", true);
+        let ctx = egui::Context::default();
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        assert_eq!(doc.row_errors.as_ref().unwrap().total(), 1, "1행이 필드 1개");
+        assert!(!should_start_error_scan(doc));
+
+        // 오류 행을 고친다(편집 지점을 흉내내지 않고 실제 경로 — undo push).
+        let e = doc.edit.as_mut().unwrap();
+        e.undo.push(crate::edit::EditOp::Replace(vec![(1, e.lines[1].clone())]));
+        e.lines[1] = "1,2".to_string();
+
+        assert!(should_start_error_scan(doc), "데이터가 바뀌면 다시 검사한다");
+        start_error_scan(doc, &ctx);
+        assert_eq!(doc.row_errors.as_ref().unwrap().total(), 0, "고친 뒤엔 오류 없음");
+    }
+
+    /// 되돌리기도 데이터를 바꾸므로 재검사 대상이다.
+    #[test]
+    fn error_scan_restarts_after_undo() {
+        let (mut app, _) = edit_doc(b"a,b\n1,2\n", true);
+        let ctx = egui::Context::default();
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        assert_eq!(doc.row_errors.as_ref().unwrap().total(), 0);
+
+        // 행을 망가뜨렸다가 되돌린다.
+        let e = doc.edit.as_mut().unwrap();
+        e.undo.push(crate::edit::EditOp::Replace(vec![(1, e.lines[1].clone())]));
+        e.lines[1] = "1".to_string();
+        start_error_scan(doc, &ctx);
+        assert_eq!(doc.row_errors.as_ref().unwrap().total(), 1);
+
+        let e = doc.edit.as_mut().unwrap();
+        assert!(e.undo.undo(&mut e.lines));
+        assert!(should_start_error_scan(doc), "되돌리기 뒤에도 재검사");
+        start_error_scan(doc, &ctx);
+        assert_eq!(doc.row_errors.as_ref().unwrap().total(), 0);
+    }
+
+    /// 구분자를 바꾸면 필드 수를 세는 기준이 통째로 달라진다.
+    #[test]
+    fn invalidate_clears_result_and_revision() {
+        let (mut app, _) = edit_doc(b"a,b\n1,2\n", true);
+        let ctx = egui::Context::default();
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        assert!(doc.row_errors.is_some());
+        invalidate_error_scan(doc);
+        assert!(doc.row_errors.is_none());
+        assert_eq!(doc.row_errors_revision, 0);
+    }
+
+    /// 변환은 데이터도 보는 기준도 바꾼다 — 목록이 남아 있으면 안 된다.
+    #[test]
+    fn convert_delimiter_invalidates_error_scan() {
+        let (mut app, _) = edit_doc(b"a,b\n1,2\n", true);
+        let ctx = egui::Context::default();
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        assert!(doc.row_errors.is_some(), "전제: 결과가 있다");
+        convert_delimiter_in_doc(doc, b'\t');
+        assert!(doc.row_errors.is_none(), "변환 뒤 목록은 무효");
+    }
+
+    /// 바뀔 행이 하나도 없는 변환(구분자가 없는 문서)도 **보는 기준**은
+    /// 바꾸므로 목록을 무효화해야 한다. 이 경로는 편집이 없어 개정 번호가
+    /// 안 움직이므로 명시적 무효화에만 기댄다.
+    #[test]
+    fn convert_with_no_changed_rows_still_invalidates() {
+        let (mut app, _) = edit_doc(b"onlyonecol\nx\n", true);
+        let ctx = egui::Context::default();
+        let doc = app.doc_mut().unwrap();
+        doc.sep = SeparatorMode::Char(b',');
+        start_error_scan(doc, &ctx);
+        assert!(doc.row_errors.is_some(), "전제: 결과가 있다");
+        let rev_before = doc_revision(doc);
+        convert_delimiter_in_doc(doc, b'\t');
+        assert_eq!(doc_revision(doc), rev_before, "전제: 편집이 일어나지 않았다");
+        assert!(doc.row_errors.is_none(), "그래도 목록은 무효");
+    }
+
+    /// 상태바 문구가 세 상태를 가른다. 특히 "아직 안 돌았다"와 "돌았는데
+    /// 0개"는 둘 다 빈 목록이지만 정반대의 뜻이다.
+    #[test]
+    fn error_status_text_distinguishes_states() {
+        let (mut app, ctx) = convert_doc(b"a,b\n1,2\n");
+        let doc = app.doc_mut().unwrap();
+
+        // 아직 안 돌았음 — 표시할 것이 없다.
+        doc.row_errors = None;
+        assert_eq!(error_status_text(doc), None);
+
+        // 돌았고 오류 0개.
+        start_error_scan(doc, &ctx);
+        poll_scan_to_completion(doc);
+        assert_eq!(error_status_text(doc).as_deref(), Some("No bad rows"));
+
+        // 텍스트 모드는 아예 표시하지 않는다.
+        doc.sep = SeparatorMode::None;
+        assert_eq!(error_status_text(doc), None);
+    }
+
+    /// 오류가 있으면 개수를, 상한에 걸렸으면 "일부만 보여 준다"를 밝힌다.
+    #[test]
+    fn error_status_text_reports_counts_and_truncation() {
+        let (mut app, _) = convert_doc(b"a,b\n1,2\n");
+        let doc = app.doc_mut().unwrap();
+
+        doc.row_errors = Some(crate::validate::ScanResult {
+            errors: vec![crate::validate::RowError {
+                logical: 1,
+                issue: crate::validate::RowIssue::UnbalancedQuote,
+                preview: "x".into(),
+            }],
+            dropped: 0,
+        });
+        assert_eq!(error_status_text(doc).as_deref(), Some("⚠ 1 bad rows"));
+
+        // 상한에 걸린 경우 — 목록이 전부가 아님을 반드시 밝힌다.
+        doc.row_errors = Some(crate::validate::ScanResult {
+            errors: vec![crate::validate::RowError {
+                logical: 1,
+                issue: crate::validate::RowIssue::UnbalancedQuote,
+                preview: "x".into(),
+            }],
+            dropped: 41,
+        });
+        let text = error_status_text(doc).unwrap();
+        assert!(text.contains("42"), "총계를 밝힌다: {text}");
+        assert!(text.contains("showing first 1"), "일부임을 밝힌다: {text}");
+    }
+
+    /// 오류 행 검사는 헤더를 검사 대상에서 뺀다(`data_start`).
+    #[test]
+    fn error_scan_skips_header_row() {
+        // 헤더의 필드 수가 데이터와 다르지만 헤더는 오류가 아니다.
+        let (mut app, _) = edit_doc(b"solo\n1,2\n3,4\n", true);
+        let ctx = egui::Context::default();
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        assert_eq!(doc.row_errors.as_ref().unwrap().total(), 0);
+    }
+
+    /// 유형 라벨이 세 종류를 구분한다.
+    #[test]
+    fn issue_labels_are_distinct() {
+        use crate::validate::RowIssue;
+        let fc = issue_label(RowIssue::FieldCount { got: 2, expected: 3 });
+        let uq = issue_label(RowIssue::UnbalancedQuote);
+        let de = issue_label(RowIssue::DecodeError);
+        assert!(fc.contains('2') && fc.contains('3'), "{fc}");
+        assert_ne!(fc, uq);
+        assert_ne!(uq, de);
+        assert_ne!(fc, de);
+    }
+
+    /// 백그라운드 검사가 끝날 때까지 폴링한다(테스트 전용).
+    fn poll_scan_to_completion(doc: &mut Document) {
+        for _ in 0..100_000 {
+            poll_error_scan(doc);
+            if doc.error_scan.is_none() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("검사가 끝나지 않았다");
     }
 
     #[test]
