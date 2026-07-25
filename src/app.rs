@@ -60,6 +60,14 @@ pub struct Document {
     pub sort_job: Option<sort::SortJob>,
     /// 다중 컬럼 정렬 다이얼로그 표시 여부.
     pub show_sort_dialog: bool,
+    /// 구분자 변환 다이얼로그 표시 여부.
+    pub show_convert_dialog: bool,
+    /// 변환 다이얼로그에서 고른 대상 구분자. `None`이면 커스텀 입력을 쓴다.
+    /// 툴바의 `custom_sep_input`과 **별개**다 — 툴바는 보기 설정이고 이쪽은
+    /// 데이터 변환이라, 한쪽을 만지다 다른 쪽이 따라 움직이면 사고가 난다.
+    pub convert_target: Option<u8>,
+    /// 변환 다이얼로그의 커스텀 구분자 입력(ASCII 한 글자).
+    pub convert_custom_input: String,
     /// 다이얼로그에서 편집 중인 정렬 기준 목록(위가 1차).
     pub sort_specs: Vec<SortSpec>,
     /// 편집 모드 인메모리 버퍼. None이면 뷰 전용(mmap).
@@ -421,6 +429,9 @@ impl App {
             sort: None,
             sort_job: None,
             show_sort_dialog: false,
+            show_convert_dialog: false,
+            convert_target: None,
+            convert_custom_input: String::new(),
             sort_specs: Vec::new(),
             edit: None,
             editing_cell: None,
@@ -899,6 +910,23 @@ impl eframe::App for App {
                             }
                             ui.close_menu();
                         }
+                        // 구분자 변환은 표 모드에서만 의미가 있다 — 텍스트
+                        // 모드는 나눌 기준이 없으므로 변환할 것도 없다.
+                        let table_mode =
+                            self.doc().is_some_and(|d| matches!(d.sep, SeparatorMode::Char(_)));
+                        ui.add_enabled_ui(table_mode, |ui| {
+                            if ui.button("Convert Delimiter…").clicked() {
+                                if let Some(doc) = self.doc_mut() {
+                                    // 열 때마다 초기화한다 — 지난번 선택이 남아
+                                    // 있으면 무심코 누른 Convert가 의도치 않은
+                                    // 구분자로 데이터를 바꾼다.
+                                    doc.convert_target = None;
+                                    doc.convert_custom_input.clear();
+                                    doc.show_convert_dialog = true;
+                                }
+                                ui.close_menu();
+                            }
+                        });
                         if ui.button("Row & Column Numbers…").clicked() {
                             self.show_numbering_dialog = true;
                             ui.close_menu();
@@ -1217,6 +1245,18 @@ impl eframe::App for App {
         if let Some(doc) = self.doc_mut() {
             if doc.show_sort_dialog {
                 render_sort_dialog(ctx, doc, col_base);
+            }
+        }
+
+        // 구분자 변환 다이얼로그. `Convert`를 누르면 그 자리에서 변환한다.
+        if let Some(doc) = self.doc_mut() {
+            if doc.show_convert_dialog {
+                let want = render_convert_dialog(ctx, doc);
+                if want {
+                    if let Some(new) = doc.convert_target {
+                        convert_delimiter_in_doc(doc, new);
+                    }
+                }
             }
         }
 
@@ -3113,6 +3153,9 @@ fn build_extracted_doc(
         sort: None,
         sort_job: None,
         show_sort_dialog: false,
+        show_convert_dialog: false,
+        convert_target: None,
+        convert_custom_input: String::new(),
         sort_specs: Vec::new(),
         edit: None,
         editing_cell: None,
@@ -3886,6 +3929,201 @@ fn render_numbering_dialog(ctx: &egui::Context, app: &mut App) {
     if !open {
         app.show_numbering_dialog = false;
     }
+}
+
+/// 문서 전체의 구분자를 `new`로 바꾼다. 편집 버퍼가 없으면 먼저 만든다.
+///
+/// **뷰 모드에서 자동으로 편집 모드에 진입하는 이유.** 데이터를 고치는
+/// 작업이므로 인메모리 버퍼가 필요하다. 버튼을 비활성화하고 "편집 모드를 먼저
+/// 켜세요"라고 하는 대신 자동으로 켠다 — 사용자가 Replace에서 같은 벽에
+/// 부딪혀 불편해했다.
+///
+/// 되돌리기는 `replace_all_in_doc`과 같은 규율이다: 실제로 달라진 행만
+/// `EditOp::Replace` **하나**에 모아 Ctrl+Z 한 번으로 전부 복구한다. 행 수는
+/// 변하지 않는다.
+fn convert_delimiter_in_doc(doc: &mut Document, new: u8) {
+    let SeparatorMode::Char(old) = doc.sep else {
+        return;
+    };
+    if old == new || !new.is_ascii() {
+        return;
+    }
+    // 데이터를 고치려면 편집 버퍼가 필요하다.
+    if doc.edit.is_none() {
+        enter_edit_mode(doc);
+    }
+    let Some(e) = doc.edit.as_mut() else { return };
+
+    let changed = crate::convert::convert_all(&e.lines, old, new);
+    if changed.is_empty() {
+        // 구분자가 하나도 없는 문서(전부 한 필드)면 바뀔 것이 없다. 그래도
+        // `doc.sep`은 새 구분자로 맞춘다 — 사용자가 고른 구분자로 보는 것이
+        // 기대에 맞고, 데이터가 안 바뀌었으므로 dirty를 세우지 않는다.
+        doc.sep = SeparatorMode::Char(new);
+        doc.custom_sep_input = if new.is_ascii_graphic() {
+            (new as char).to_string()
+        } else {
+            String::new()
+        };
+        doc.find_status = "Delimiter changed (no rows affected)".to_owned();
+        doc.show_convert_dialog = false;
+        return;
+    }
+
+    // 바뀐 행의 **이전** 값을 한 Replace에 모은다. `mem::replace`가 새 텍스트를
+    // 넣으면서 옛 String을 그대로 돌려주므로 문자열 복사가 없다
+    // (`replace_all_in_doc`이 같은 이유로 이 형태를 쓴다).
+    let mut before: Vec<(usize, String)> = Vec::with_capacity(changed.len());
+    for (i, text) in changed {
+        let Some(slot) = e.lines.get_mut(i) else {
+            continue;
+        };
+        before.push((i, std::mem::replace(slot, text)));
+    }
+    let rows = before.len();
+    e.undo.push(crate::edit::EditOp::Replace(before));
+    e.dirty = true;
+
+    // 데이터가 새 구분자로 바뀌었으니 보기 기준도 맞춘다. 안 맞추면 표가
+    // 한 컬럼으로 무너진다.
+    doc.sep = SeparatorMode::Char(new);
+    doc.custom_sep_input = if new.is_ascii_graphic() {
+        (new as char).to_string()
+    } else {
+        String::new()
+    };
+    // 컬럼 경계가 달라졌으므로 컬럼에 매인 상태를 전부 버린다(툴바의 구분자
+    // 변경이 하는 것과 같다). `has_header`는 **유지한다** — 변환은 필드 수도
+    // 행 수도 바꾸지 않으므로 헤더 행은 그대로 헤더다.
+    doc.sort = None;
+    doc.sort_job = None;
+    doc.selected_col = None;
+    doc.sort_specs.clear();
+    doc.show_sort_dialog = false;
+    // 셀 단위 매치 위치가 무의미해졌다.
+    doc.highlight = None;
+    doc.last_match = None;
+    doc.find_status = if rows == 1 {
+        "1 row converted".to_owned()
+    } else {
+        format!("{rows} rows converted")
+    };
+    doc.show_convert_dialog = false;
+}
+
+/// 변환 다이얼로그의 `Convert` 버튼을 누를 수 있는가.
+///
+/// `current`가 현재 문서 구분자, `target`이 고른 대상 구분자다.
+///
+/// 세 가지를 막는다:
+/// - 텍스트 모드(`SeparatorMode::None`) — 나눌 기준이 없으니 변환할 것도 없다
+/// - 대상이 현재와 같음 — no-op
+/// - 대상이 비ASCII — `join_fields`가 `delim as char`로 비교/기록하므로
+///   비ASCII 바이트는 UTF-8 **두 바이트**로 쓰여 파서가 기대하는 한 바이트와
+///   어긋난다. 결과 파일이 깨진다.
+///
+/// **자유 함수인 이유.** 프로덕션(egui 클로저)과 테스트가 이 함수 **하나**를
+/// 부른다. 판정식을 클로저 안에 인라인으로 적고 테스트가 그걸 복사하면, 진짜
+/// 가드를 지워도 테스트는 자기 사본만 보고 통과한다 — 이 코드베이스에서
+/// 반복해서 나온 결함이다.
+fn convert_enabled(current: SeparatorMode, target: Option<u8>) -> bool {
+    let SeparatorMode::Char(cur) = current else {
+        return false;
+    };
+    let Some(t) = target else {
+        return false;
+    };
+    t.is_ascii() && t != cur
+}
+
+/// 구분자 변환 다이얼로그. 고른 구분자로 **데이터를 실제로 재작성**한다.
+///
+/// 툴바의 `Delimiter` 드롭다운과 역할이 다르다는 것을 문구로 분명히 한다 —
+/// 저쪽은 보기 설정이라 파일을 건드리지 않고, 이쪽은 파일 내용을 바꾼다.
+/// 두 개념이 섞이면 "탭으로 바꿨는데 왜 파일에 아직 콤마가 있지"로 이어진다.
+///
+/// `Convert`를 누르면 `want_convert`가 참으로 돌아온다. 실제 변환은 호출부가
+/// 한다 — 변환은 편집 버퍼 진입(`enter_edit_mode`)이 필요할 수 있는데, 그건
+/// `Document` 하나가 아니라 더 넓은 범위를 건드리기 때문이다.
+fn render_convert_dialog(ctx: &egui::Context, doc: &mut Document) -> bool {
+    let mut open = true;
+    let mut want_convert = false;
+    let cur_label = match doc.sep {
+        SeparatorMode::None => "None (plain text)".to_owned(),
+        SeparatorMode::Char(b',') => "Comma  ,".to_owned(),
+        SeparatorMode::Char(b'\t') => "Tab".to_owned(),
+        SeparatorMode::Char(b'|') => "Pipe  |".to_owned(),
+        SeparatorMode::Char(b';') => "Semicolon  ;".to_owned(),
+        SeparatorMode::Char(b) if b.is_ascii_graphic() => format!("Custom  {}", b as char),
+        SeparatorMode::Char(b) => format!("Custom  0x{b:02X}"),
+    };
+    egui::Window::new("Convert Delimiter")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(crate::theme::chrome_text(format!(
+                "Current delimiter:  {cur_label}"
+            )));
+            ui.separator();
+            ui.label(crate::theme::chrome_text("Convert to"));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut doc.convert_target, Some(b','), "Comma  ,");
+                ui.selectable_value(&mut doc.convert_target, Some(b'\t'), "Tab");
+                ui.selectable_value(&mut doc.convert_target, Some(b'|'), "Pipe  |");
+                ui.selectable_value(&mut doc.convert_target, Some(b';'), "Semicolon  ;");
+            });
+            ui.horizontal(|ui| {
+                ui.label(crate::theme::chrome_text("Custom:"));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut doc.convert_custom_input)
+                        .desired_width(28.0)
+                        .char_limit(1),
+                );
+                // 커스텀 입력을 만지면 그 글자가 대상이 된다(라디오 선택 해제).
+                if resp.changed() {
+                    doc.convert_target = doc
+                        .convert_custom_input
+                        .as_bytes()
+                        .first()
+                        .copied()
+                        .filter(|b| b.is_ascii());
+                }
+            });
+            // 비ASCII를 입력한 경우 왜 안 되는지 알려준다. 조용히 비활성화하면
+            // 사용자가 이유를 알 수 없다.
+            if !doc.convert_custom_input.is_empty()
+                && !doc.convert_custom_input.is_ascii()
+            {
+                ui.label(
+                    egui::RichText::new("Custom delimiter must be an ASCII character.")
+                        .color(egui::Color32::from_rgb(0xC0, 0x39, 0x2B)),
+                );
+            }
+            ui.separator();
+            ui.label(crate::theme::chrome_text(
+                "파일 내용이 바뀝니다. 되돌리려면 Ctrl+Z.",
+            ));
+            ui.label(crate::theme::chrome_text(
+                "저장해야 디스크에 반영됩니다. 뷰 모드면 편집 모드로 전환됩니다.",
+            ));
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    doc.show_convert_dialog = false;
+                }
+                let enabled = convert_enabled(doc.sep, doc.convert_target);
+                ui.add_enabled_ui(enabled, |ui| {
+                    if ui.button("Convert").clicked() {
+                        want_convert = true;
+                    }
+                });
+            });
+        });
+    if !open {
+        doc.show_convert_dialog = false;
+    }
+    want_convert
 }
 
 /// 다중 컬럼 정렬 다이얼로그. 정렬 기준(컬럼·문자/숫자·오름/내림) 목록을
@@ -6844,6 +7082,164 @@ mod tests {
         enter_edit_mode(doc);
         assert!(doc.edit.is_some());
         assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a,b", "1,2"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 구분자 변환 (Convert Delimiter)
+    // -----------------------------------------------------------------------
+
+    /// 변환 준비가 끝난 문서를 연다(인덱싱 완료까지 기다린다).
+    fn convert_doc(content: &[u8]) -> (App, egui::Context) {
+        let p = temp(content);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        (app, ctx)
+    }
+
+    #[test]
+    fn convert_enabled_rejects_text_mode() {
+        // 텍스트 모드는 나눌 기준이 없으니 변환도 없다.
+        assert!(!convert_enabled(SeparatorMode::None, Some(b'\t')));
+    }
+
+    #[test]
+    fn convert_enabled_rejects_same_delimiter() {
+        // no-op를 데이터 변경으로 기록하면 dirty가 거짓으로 선다.
+        assert!(!convert_enabled(SeparatorMode::Char(b','), Some(b',')));
+    }
+
+    #[test]
+    fn convert_enabled_rejects_non_ascii() {
+        // `join_fields`가 `delim as char`로 쓰므로 비ASCII는 UTF-8 두 바이트가
+        // 되어 파일이 깨진다.
+        assert!(!convert_enabled(SeparatorMode::Char(b','), Some(0xA9)));
+        assert!(!convert_enabled(SeparatorMode::Char(b','), Some(0xC2)));
+    }
+
+    #[test]
+    fn convert_enabled_rejects_no_target() {
+        assert!(!convert_enabled(SeparatorMode::Char(b','), None));
+    }
+
+    #[test]
+    fn convert_enabled_accepts_valid_change() {
+        assert!(convert_enabled(SeparatorMode::Char(b','), Some(b'\t')));
+        assert!(convert_enabled(SeparatorMode::Char(b'\t'), Some(b',')));
+        // 커스텀 구분자도 ASCII면 양방향 모두 허용된다(사용자 요구 사례 1, 2).
+        assert!(convert_enabled(SeparatorMode::Char(b'~'), Some(b'\t')));
+        assert!(convert_enabled(SeparatorMode::Char(b','), Some(b'~')));
+    }
+
+    #[test]
+    fn convert_rewrites_data_and_updates_sep() {
+        let (mut app, _ctx) = convert_doc(b"a,b\n1,2\n");
+        let doc = app.doc_mut().unwrap();
+        assert_eq!(doc.sep, SeparatorMode::Char(b','));
+        convert_delimiter_in_doc(doc, b'\t');
+        // 데이터가 실제로 바뀌었다.
+        assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a\tb", "1\t2"]);
+        // 보기 기준도 따라왔다 — 안 맞추면 표가 한 컬럼으로 무너진다.
+        assert_eq!(doc.sep, SeparatorMode::Char(b'\t'));
+        assert!(doc.edit.as_ref().unwrap().dirty);
+    }
+
+    #[test]
+    fn convert_enters_edit_mode_from_view_mode() {
+        // 뷰 모드에서 눌러도 동작해야 한다(Replace처럼 막지 않는다).
+        let (mut app, _ctx) = convert_doc(b"a,b\n1,2\n");
+        let doc = app.doc_mut().unwrap();
+        assert!(doc.edit.is_none(), "사전 조건: 뷰 모드");
+        convert_delimiter_in_doc(doc, b'|');
+        assert!(doc.edit.is_some(), "편집 모드로 자동 전환되어야 한다");
+        assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a|b", "1|2"]);
+    }
+
+    #[test]
+    fn convert_undo_restores_all_rows_in_one_step() {
+        let (mut app, _ctx) = convert_doc(b"a,b\n1,2\n3,4\n");
+        let doc = app.doc_mut().unwrap();
+        convert_delimiter_in_doc(doc, b'\t');
+        assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a\tb", "1\t2", "3\t4"]);
+        // Ctrl+Z 한 번에 전부 돌아와야 한다 — 세 행이 Replace **하나**에
+        // 묶여 있어야 성립한다.
+        let e = doc.edit.as_mut().unwrap();
+        assert_eq!(e.undo.len(), 1, "한 사용자 동작 = 한 undo 단계");
+        assert!(e.undo.undo(&mut e.lines));
+        assert_eq!(e.lines, vec!["a,b", "1,2", "3,4"]);
+    }
+
+    #[test]
+    fn convert_preserves_quoted_cells() {
+        // 인용 안의 콤마는 데이터다. 탭으로 바뀌면 안 된다.
+        let (mut app, _ctx) = convert_doc("name,addr\n홍길동,\"서울, 강남구\"\n".as_bytes());
+        let doc = app.doc_mut().unwrap();
+        convert_delimiter_in_doc(doc, b'\t');
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines,
+            vec!["name\taddr", "홍길동\t서울, 강남구"]
+        );
+    }
+
+    #[test]
+    fn convert_quotes_when_new_delimiter_in_value() {
+        // 탭 → 콤마. 값에 콤마가 있으므로 인용이 **생겨야** 한다.
+        let (mut app, _ctx) = convert_doc("name\taddr\n홍길동\t서울, 강남구\n".as_bytes());
+        let doc = app.doc_mut().unwrap();
+        // 자동 감지는 값에 든 콤마를 보고 콤마를 고를 수 있다. 이 테스트가
+        // 검증하려는 것은 감지가 아니라 변환이므로 구분자를 명시한다.
+        doc.sep = SeparatorMode::Char(b'\t');
+        convert_delimiter_in_doc(doc, b',');
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines,
+            vec!["name,addr", "홍길동,\"서울, 강남구\""]
+        );
+    }
+
+    #[test]
+    fn convert_clears_column_bound_state_but_keeps_header() {
+        let (mut app, _ctx) = convert_doc(b"a,b\n1,2\n");
+        let doc = app.doc_mut().unwrap();
+        doc.has_header = true;
+        doc.selected_col = Some(1);
+        doc.sort_specs.push(SortSpec {
+            col: 1,
+            kind: SortKind::Text,
+            dir: SortDir::Asc,
+            ci: true,
+        });
+        convert_delimiter_in_doc(doc, b'\t');
+        // 컬럼 경계가 달라졌으므로 컬럼에 매인 상태는 버린다.
+        assert_eq!(doc.selected_col, None);
+        assert!(doc.sort_specs.is_empty());
+        assert!(doc.sort.is_none());
+        // 헤더는 유지 — 변환은 행 수도 필드 수도 바꾸지 않는다.
+        assert!(doc.has_header, "헤더 유무는 변환과 무관하다");
+    }
+
+    #[test]
+    fn convert_no_op_does_not_dirty() {
+        // 구분자가 하나도 없는 문서 → 바뀌는 행이 없다. dirty가 서면 안 된다.
+        let (mut app, _ctx) = convert_doc(b"solo\nalone\n");
+        let doc = app.doc_mut().unwrap();
+        doc.sep = SeparatorMode::Char(b',');
+        convert_delimiter_in_doc(doc, b'\t');
+        assert_eq!(doc.sep, SeparatorMode::Char(b'\t'), "보기 기준은 바뀐다");
+        if let Some(e) = doc.edit.as_ref() {
+            assert!(!e.dirty, "바뀐 행이 없으면 dirty가 서면 안 된다");
+            assert!(e.undo.is_empty(), "유령 undo 단계를 만들면 안 된다");
+        }
+    }
+
+    #[test]
+    fn convert_rejects_same_delimiter_at_runtime() {
+        // 가드가 UI에만 있으면 안 된다 — 함수 자체가 막아야 한다.
+        let (mut app, _ctx) = convert_doc(b"a,b\n1,2\n");
+        let doc = app.doc_mut().unwrap();
+        convert_delimiter_in_doc(doc, b',');
+        assert!(doc.edit.is_none(), "no-op는 편집 모드조차 켜지 않는다");
     }
 
     #[test]
