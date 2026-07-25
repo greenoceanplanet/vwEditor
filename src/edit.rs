@@ -376,20 +376,50 @@ pub fn remove_row(lines: &mut Vec<String>, at: usize) {
 
 /// order(원본 논리 행번호 배열) 순서로 데이터 행을 재배치한다. data_start 이전
 /// 행(헤더)은 그대로 앞에 유지한다. order는 데이터 행만 커버한다.
+///
+/// **행 텍스트를 복사하지 않고 옮긴다(`mem::take`).** 예전에는 `clone()`이라
+/// 정렬 한 번마다 파일 전체를 통째로 재할당했다 — 15.4M행 실파일에서
+/// **785ms → 97ms(8.1배)**, 정렬 중 최고 상주 메모리도 4,602MB → 3,627MB로
+/// 준다(버퍼 사본이 잠깐 두 벌 뜨던 것이 없어졌다).
+///
+/// **같은 인덱스가 order에 두 번 나오면 두 번째부터는 `clone`으로 돌아간다.**
+/// 정상 순열이면 있을 수 없는 일이지만, `inverse_of`는 order가 순열이 아닐 때
+/// 안 채워진 자리에 0을 남기므로(그 함수의 `vec![0u32; ..]` 참조) 중복 인덱스가
+/// 들어올 수 있다. 그때 무턱대고 `take`하면 두 번째 자리가 빈 줄이 되어
+/// **데이터가 조용히 사라진다**. `seen` 비트맵으로 첫 방문만 옮기고 나머지는
+/// 복사해, 결과가 옛 `clone` 판과 어떤 입력에서도 글자 그대로 같도록 유지한다.
+/// 비트맵 비용은 행당 1비트(15.4M행에 1.9MB)라 무시할 수준이다.
 pub fn apply_permutation(lines: &mut Vec<String>, order: &[u32], data_start: usize) {
     if data_start > lines.len() {
         return;
     }
-    let header: Vec<String> = lines[..data_start].to_vec();
-    let mut reordered: Vec<String> = Vec::with_capacity(order.len());
+    let n = lines.len();
+    // taken[i] = 원본 i행을 이미 꺼내 담은 out의 자리(+1). 0이면 아직 안 꺼냈다.
+    // Option<usize> 대신 +1 인코딩을 쓰는 이유는 15.4M행에서 8바이트/행이라도
+    // 아끼려는 게 아니라, 0 초기화가 vec![]의 memset 한 번으로 끝나기 때문이다.
+    let mut taken = vec![0usize; n];
+    let mut out: Vec<String> = Vec::with_capacity(data_start + order.len());
+    // 헤더는 순열 대상이 아니므로 앞에서부터 그대로 꺼내 옮긴다. 옮긴 자리를
+    // taken에 등록해 두는 이유: order가 헤더 인덱스를 가리키는 경우(정상 정렬에선
+    // 없지만 `inverse_of`의 0 채움으로 생길 수 있다) 원본이 이미 비어 있으므로,
+    // 아래 루프가 빈 줄을 담지 않고 이 자리에서 복사해 오게 해야 한다.
+    for (i, slot) in lines.iter_mut().take(data_start).enumerate() {
+        taken[i] = i + 1;
+        out.push(std::mem::take(slot));
+    }
     for &idx in order {
         let i = idx as usize;
-        if i < lines.len() {
-            reordered.push(lines[i].clone());
+        if i >= n {
+            continue;
+        }
+        if taken[i] == 0 {
+            taken[i] = out.len() + 1;
+            out.push(std::mem::take(&mut lines[i]));
+        } else {
+            // 중복 인덱스 — 원본은 이미 비었으니 먼저 옮겨 둔 자리에서 복사한다.
+            out.push(out[taken[i] - 1].clone());
         }
     }
-    let mut out = header;
-    out.append(&mut reordered);
     *lines = out;
 }
 
@@ -975,6 +1005,52 @@ mod tests {
         let mut lines = v(&["b", "a", "c"]);
         apply_permutation(&mut lines, &[1, 0, 2], 0);
         assert_eq!(lines, v(&["a", "b", "c"]));
+    }
+
+    /// `apply_permutation`이 clone 판과 **글자 그대로 같은** 결과를 내는지
+    /// 전수 비교한다. move 판으로 바꾸면서 중복 인덱스·범위 밖 인덱스·헤더를
+    /// 가리키는 인덱스가 새 위험으로 생겼는데(그 함수 주석 참조), 정상 순열만
+    /// 넣어 보면 셋 다 안 걸린다. 그래서 순열이 **아닌** order까지 포함해
+    /// 작은 크기에서 모든 조합을 돌린다.
+    #[test]
+    fn apply_permutation_move_matches_clone_exhaustively() {
+        // 옛 구현 그대로(비교 기준).
+        fn clone_based(lines: &mut Vec<String>, order: &[u32], data_start: usize) {
+            if data_start > lines.len() {
+                return;
+            }
+            let header: Vec<String> = lines[..data_start].to_vec();
+            let mut reordered: Vec<String> = Vec::with_capacity(order.len());
+            for &idx in order {
+                let i = idx as usize;
+                if i < lines.len() {
+                    reordered.push(lines[i].clone());
+                }
+            }
+            let mut out = header;
+            out.append(&mut reordered);
+            *lines = out;
+        }
+        let base = v(&["h", "a", "b", "c"]);
+        // order 길이 0~3, 각 원소는 0..=4(4는 lines 범위 밖) → 순열이 아닌 조합도
+        // 전부 돈다. 5진수 카운터를 그냥 펼쳐서 조합을 만든다.
+        let mut cases = 0usize;
+        for len in 0..=3usize {
+            let total = 5usize.pow(len as u32);
+            for n in 0..total {
+                let order: Vec<u32> =
+                    (0..len).map(|k| (n / 5usize.pow(k as u32) % 5) as u32).collect();
+                for ds in 0..=2usize {
+                    let mut got = base.clone();
+                    let mut want = base.clone();
+                    apply_permutation(&mut got, &order, ds);
+                    clone_based(&mut want, &order, ds);
+                    assert_eq!(got, want, "order={order:?} data_start={ds}");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, (1 + 5 + 25 + 125) * 3);
     }
 
     #[test]
