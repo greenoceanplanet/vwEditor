@@ -386,9 +386,10 @@ pub fn remove_row(lines: &mut Vec<String>, at: usize) {
 /// 정상 순열이면 있을 수 없는 일이지만, `inverse_of`는 order가 순열이 아닐 때
 /// 안 채워진 자리에 0을 남기므로(그 함수의 `vec![0u32; ..]` 참조) 중복 인덱스가
 /// 들어올 수 있다. 그때 무턱대고 `take`하면 두 번째 자리가 빈 줄이 되어
-/// **데이터가 조용히 사라진다**. `seen` 비트맵으로 첫 방문만 옮기고 나머지는
+/// **데이터가 조용히 사라진다**. 아래 `taken` 표로 첫 방문만 옮기고 나머지는
 /// 복사해, 결과가 옛 `clone` 판과 어떤 입력에서도 글자 그대로 같도록 유지한다.
-/// 비트맵 비용은 행당 1비트(15.4M행에 1.9MB)라 무시할 수준이다.
+/// 표는 행당 `usize` 하나(15.4M행에 123MB)를 쓰지만 이 함수가 도는 동안만
+/// 살아 있고, 그래도 전 행을 `clone`하던 옛 판이 만들던 사본보다 훨씬 싸다.
 pub fn apply_permutation(lines: &mut Vec<String>, order: &[u32], data_start: usize) {
     if data_start > lines.len() {
         return;
