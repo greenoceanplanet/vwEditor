@@ -254,9 +254,16 @@ pub(crate) fn query_is_case_foldable_by_bytes(query: &str) -> bool {
 /// 그래서 치환 쪽만 `k`/`K`가 든 needle을 폴백으로 보낸다.
 /// (`replace_all_kelvin_sign_matches_reference`가 이 규칙을 지킨다.)
 ///
-/// **대가는 작다.** `k`가 든 needle이어도 폴백(`replace_in_line`)이 정확히
-/// 동작할 뿐이고, 사용자가 겪은 병목(needle `-`)을 비롯한 대부분의 검색어는
-/// 영향이 없다. match_case에서는 접기 자체가 없으므로 이 제한이 적용되지 않는다.
+/// **대가는 정확히 말하면 이렇다.** `k`/`K`가 든 needle은 `replace_cells_bytes`
+/// (바이트 셀 치환)만 잃는 게 아니라, `replace_all`의 프리필터도 `Prefilter::None`이
+/// 되어 **함께 사라진다**(아래 `replace_all`의 needle_is_bytefold_exact 분기 참조) —
+/// 즉 "매치 없는 행 건너뛰기" 자체가 꺼져 모든 행이 `replace_in_line`을 탄다.
+/// 그래서 `king`/`key`/`check`처럼 `k`/`K`를 포함한 needle은 ignore_case에서
+/// 최적화 **두 층 다** 잃고 옛 성능(사용자 파일 기준 ~21초)으로 돌아간다.
+/// 그럼에도 이 폴백을 유지하는 이유는 `replace_all`의 계약이 "최적화 전과
+/// 비트 단위로 동일"이기 때문이다 — 정확성이 속도보다 우선이고, `k`/`K`가 든
+/// 검색어는 사용자가 겪은 실제 병목(needle `-`)을 비롯한 대부분의 검색어에 비해
+/// 드물다. match_case에서는 접기 자체가 없으므로 이 제한이 적용되지 않는다.
 pub(crate) fn needle_is_bytefold_exact(needle: &str, match_case: bool) -> bool {
     if match_case {
         // 접기가 없으면 바이트 비교가 곧 정확한 비교다.
@@ -678,6 +685,18 @@ pub(crate) fn replace_cells_bytes(
     if memchr::memchr(b'"', lb).is_some() {
         return None;
     }
+    // 1-bis. 홀로 있는 `\r`/`\n`이 낀 행도 마찬가지로 물러난다. `csv_core`는
+    // 이 두 바이트를 **레코드 종결자**로 취급해 `split_fields`가 그 뒤를 다음
+    // 레코드로 넘겨 버리므로(예: "a\r,b" → 셀 하나 "a"), 여기서 델리미터만
+    // 보고 그대로 두 셀("a\r", "b")로 나누면 `field_slice`/`split_fields`가
+    // 세는 셀 경계와 어긋난다. `load_edit_buffer`는 `\n` 앞의 `\r`과 EOF의
+    // `\r`만 벗기므로 행 중간의 홀로 있는 CR은 그대로 살아 여기까지 온다
+    // (Task M 리뷰: `h1,h2\na\r,b\nc,d\n` 로드 후 needle `a`/`b` 양쪽에서
+    // 위음성/위양성이 실측됨). quote 가드와 같은 등급의 안전장치이므로 같은
+    // 자리에 둔다.
+    if memchr::memchr2(b'\r', b'\n', lb).is_some() {
+        return None;
+    }
     // 2. ignore_case인데 바이트 접기가 유니코드 접기와 답이 갈릴 수 있는 needle
     //    (`é` 같은 접히는 문자, 그리고 U+212A가 접혀 오는 `k`) → 폴백.
     if !needle_is_bytefold_exact(needle, match_case) {
@@ -740,7 +759,7 @@ enum Prefilter {
 /// 없다"를 증명할 수 있을 때만 참이어야 한다. 반대로 거짓(=통과)은 언제나
 /// 안전하다 — 뒤따르는 정밀 판정이 다시 거른다. 애매하면 거짓이 정답이다.
 ///
-/// 판단 두 가지가 겹쳐 있다:
+/// 판단 세 가지가 겹쳐 있다:
 ///
 /// 1. **따옴표 행은 절대 건너뛰지 않는다**(`quote_sensitive`가 참일 때).
 ///    Whole cell의 비교 대상은 파일 바이트가 아니라 **표시값**이라, `"a"a`는
@@ -748,7 +767,16 @@ enum Prefilter {
 ///    단정하면 그 행을 통째로 잃는다(Task I에서 실제로 낸 위음성).
 ///    Partial/WholeWord는 비교 대상이 행 원문 그대로라 이 함정이 없으므로
 ///    `quote_sensitive`가 거짓이고, 따옴표가 있어도 바이트로 판정해도 된다.
-/// 2. **needle 바이트가 한 번도 안 나오면** 매치가 있을 수 없다. `Exact`는
+/// 2. **홀로 있는 `\r`/`\n`이 낀 행도 `quote_sensitive`일 때 건너뛰지 않는다.**
+///    `csv_core`(`split_fields`)는 이 두 바이트를 레코드 종결자로 삼아 그 뒤를
+///    잘라 버리는데, 같은 열(col)의 바이트 범위를 주는 `field_slice`는 CR/LF를
+///    전혀 모르고 델리미터만 본다 — 그래서 표시값 비교(`split_fields`)와 실제
+///    치환 범위(`field_slice`)가 이미 서로 다른 규칙으로 움직인다(Task M 리뷰).
+///    이 두 함수의 불일치가 어떤 입력에서 정확히 어떻게 프리필터를 속이는지
+///    분석만으로 완전히 배제하기보다, 따옴표와 **같은 등급의 구조적 위험**으로
+///    보고 무조건 통과시키는 쪽을 택한다 — "애매하면 거짓" 규율 그대로다.
+///    (`replace_cells_bytes`도 같은 이유로 이 행에서 물러난다.)
+/// 3. **needle 바이트가 한 번도 안 나오면** 매치가 있을 수 없다. `Exact`는
 ///    match_case라 그대로, `CaseFold`는 양쪽을 ASCII 소문자로 접어 비교하므로
 ///    `Ab`/`aB`/`AB`도 전부 잡는다(단순 `memmem`으로는 놓쳐 위음성이 난다).
 ///    `None`이면 판단을 포기하고 통과시킨다.
@@ -760,6 +788,12 @@ fn replace_row_can_skip(line: &str, pre: &Prefilter, quote_sensitive: bool) -> b
     let lb = line.as_bytes();
     if quote_sensitive && memchr::memchr(b'"', lb).is_some() {
         // 따옴표 행: 표시값 != 바이트라 아무것도 단정할 수 없다.
+        return false;
+    }
+    if quote_sensitive && memchr::memchr2(b'\r', b'\n', lb).is_some() {
+        // CR/LF 행: split_fields(표시값)와 field_slice(치환 범위)가 CR/LF를
+        // 다르게 취급해 서로 어긋난다 — 따옴표와 같은 등급의 구조적 위험이라
+        // 프리필터가 판단을 내리지 않고 통과시킨다.
         return false;
     }
     match pre {
@@ -835,7 +869,13 @@ pub fn replace_all(
         // 엄격한 쪽(`needle_is_bytefold_exact`)이다 — 계약이 다르기 때문.
         Prefilter::CaseFold(needle.bytes().map(ascii_lower).collect())
     } else {
-        // `é`(유니코드 접기 필요)나 `k`(U+212A가 접혀 옴) — 건너뛸 근거가 없다.
+        // `é`(유니코드 접기 필요)나 `k`/`K`(U+212A가 접혀 옴) — 건너뛸 근거가
+        // 없다. **이 분기는 프리필터뿐 아니라 `replace_cells_bytes`도 함께
+        // 잃는다**(`needle_is_bytefold_exact`가 같은 판정을 그 함수 진입부에서도
+        // 쓴다) — 즉 `king`/`key`/`check`처럼 `k`/`K`가 든 needle은 ignore_case에서
+        // 최적화 두 층이 전부 꺼져 옛 성능(~21초, 사용자 파일 기준)으로 돌아간다.
+        // 대가가 크지만 정확성(비트 단위 동일 계약)이 우선이라 감수한다
+        // (`needle_is_bytefold_exact`의 doc 참조).
         Prefilter::None
     };
     let mut changed = Vec::new();
@@ -906,6 +946,9 @@ pub fn matching_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edit::load_edit_buffer;
+    use crate::parse::Encoding;
+    use crate::source::Source;
 
     /// 기존 테스트가 `(match_case, whole_word)`로 옵션을 만들던 관습을 유지한다 —
     /// `whole_word: true`는 `WholeWord`, `false`는 `Partial`로 이관(의미 불변).
@@ -1792,6 +1835,25 @@ mod tests {
         // — 여기까지 통과시키면 따옴표 흔한 CSV에서 프리필터가 무력해진다.
         assert!(replace_row_can_skip("\"a\"a,b", &aa, false));
 
+        // Task M 회귀: 홀로 있는 `\r`/`\n`이 낀 행도 quote_sensitive에서 절대
+        // 건너뛰지 않는다. needle "aa"가 이 행에 리터럴로 없으므로(바이트에는
+        // "aa"가 없다) 이 가드가 없으면 이 프리필터는 건너뛰어도 된다고 판단하는데,
+        // `split_fields`(표시값)와 `field_slice`(치환 범위)가 CR/LF를 다르게
+        // 취급하는 구조적 위험 자체를 이 가드가 막아야 한다 — 값으로는 아직
+        // 위음성을 구성하지 못했더라도, 따옴표와 같은 등급으로 무조건 통과시킨다.
+        assert!(
+            !replace_row_can_skip("a\r,b", &aa, true),
+            "행 안의 CR을 바이트로 단정하면 안 된다(따옴표와 같은 구조적 위험)"
+        );
+        assert!(
+            !replace_row_can_skip("a\n,b", &aa, true),
+            "행 안의 LF도 같은 이유로 절대 건너뛰면 안 된다"
+        );
+        // Partial/WholeWord는 행 원문을 그대로 비교하므로 CR/LF가 있어도
+        // 프리필터가 정확하다 — 여기까지 통과시키면 그 행들에서도 프리필터가
+        // 무력해진다.
+        assert!(replace_row_can_skip("a\r,b", &aa, false));
+
         // `None`은 판단을 포기한다 — 언제나 통과(안전한 쪽).
         assert!(!replace_row_can_skip("xyz", &Prefilter::None, false));
     }
@@ -1868,5 +1930,86 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(changed, vec![(0, "x y\tb".to_string())]);
         assert!(!changed[0].1.contains('\n'));
+    }
+
+    // ── Task M 회귀: 행 안의 홀로 있는 `\r` ─────────────────────────────
+    //
+    // `csv_core`는 `\r`/`\n`을 **레코드 종결자**로 취급하므로
+    // `split_fields("a\r,b", b',')`는 셀 하나("a")만 준다. 하지만
+    // `replace_cells_bytes`는 델리미터만 보고 그대로 둘로 쪼갠다
+    // (`["a\r", "b"]`) — csv_core 의미와 바이트 분할이 여기서 갈린다.
+    // 이 갈림이 실제로 파일 로드 경로(`load_edit_buffer`)를 통해 `lines[i]`에
+    // 도달할 수 있다(옛 Mac 개행이나 내보낸 데이터의 임베디드 CR).
+    // `replace_cells_bytes`도 `replace_row_can_skip`도 이 셀 분할 방식을
+    // 그대로 물려받으므로, `\r`을 quote와 같은 등급의 가드로 막아야 한다.
+
+    /// 리뷰어가 제시한 재현 1: `needle="a"`가 새 경로에서 위음성으로 사라진다.
+    /// old(오라클, `replace_in_line`)는 `split_fields("a\r,b", ',')`가 셀 하나
+    /// `"a"`만 주므로 그 셀이 needle "a"와 정확히 같아 매치다 — 실제로 **1건
+    /// 바꾼다**. 새 경로(수정 전)는 델리미터만 보고 셀을 `"a\r"`/`"b"` 둘로
+    /// 쪼개 `"a\r"` != `"a"`라 판정해 놓친다. old의 행동값 자체를 오라클로
+    /// 못박는다(csv_core 내부 동작을 재해석하지 않는다).
+    #[test]
+    fn replace_all_bare_cr_regression_needle_a() {
+        let bytes = b"h1,h2\na\r,b\nc,d\n".to_vec();
+        let source = Source::from_bytes(bytes);
+        let buf = load_edit_buffer(&source, Encoding::Utf8);
+        assert_eq!(buf.lines, vec!["h1,h2", "a\r,b", "c,d"], "CR이 그대로 살아 lines[1]에 남아야 한다");
+
+        let o = cell_opts(true); // match_case
+        let fast = replace_all(&buf.lines, "a", "Z", &o, Some(b','));
+        let slow = replace_all_reference(&buf.lines, "a", "Z", &o, Some(b','));
+        assert_eq!(fast, slow, "바이트 경로가 CR을 못 보고 오라클과 갈리면 안 된다");
+        assert_eq!(slow, (vec![(1, "Z,b".to_string())], 1), "old 오라클 값 고정");
+    }
+
+    /// 리뷰어가 제시한 재현 2: `needle="b"`가 위양성으로 나타난다(같은 행).
+    /// old는 셀을 `a\r`/`b` 둘로 나누지 않으므로 `b`만 있는 셀이 없어 매치가
+    /// 없다. 새 경로가 델리미터만 보고 쪼개면 `b` 셀이 생겨 잘못 바뀐다.
+    #[test]
+    fn replace_all_bare_cr_regression_needle_b() {
+        let bytes = b"h1,h2\na\r,b\nc,d\n".to_vec();
+        let source = Source::from_bytes(bytes);
+        let buf = load_edit_buffer(&source, Encoding::Utf8);
+
+        let o = cell_opts(true);
+        let fast = replace_all(&buf.lines, "b", "Z", &o, Some(b','));
+        let slow = replace_all_reference(&buf.lines, "b", "Z", &o, Some(b','));
+        assert_eq!(fast, slow, "바이트 경로가 CR 행에 없는 셀 경계를 만들어내면 안 된다");
+        assert_eq!(slow, (Vec::new(), 0), "old 오라클: 매치 없음");
+    }
+
+    /// 리뷰어가 제시한 재현 3: 실사용 형태인 TSV + 한글, `-\r\t한국`에서
+    /// needle `한국`. old는 `-\r`을 한 셀로 보아 `한국`만 있는 셀이 없다.
+    #[test]
+    fn replace_all_bare_cr_regression_tsv_hangul() {
+        let v = lines(&["-\r\t한국"]);
+        let o = cell_opts(true);
+        let fast = replace_all(&v, "한국", "X", &o, Some(b'\t'));
+        let slow = replace_all_reference(&v, "한국", "X", &o, Some(b'\t'));
+        assert_eq!(fast, slow, "TSV + 한글 + CR 조합에서 바이트 경로가 오라클과 갈리면 안 된다");
+        assert_eq!(slow, (Vec::new(), 0), "old 오라클: 매치 없음");
+    }
+
+    /// **핵심 차등 테스트에 `\r`/`\n`을 더한 버전.** 기존 세 코퍼스의 알파벳
+    /// (`{a,A,",,,b}`, `{-,\t,한,x,"}`, `{É,é,,,a,İ,U+212A,k}`)은 전부 csv_core가
+    /// 레코드 종결자로 특별 취급하는 제어 바이트를 담지 않아, 이 버그가 있어도
+    /// 전수 테스트를 통과했다. 이 코퍼스가 그 구멍을 영구히 메운다 — 수정 전엔
+    /// 반드시 실패하고 수정 후엔 통과해야 한다.
+    #[test]
+    fn replace_all_bytes_matches_reference_cr_lf_alphabet() {
+        let alphabet = ['a', ',', '\r', '\n', 'b'];
+        let corpus = all_strings(&alphabet, 4);
+        for needle in ["a", "b", "a,b", "\r", "\n", "a\r"] {
+            for rep in ["Z", "", "a"] {
+                for match_case in [true, false] {
+                    for scope in [MatchScope::WholeCell, MatchScope::Partial, MatchScope::WholeWord]
+                    {
+                        let o = FindOptions { match_case, scope };
+                        assert_same_as_reference(&corpus, needle, rep, &o, Some(b','));
+                    }
+                }
+            }
+        }
     }
 }
