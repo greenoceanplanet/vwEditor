@@ -150,6 +150,10 @@ fn merge_results(a: ScanResult, b: ScanResult, limit: usize) -> ScanResult {
 /// 청크가 작으면 rayon 작업 분배 비용이 검사 자체보다 커진다.
 const CHUNK: usize = 64 * 1024;
 
+/// 청크 안에서 취소 신호를 몇 행마다 확인할지. 청크 경계에서만 보면 이미
+/// 시작한 청크가 `CHUNK`행을 다 돌 때까지 멈추지 않는다.
+const CANCEL_CHECK_ROWS: usize = 1024;
+
 /// 이미 디코딩된 줄들(편집 버퍼)을 병렬 검사한다.
 ///
 /// mmap 경로와 나누어 둔 이유: **편집 모드에서는 파일 바이트가 더 이상 진실이
@@ -224,7 +228,16 @@ pub fn scan_errors(
             if cancel.is_some_and(|c| c()) {
                 return local;
             }
-            for logical in chunk {
+            for (i, logical) in chunk.into_iter().enumerate() {
+                // 청크 진입에서 한 번만 보면 이미 시작한 청크가 6.5만 행을 전부
+                // 디코딩할 때까지 코어를 붙든다. 취소는 "탭을 닫았다"처럼 결과가
+                // 이미 버려진 상황이라, 그만큼을 마저 도는 것은 순수한 낭비다.
+                //
+                // 원자적 읽기 하나가 1024행마다 한 번이면 스캔 비용에 묻힌다
+                // (행마다 보면 그 읽기가 검사 자체보다 비싸진다).
+                if i % CANCEL_CHECK_ROWS == 0 && i > 0 && cancel.is_some_and(|c| c()) {
+                    return local;
+                }
                 let Some((s, e)) = LineIndex::range_in(offsets, total_bytes, logical) else {
                     continue;
                 };
@@ -505,12 +518,100 @@ mod tests {
         assert_eq!(m.dropped, 3);
     }
 
-    /// 빈 쪽과의 병합은 항등이어야 한다(rayon의 identity가 `default()`다).
+    /// 빈 쪽과의 병합은 항등이다 — **단, 상한을 이미 지키는 값에 한해서.**
+    ///
+    /// 정확히 적는 이유: `merge_results(x, default(), limit)`은 `x`가 상한을
+    /// 넘으면 잘라 낸다. 그러니 "항상 항등"이라고 쓰면 거짓인 법을 주장하는
+    /// 셈이고, 그 테스트는 상한 로직이 통째로 없는 구현도 통과시킨다
+    /// (`limit`을 입력보다 크게 잡으면 자를 일이 없으므로).
+    ///
+    /// rayon이 실제로 요구하는 것은 이 **제한된** 항등이다. reduce에 흘러
+    /// 다니는 값은 이미 병합을 거쳐 상한을 지키고 있기 때문이다.
     #[test]
-    fn merge_with_empty_is_identity() {
+    fn merge_with_empty_is_identity_for_limit_respecting_values() {
         let a = res(&[3, 9], 2);
         assert_eq!(merge_results(a.clone(), ScanResult::default(), 100), a);
         assert_eq!(merge_results(ScanResult::default(), a.clone(), 100), a);
+        // 상한과 정확히 같은 크기(경계)에서도 항등이다.
+        assert_eq!(merge_results(a.clone(), ScanResult::default(), 2), a);
+    }
+
+    /// 상한을 **넘는** 값은 빈 쪽과 병합해도 그대로가 아니다 — 잘린다.
+    /// 이것이 의도된 동작임을 못 박아, 위 테스트가 "항상 항등"으로 잘못
+    /// 넓어지는 것을 막는다.
+    #[test]
+    fn merge_with_empty_truncates_over_limit_values() {
+        let a = res(&[1, 2, 3, 4], 0);
+        let m = merge_results(a, ScanResult::default(), 2);
+        assert_eq!(rows_of(&m), vec![1, 2]);
+        assert_eq!(m.dropped, 2, "잘린 만큼 센다");
+    }
+
+    /// **결합법칙 + 임의 폴드 트리**에서 결과가 같아야 한다.
+    ///
+    /// rayon이 범위를 어떻게 쪼개고 어떤 순서로 접는지는 스레드 수에 따라
+    /// 달라진다. 그래서 "특정 분할에서 맞다"로는 부족하고, 가능한 분할 전반에서
+    /// 같은 답이 나와야 한다. 여기서는 rayon의 실제 의미(각 조각을
+    /// `default()`로 시드해 순차 폴드한 뒤, 그 결과들을 임의의 이진 트리로
+    /// 병합)를 흉내 내 전수에 가깝게 확인한다.
+    ///
+    /// 기준 정답은 "행번호가 가장 작은 limit개, 나머지는 dropped".
+    #[test]
+    fn merge_is_associative_across_fold_trees() {
+        // 행번호 12개를 오름차순으로 두고, 여러 방식으로 쪼개 접는다.
+        let all: Vec<usize> = (1..=12).collect();
+
+        // rayon 한 조각의 순차 폴드: default()로 시드해 원소를 하나씩 접는다.
+        fn fold_chunk(rows: &[usize], limit: usize) -> ScanResult {
+            let mut acc = ScanResult::default();
+            for &r in rows {
+                acc = merge_results(acc, res(&[r], 0), limit);
+            }
+            acc
+        }
+
+        // 조각 경계를 비트마스크로 전수 생성(11개 경계 → 2048가지).
+        for mask in 0u32..(1 << 11) {
+            let mut chunks: Vec<Vec<usize>> = Vec::new();
+            let mut cur: Vec<usize> = vec![all[0]];
+            for (i, &row) in all.iter().enumerate().skip(1) {
+                if mask & (1 << (i - 1)) != 0 {
+                    chunks.push(std::mem::take(&mut cur));
+                }
+                cur.push(row);
+            }
+            chunks.push(cur);
+
+            for &limit in &[0usize, 1, 5, 12, 100] {
+                let folded: Vec<ScanResult> =
+                    chunks.iter().map(|c| fold_chunk(c, limit)).collect();
+
+                // 왼쪽 결합으로 접기.
+                let left = folded
+                    .iter()
+                    .cloned()
+                    .fold(ScanResult::default(), |a, b| merge_results(a, b, limit));
+                // 오른쪽 결합으로 접기(트리 모양이 달라도 같아야 한다).
+                let right = folded
+                    .iter()
+                    .cloned()
+                    .rev()
+                    .fold(ScanResult::default(), |a, b| merge_results(b, a, limit));
+
+                let expect_kept = all.len().min(limit);
+                assert_eq!(
+                    rows_of(&left),
+                    all[..expect_kept],
+                    "mask={mask} limit={limit}"
+                );
+                assert_eq!(left, right, "폴드 트리 모양에 결과가 좌우된다 mask={mask}");
+                assert_eq!(
+                    left.total(),
+                    all.len(),
+                    "총계는 분할·상한과 무관해야 한다 mask={mask} limit={limit}"
+                );
+            }
+        }
     }
 
     /// 동점(같은 행번호)이 있어도 개수가 맞아야 한다 — 한쪽을 통째로 버리는
@@ -721,6 +822,46 @@ mod tests {
         let always: &(dyn Fn() -> bool + Sync) = &|| true;
         let r = scan_errors(&src, &idx, Encoding::Utf8, b',', 2, 1, 100, Some(always));
         assert!(r.errors.is_empty(), "취소되면 수집하지 않는다");
+    }
+
+    /// 취소가 **청크 중간에서도** 걸려야 한다.
+    ///
+    /// 청크 경계에서만 확인하면 이미 시작한 청크는 `CHUNK`행(6.5만)을 전부
+    /// 돈다. 여기서는 한 청크에 다 들어가는 크기의 입력을 주고, 스캔이 몇 행쯤
+    /// 진행된 뒤 취소를 켜서 **끝까지 돌지 않는지** 본다.
+    ///
+    /// 관측은 "몇 행을 실제로 검사했는가"로 한다 — 판정식을 다시 계산하지 않고
+    /// 프로덕션이 실행한 것을 센다.
+    #[test]
+    fn scan_cancel_stops_mid_chunk() {
+        use std::sync::atomic::AtomicUsize;
+
+        // 한 청크(CHUNK=65536)에 들어가면서 취소 확인 간격(1024)을 여러 번
+        // 넘는 크기.
+        const ROWS: usize = 20_000;
+        let mut content = Vec::from(&b"a,b\n"[..]);
+        for _ in 0..ROWS {
+            content.extend_from_slice(b"bad\n"); // 전부 오류(필드 1개)
+        }
+        let (src, idx) = open_indexed(&content);
+
+        // 취소 확인이 몇 번 불렸는지 세고, 일정 횟수 뒤 취소를 켠다.
+        let calls = AtomicUsize::new(0);
+        let trip: &(dyn Fn() -> bool + Sync) = &|| {
+            // 첫 두 번(청크 진입 + 1024행)은 통과시키고 그 뒤로 취소.
+            calls.fetch_add(1, Ordering::Relaxed) >= 2
+        };
+        let r = scan_errors(&src, &idx, Encoding::Utf8, b',', 2, 1, usize::MAX, Some(trip));
+
+        assert!(
+            r.errors.len() < ROWS,
+            "취소했는데 {}행을 전부 검사했다 — 청크 중간에서 안 멈춘다",
+            r.errors.len()
+        );
+        assert!(
+            calls.load(Ordering::Relaxed) > 1,
+            "취소 확인이 청크당 한 번뿐이면 이 테스트는 무의미하다"
+        );
     }
 
     /// 취소 신호가 꺼져 있으면 평소대로 전부 검사한다(위 테스트가 "항상 빈

@@ -626,6 +626,12 @@ pub fn enter_edit_mode(doc: &mut Document) {
     doc.text_caret = crate::edit::TextPos { line: 0, col: 0 };
     doc.text_drag_active = false;
     doc.pending_column_op = None;
+    // 검사의 **바탕**이 mmap에서 편집 버퍼로 바뀐다. 개정 번호로는 못 잡는다 —
+    // 새 `EditBuffer`의 revision은 0이고 뷰 모드의 `doc_revision`도 0이라
+    // 신선도 비교가 "그대로"라고 답한다. 특히 디코드 오류는 편집 버퍼에서는
+    // 아예 나올 수 없으므로(이미 String이다), 뷰 모드에서 센 디코드 오류가
+    // 편집 모드 화면에 그대로 남는다.
+    invalidate_error_scan(doc);
 }
 
 /// 저장 직후 문서의 뷰 소스(mmap)를 방금 쓴 파일로 다시 겨눈다.
@@ -668,6 +674,10 @@ fn repoint_source_after_save(
     // 옛 인덱스 기준의 permutation은 새 파일에 맞지 않는다.
     doc.sort = None;
     doc.sort_job = None;
+    // 오류 목록도 옛 source/index 기준이다. 편집 모드인 동안은 편집 버퍼가
+    // 진실이라 티가 안 나지만, 편집 모드를 끄면 새 파일을 옛 목록으로 설명하게
+    // 된다(그리고 새 인덱스가 다 될 때까지 재검사도 못 한다).
+    invalidate_error_scan(doc);
     Ok(())
 }
 
@@ -681,6 +691,10 @@ pub fn exit_edit_mode(doc: &mut Document) {
     doc.text_drag_active = false;
     // 편집 버퍼가 사라지면 대기 중인 컬럼 연산도 무의미하다.
     doc.pending_column_op = None;
+    // 검사의 바탕이 편집 버퍼에서 mmap으로 되돌아간다. 개정 번호 비교로도
+    // 대개 낡음으로 잡히지만(편집이 있었다면), 편집 없이 켰다 끈 경우엔
+    // 양쪽 다 0이라 안 잡힌다 — 우연에 기대지 않고 여기서 명시한다.
+    invalidate_error_scan(doc);
 }
 
 /// logical 논리 행의 텍스트. 편집 모드면 EditBuffer에서, 아니면 mmap 디코딩.
@@ -1165,6 +1179,9 @@ impl eframe::App for App {
                                 // 재스캔으로 행 구성이 바뀔 수 있으므로 정렬 무효화.
                                 doc.sort = None;
                                 doc.sort_job = None;
+                                // 같은 이유로 오류 목록도 버린다 — 인덱스가
+                                // 통째로 다시 만들어지므로 옛 행번호가 무의미하다.
+                                invalidate_error_scan(doc);
                                 let handle = crate::indexer::spawn_indexer(
                                     doc.source.clone(),
                                     doc.index.clone(),
@@ -4354,6 +4371,26 @@ fn render_convert_dialog(ctx: &egui::Context, doc: &mut Document) -> bool {
     want_convert
 }
 
+/// 오류 목록에 표시할 **행번호** — 본문 라인 번호 칸과 반드시 같은 수여야 한다.
+///
+/// `render_table`의 번호 칸은 `view_row + row_base`를 쓴다(그 지점 참조).
+/// `RowError.logical`은 **헤더를 포함한 절대 논리 행**이므로 그대로 더하면
+/// 헤더가 있을 때 항상 1 어긋나고, 정렬 중이면 어긋나는 폭이 제멋대로다.
+///
+/// 그래서 `logical_to_screen_row`로 화면 행을 얻은 뒤 `row_base`를 더한다 —
+/// 이동에 쓰는 `gutter_click_target`과 **같은 변환**이라, 목록에 보이는 번호와
+/// 클릭해서 도착하는 행이 어긋날 수 없다.
+fn error_row_display_number(doc: &Document, logical: usize, row_base: usize) -> usize {
+    let row = match doc.sep {
+        SeparatorMode::None => logical,
+        SeparatorMode::Char(_) => {
+            let data_start = if doc.has_header { 1 } else { 0 };
+            logical_to_screen_row(doc, logical, data_start)
+        }
+    };
+    row + row_base
+}
+
 /// 오류 유형 하나를 목록에 쓸 문구로 바꾼다.
 ///
 /// `col_base`는 컬럼 번호 표시 기준(0/1)이다. 필드 **개수**는 기준과 무관한
@@ -4434,7 +4471,7 @@ fn render_errors_window(ctx: &egui::Context, doc: &mut Document, row_base: usize
                     for e in &result.errors {
                         let text = format!(
                             "{}   {}   {}",
-                            e.logical + row_base,
+                            error_row_display_number(doc, e.logical, row_base),
                             issue_label(e.issue),
                             e.preview
                         );
@@ -7628,6 +7665,86 @@ mod tests {
         assert!(doc.row_errors.is_none(), "그래도 목록은 무효");
     }
 
+    /// 편집 모드로 **들어가면** 검사의 바탕이 mmap에서 편집 버퍼로 바뀐다.
+    ///
+    /// 개정 번호로는 못 잡는다 — 새 `EditBuffer`의 revision이 0이고 뷰 모드의
+    /// `doc_revision`도 0이라 "그대로"라고 답한다. 특히 디코드 오류는 편집
+    /// 버퍼에서는 나올 수 없으므로(이미 String이다) 뷰 모드에서 센 목록이
+    /// 그대로 남으면 사용자가 존재하지 않는 오류를 본다.
+    #[test]
+    fn entering_edit_mode_invalidates_error_scan() {
+        let (mut app, ctx) = convert_doc(b"a,b\n1,2\n");
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        poll_scan_to_completion(doc);
+        assert!(doc.row_errors.is_some(), "전제: 뷰 모드 결과가 있다");
+        assert_eq!(doc_revision(doc), 0, "전제: 뷰 모드는 개정 번호 0");
+
+        enter_edit_mode(doc);
+        assert_eq!(doc_revision(doc), 0, "새 버퍼도 개정 번호 0 — 비교로는 못 잡는다");
+        assert!(doc.row_errors.is_none(), "그래도 목록은 무효여야 한다");
+    }
+
+    /// 편집 모드를 **끄면** 바탕이 mmap으로 되돌아간다. 편집 없이 켰다 끈
+    /// 경우엔 양쪽 개정 번호가 다 0이라 비교로는 안 잡힌다.
+    #[test]
+    fn exiting_edit_mode_invalidates_error_scan() {
+        let (mut app, _) = edit_doc(b"a,b\n1,2\n", true);
+        let ctx = egui::Context::default();
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        assert!(doc.row_errors.is_some(), "전제: 편집 모드 결과가 있다");
+        assert_eq!(doc_revision(doc), 0, "전제: 편집 없이 들어왔으므로 0");
+
+        exit_edit_mode(doc);
+        assert!(doc.row_errors.is_none());
+    }
+
+    /// 인덱스를 통째로 다시 만드는 경로(Paused → Resume)는 옛 행번호를
+    /// 무의미하게 만든다. 여기서는 그 핸들러가 부르는 무효화만 직접 확인한다
+    /// (버튼 클릭은 egui 클로저라 테스트가 구동할 수 없다).
+    #[test]
+    fn invalidate_cancels_running_job_too() {
+        let (mut app, ctx) = convert_doc(b"a,b\n1\n2\n3\n");
+        let doc = app.doc_mut().unwrap();
+        start_error_scan(doc, &ctx);
+        assert!(doc.error_scan.is_some(), "전제: 백그라운드 작업이 떴다");
+        invalidate_error_scan(doc);
+        assert!(doc.error_scan.is_none(), "진행 중인 작업도 치운다");
+        assert!(doc.row_errors.is_none());
+        // 무효화 뒤에는 다시 시작할 수 있어야 한다(막아 두면 영영 안 돈다).
+        assert!(should_start_error_scan(doc));
+    }
+
+    /// 목록에 보이는 행번호가 **본문 라인 번호 칸과 같아야** 한다.
+    ///
+    /// `RowError.logical`은 헤더를 포함한 절대 논리 행이고, 본문은
+    /// `view_row + row_base`(헤더 제외)를 쓴다. 그대로 더하면 헤더가 있을 때
+    /// 항상 1 어긋난다 — 사용자가 "3번 행이 오류"를 보고 3번 행을 봤는데
+    /// 멀쩡한 상황이 된다.
+    #[test]
+    fn error_row_display_number_matches_table_line_number() {
+        let (mut app, _) = edit_doc(b"a,b\n1,2\n3,4\n", true);
+        let doc = app.doc_mut().unwrap();
+        // 헤더가 있으니 논리 1행 = 화면 0행.
+        assert_eq!(error_row_display_number(doc, 1, 0), 0, "row_base 0");
+        assert_eq!(error_row_display_number(doc, 1, 1), 1, "row_base 1");
+        assert_eq!(error_row_display_number(doc, 2, 0), 1);
+
+        // 헤더가 없으면 논리 행이 곧 화면 행이다.
+        doc.has_header = false;
+        assert_eq!(error_row_display_number(doc, 1, 0), 1);
+    }
+
+    /// 텍스트 모드에서는 논리 행이 곧 화면 행이다(헤더 개념이 없다).
+    #[test]
+    fn error_row_display_number_in_text_mode() {
+        let (mut app, _) = edit_doc(b"a,b\n1,2\n", true);
+        let doc = app.doc_mut().unwrap();
+        doc.sep = SeparatorMode::None;
+        assert_eq!(error_row_display_number(doc, 2, 0), 2, "data_start를 빼지 않는다");
+    }
+
     /// 상태바 문구가 세 상태를 가른다. 특히 "아직 안 돌았다"와 "돌았는데
     /// 0개"는 둘 다 빈 목록이지만 정반대의 뜻이다.
     #[test]
@@ -8117,6 +8234,48 @@ mod tests {
         assert_eq!(doc.selected_col, Some(1), "선택 컬럼 유지");
         // 편집 모드에서는 여전히 버퍼가 진실.
         assert_eq!(logical_line(doc, 1).as_deref(), Some("a,1"));
+    }
+
+    /// 저장으로 소스/인덱스를 갈아끼우면 오류 목록도 버려야 한다.
+    ///
+    /// 편집 모드인 동안은 편집 버퍼가 진실이라 티가 안 나지만, 편집 모드를
+    /// 끄면 **새 파일을 옛 목록으로 설명하게** 된다. 게다가 새 인덱스가
+    /// 프라이밍 중이라 `should_start_error_scan`이 재검사도 막으므로, 낡은
+    /// 목록이 그대로 화면에 남는다.
+    #[test]
+    fn repoint_after_save_invalidates_error_scan() {
+        let path = temp(b"h,v\na,1\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&path, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        doc.has_header = true;
+
+        start_error_scan(doc, &ctx);
+        poll_scan_to_completion(doc);
+        assert!(doc.row_errors.is_some(), "전제: 검사 결과가 있다");
+
+        enter_edit_mode(doc);
+        // 편집 모드 진입 자체가 무효화하므로, 저장 경로만 보려고 다시 채운다.
+        start_error_scan(doc, &ctx);
+        assert!(doc.row_errors.is_some(), "전제: 편집 모드 결과가 있다");
+
+        {
+            let opts = crate::save::SaveOptions {
+                enc: doc.enc,
+                bom: false,
+                newline: crate::edit::Newline::Lf,
+            };
+            crate::save::write_file(&path, &v(&["h,v", "a,1"]), &opts, None).unwrap();
+        }
+        repoint_source_after_save(doc, &path, &ctx).unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+
+        assert!(
+            doc.row_errors.is_none(),
+            "소스·인덱스가 바뀌었으면 옛 목록은 무효"
+        );
     }
 
     /// save-as: 새 경로로 저장하면 소스도 새 파일을 매핑해야 한다
