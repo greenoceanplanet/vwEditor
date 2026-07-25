@@ -37,6 +37,7 @@ mod save;
 mod sort;
 mod source;
 mod theme;
+mod validate;
 
 fn main() -> eframe::Result<()> {
     // 첫 인자가 있으면 그 파일을 열고 시작한다(셸에서 실행하거나 exe에
