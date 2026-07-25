@@ -3496,7 +3496,14 @@ fn find_inputs_changed(
 /// 사용자가 `\n`을 쳤을 때 아무 안내 없이 "못 찾음"만 뜨면 기능이 고장 난
 /// 것처럼 보인다. `render_find_panel` 안의 문자열 리터럴로 두면 문구를 지워도
 /// 아무 테스트가 깨지지 않으므로 상수로 뽑는다(`EXTRACT_LOCKED_STATUS`와 같은 결).
-const FIND_ESCAPES_TOOLTIP: &str = "\\t = tab, \\\\ = backslash, \\xNN = character code (hex, e.g. \\x41 = A).\n\\n is not supported: a line is a row here, so it stays as the two characters \\ and n.\nAny other \\x sequence is left as typed.";
+///
+/// **`\x0A`/`\x0D`도 한 줄 덧붙여 경고한다.** `\n` 자체는 못 푼다고 위에서
+/// 이미 말했지만, `\xNN`은 16진수를 그대로 풀므로 `\x0A`/`\x0D`는 실제 개행
+/// 문자를 만들어 낸다 — 그리고 치환문에 들어간 그 개행은 `sanitize_for_line`이
+/// 조용히 공백으로 바꿔치기한다(행 배열 불변식 때문에 안전하지만 무음이다).
+/// 이 문구가 없으면 사용자가 "`\n`은 안 된다니 `\x0A`로 우회하자"고 생각했다가
+/// 아무 표시도 없이 공백을 받게 된다.
+const FIND_ESCAPES_TOOLTIP: &str = "\\t = tab, \\\\ = backslash, \\xNN = character code (hex, e.g. \\x41 = A).\n\\n is not supported: a line is a row here, so it stays as the two characters \\ and n.\nNewline codes in a replacement (\\n, \\x0A, \\x0D) become a space, for the same reason: one row is one line.\nAny other \\x sequence is left as typed.";
 
 /// 찾기 상태 문구. `find_status`(Replace 결과나 "Not found" 등)가 있으면 그걸
 /// 우선한다 — 사용자가 방금 누른 버튼의 결과이므로 매치 개수보다 관심사가
@@ -11931,6 +11938,32 @@ mod tests {
         assert_eq!(doc.find_status, "2 replacements");
         undo_once(doc);
         assert_eq!(doc.edit.as_ref().unwrap().lines, before, "undo 한 번에 전부 복구");
+    }
+
+    /// **`replace_one` 배선 회귀(Task L).** `replace_one`의 재검증이 `doc.
+    /// find_query`(날 문자열)를 쓰면 `\t`로 잡은 매치가 재검증마다 실패해
+    /// "바꾸기"가 매번 "그냥 다음 찾기"로 흘러 버린다 — 같은 두 탭 자리
+    /// 사이를 영원히 왔다 갔다 할 뿐 한 글자도 안 바뀐다. Replace All 계열
+    /// 테스트(`replace_tab_with_text`)는 `replace_all_in_doc`이라는 **다른**
+    /// 경로를 타므로 이 결함을 못 잡는다 — 여기서 `ReplaceOne`을 직접 반복
+    /// 호출해 확인한다.
+    #[test]
+    fn replace_one_wiring_uses_effective_query() {
+        let mut app = tsv_edit_doc(b"a\tb\tc\n");
+        let doc = app.doc_mut().unwrap();
+        doc.find_escapes = true;
+        doc.find_query = r"\t".to_owned();
+        doc.replace_text = "|".to_owned();
+        apply_find_action(doc, FindAction::ReplaceOne); // 1회차: 아직 커서가 없으니 Find Next와 동일.
+        assert_eq!(doc.edit.as_ref().unwrap().lines[0], "a\tb\tc", "1회차는 찾기만 한다");
+        apply_find_action(doc, FindAction::ReplaceOne); // 2회차: 첫 탭을 "|"로.
+        assert_eq!(doc.edit.as_ref().unwrap().lines[0], "a|b\tc");
+        apply_find_action(doc, FindAction::ReplaceOne); // 3회차: 남은 탭을 "|"로.
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines[0],
+            "a|b|c",
+            "재검증이 effective_query를 쓰지 않으면 여기서 두 탭 자리를 영원히 오가며 절대 도달 못 한다"
+        );
     }
 
     /// 반대 방향 — 치환문 쪽 `\t`도 실제 탭이 된다(`effective_replacement` 배선).
