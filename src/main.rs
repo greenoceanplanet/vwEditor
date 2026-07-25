@@ -27,6 +27,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod app;
+mod convert;
 mod edit;
 mod find;
 mod index;
