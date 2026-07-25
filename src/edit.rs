@@ -445,18 +445,101 @@ pub enum EditOp {
     Batch(Vec<EditOp>),
 }
 
-/// 되돌리기 스택. limit을 넘으면 가장 오래된 것부터 버린다(FIFO).
+/// 되돌리기 스택. **단계 수와 바이트 예산 둘 다**로 자르고, 넘으면 가장
+/// 오래된 것부터 버린다(FIFO). 둘 중 먼저 걸리는 쪽이 이긴다.
 pub struct UndoStack {
     ops: Vec<EditOp>,
+    /// `ops[i]`의 대략적인 바이트(`op_bytes`). push 때 한 번만 재고 들고 다닌다 —
+    /// 버릴 개수를 정할 때마다 다시 세면 스택 전체를 훑게 되는데, 그게 바로
+    /// 이 예산이 막으려는 규모(수백 MB 문자열)라 자기모순이 된다.
+    sizes: Vec<usize>,
     limit: usize,
+    /// `sizes`의 합. 증감으로만 유지한다.
+    bytes: usize,
+    budget: usize,
 }
 
 /// 기본 되돌리기 깊이(사용자 확정).
 pub const UNDO_LIMIT: usize = 100;
 
+/// 되돌리기 스택이 붙들 수 있는 대략적인 최대 바이트.
+///
+/// **단계 수 제한만으로는 부족하다.** 15.4M행 파일에서 컬럼 연산을 100번 하면
+/// `UNDO_LIMIT = 100`은 아무것도 안 막고 100 × 900MB를 붙들어 수십 GB가 된다.
+/// 한 단계가 파일 전체를 담을 수 있는 이상, 단계 수는 메모리 상한이 아니다.
+///
+/// 값의 근거: 이 앱은 수 GB 파일을 여는 것이 전제라 버퍼 자체가 이미 수 GB를
+/// 쓴다. 되돌리기가 그 위에 얹을 수 있는 몫으로 512MB면 실사용에서 넉넉하고
+/// (전체 바꾸기 한 번의 undo가 이 파일에서 ~370MB), 32GB 기계에서도 스왑을
+/// 유발하지 않는다. 더 키우면 큰 파일에서 되돌리기 한두 단계 때문에 앱이
+/// 통째로 느려질 위험이 커지고, 더 줄이면 큰 파일에서 전체 바꾸기 한 번조차
+/// 못 되돌린다.
+pub const UNDO_BYTE_BUDGET: usize = 512 * 1024 * 1024;
+
+/// op 하나가 붙들고 있는 대략적인 힙 바이트.
+///
+/// **정확할 필요가 없다 — 자릿수만 맞으면 된다.** 목적은 회계가 아니라 "수십
+/// GB를 조용히 붙들고 있는 상태"를 막는 것이다. 그래서 `String`의 여유 용량이나
+/// `Vec`의 초과 할당은 세지 않고, 실제로 담긴 내용 + 원소당 고정 비용만 센다.
+/// 반대로 **과소평가는 하지 않는다** — 원소가 많고 내용이 짧은 op(예: 빈 줄
+/// 100만 개)도 포인터·길이만으로 수십 MB이므로 그 고정 비용을 반드시 더한다.
+pub fn op_bytes(op: &EditOp) -> usize {
+    // (usize, String) 한 칸과 String 한 칸의 고정 비용. String은 포인터+길이+용량
+    // 24바이트, 앞의 usize까지 32바이트.
+    const PAIR: usize = 32;
+    const STR: usize = 24;
+    match op {
+        EditOp::Replace(items) => {
+            items.len() * PAIR + items.iter().map(|(_, s)| s.len()).sum::<usize>()
+        }
+        // 지운 행을 되살릴 정보가 없다 — 위치와 개수뿐이라 사실상 공짜.
+        EditOp::RemoveInserted { .. } => 0,
+        EditOp::ReinsertRemoved { lines, .. } => {
+            lines.len() * STR + lines.iter().map(|s| s.len()).sum::<usize>()
+        }
+        EditOp::Reorder { inverse, .. } => inverse.len() * std::mem::size_of::<u32>(),
+        EditOp::Batch(ops) => ops.iter().map(op_bytes).sum(),
+    }
+}
+
+/// 새 op를 쌓기 **전에** 앞에서 몇 개를 버려야 하는지 정한다.
+///
+/// 순수 함수로 뽑아 둔 이유는 이 코드베이스의 규율이다 — 판단식을 `push` 안에
+/// 인라인해 두면 테스트가 스택 상태를 통째로 꾸며야 검증할 수 있고, 규칙을
+/// 뒤집어도 테스트가 눈치채지 못한다.
+///
+/// 규칙:
+/// - `limit == 0`이면 애초에 아무것도 안 쌓으므로 이 함수를 부르지 않는다.
+/// - 단계 수가 `limit`에 닿으면 자리를 만들려고 최소 하나는 버린다.
+/// - 그러고도 (남은 바이트 + 새 op)가 예산을 넘으면 넘지 않을 때까지 더 버린다.
+/// - **새 op 하나가 혼자 예산을 넘겨도 전부 버리고 그 하나는 남긴다.** 되돌리기
+///   자체를 포기시키는 것보다 낫고, 어차피 다음 push가 이걸 밀어낸다.
+///
+/// 반환값은 "앞에서 버릴 개수"이며 `existing.len()`을 넘지 않는다.
+pub fn undo_evict_count(existing: &[usize], new_bytes: usize, limit: usize, budget: usize) -> usize {
+    let mut drop = if existing.len() >= limit {
+        // 단계 수 초과분 + 자리 하나.
+        existing.len() - limit + 1
+    } else {
+        0
+    };
+    let mut kept: usize = existing.iter().skip(drop).sum();
+    while drop < existing.len() && kept + new_bytes > budget {
+        kept -= existing[drop];
+        drop += 1;
+    }
+    drop
+}
+
 impl UndoStack {
     pub fn new(limit: usize) -> Self {
-        UndoStack { ops: Vec::new(), limit }
+        Self::with_budget(limit, UNDO_BYTE_BUDGET)
+    }
+
+    /// 바이트 예산을 직접 정해 만든다(테스트용 — 512MB를 실제로 채우려면
+    /// 테스트가 수백 MB를 할당해야 한다).
+    pub fn with_budget(limit: usize, budget: usize) -> Self {
+        UndoStack { ops: Vec::new(), sizes: Vec::new(), limit, bytes: 0, budget }
     }
 
     pub fn len(&self) -> usize {
@@ -467,20 +550,33 @@ impl UndoStack {
         self.ops.is_empty()
     }
 
-    /// 되돌리기 한 단계를 쌓는다. limit을 넘으면 가장 오래된 것을 버린다.
-    /// **편집을 적용하기 직전에** 호출해야 한다(이전 상태를 담으므로).
+    /// 지금 쌓인 op들의 대략적인 바이트 합.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// 되돌리기 한 단계를 쌓는다. 단계 수나 바이트 예산을 넘으면 가장 오래된
+    /// 것부터 버린다. **편집을 적용하기 직전에** 호출해야 한다(이전 상태를 담으므로).
     pub fn push(&mut self, op: EditOp) {
         if self.limit == 0 {
             return;
         }
-        if self.ops.len() >= self.limit {
-            self.ops.remove(0);
+        let new_bytes = op_bytes(&op);
+        let drop = undo_evict_count(&self.sizes, new_bytes, self.limit, self.budget);
+        if drop > 0 {
+            self.bytes -= self.sizes.iter().take(drop).sum::<usize>();
+            self.ops.drain(..drop);
+            self.sizes.drain(..drop);
         }
+        self.bytes += new_bytes;
         self.ops.push(op);
+        self.sizes.push(new_bytes);
     }
 
     pub fn clear(&mut self) {
         self.ops.clear();
+        self.sizes.clear();
+        self.bytes = 0;
     }
 
     /// 가장 최근 편집을 되돌린다. 되돌릴 게 없으면 false.
@@ -489,6 +585,11 @@ impl UndoStack {
         let Some(op) = self.ops.pop() else {
             return false;
         };
+        // 되돌린 단계는 스택에서 빠지므로 회계에서도 빼야 한다 — 안 그러면
+        // undo를 반복할수록 남은 예산이 실제보다 작다고 착각한다.
+        if let Some(b) = self.sizes.pop() {
+            self.bytes -= b;
+        }
         apply_undo_op(lines, op);
         // "lines는 비어 있지 않다" 불변식은 **한 단계가 끝난 뒤**에만 강제한다.
         // Batch 중간에 강제하면 유령 줄이 다시 생겨(제거 → 즉시 재삽입) 뒤이은
@@ -1129,6 +1230,116 @@ mod tests {
         st.push(EditOp::Replace(vec![(0, "2".into())]));
         st.push(EditOp::Replace(vec![(0, "3".into())]));
         assert_eq!(st.len(), 2, "가장 오래된 것이 버려진다");
+    }
+
+    /// 예산 안이면 아무것도 안 버린다 — 바이트 예산이 단계 수 제한을
+    /// 앞질러 작동하면 정상 편집에서도 되돌리기가 조용히 사라진다.
+    #[test]
+    fn undo_byte_budget_keeps_everything_when_under() {
+        let mut st = UndoStack::with_budget(100, 1 << 20);
+        for i in 0..10 {
+            st.push(EditOp::Replace(vec![(i, "x".repeat(100))]));
+        }
+        assert_eq!(st.len(), 10);
+        assert!(st.bytes() < 1 << 20);
+    }
+
+    /// 예산을 넘기면 오래된 단계부터 버린다(FIFO 유지).
+    #[test]
+    fn undo_byte_budget_drops_oldest_when_over() {
+        // op 하나가 1,024바이트 + 고정비 32바이트. 예산을 3개치로 잡는다.
+        let one = 1024 + 32;
+        let mut st = UndoStack::with_budget(100, one * 3);
+        for i in 0..6 {
+            st.push(EditOp::Replace(vec![(i, "x".repeat(1024))]));
+        }
+        assert_eq!(st.len(), 3, "예산이 3개치면 최근 3개만 남는다");
+        assert!(st.bytes() <= one * 3);
+        // 남은 3개가 **최근** 3개(3,4,5행)인지 하나씩 되돌려 확인한다.
+        // 개수만 세면 "오래된 것 대신 최신 것을 버리는" 뒤집힌 구현도 통과한다 —
+        // 각 단계가 어느 행을 복원하는지까지 봐야 FIFO가 진짜로 지켜진다.
+        let mut lines = v(&["", "", "", "", "", ""]);
+        let mut restored = Vec::new();
+        while st.undo(&mut lines) {
+            let r = lines.iter().position(|l| !l.is_empty()).expect("복원된 행이 있어야 한다");
+            restored.push(r);
+            lines[r].clear();
+        }
+        assert_eq!(restored, vec![5, 4, 3], "최근 3개가 LIFO 순서로 남아 있어야 한다");
+    }
+
+    /// 단계 수 제한은 예산과 **무관하게** 여전히 작동한다(둘 중 먼저 걸리는
+    /// 쪽이 이긴다). 예산을 사실상 무한으로 두고 확인한다.
+    #[test]
+    fn undo_step_limit_still_applies_with_huge_budget() {
+        let mut st = UndoStack::with_budget(2, usize::MAX);
+        for i in 0..5 {
+            st.push(EditOp::Replace(vec![(i, "x".into())]));
+        }
+        assert_eq!(st.len(), 2);
+    }
+
+    /// 새 op 하나가 혼자 예산을 넘겨도 그 하나는 남는다 — 되돌리기 자체를
+    /// 포기시키면 큰 파일에서 전체 바꾸기를 못 되돌린다.
+    #[test]
+    fn undo_oversized_single_op_is_still_kept() {
+        let mut st = UndoStack::with_budget(100, 64);
+        st.push(EditOp::Replace(vec![(0, "x".repeat(10))]));
+        st.push(EditOp::Replace(vec![(1, "y".repeat(10_000))]));
+        assert_eq!(st.len(), 1, "예산 초과라도 최신 하나는 남는다");
+        assert!(st.bytes() > 64);
+    }
+
+    /// 되돌린 단계는 회계에서도 빠진다 — 안 빼면 undo를 반복할수록 남은
+    /// 예산을 실제보다 작게 보아 멀쩡한 단계를 버리기 시작한다.
+    #[test]
+    fn undo_pop_releases_its_bytes() {
+        let mut st = UndoStack::with_budget(100, 1 << 20);
+        st.push(EditOp::Replace(vec![(0, "x".repeat(1000))]));
+        let after_push = st.bytes();
+        assert!(after_push >= 1000);
+        let mut lines = v(&["a"]);
+        assert!(st.undo(&mut lines));
+        assert_eq!(st.bytes(), 0, "되돌린 단계의 바이트는 반납된다");
+    }
+
+    /// `undo_evict_count`는 순수 함수라 스택을 꾸미지 않고 규칙만 직접 찌른다.
+    #[test]
+    fn undo_evict_count_rules() {
+        // 예산·단계 수 둘 다 여유 → 아무것도 안 버린다.
+        assert_eq!(undo_evict_count(&[10, 10], 10, 100, 1000), 0);
+        // 단계 수가 꽉 참 → 자리 하나를 만든다.
+        assert_eq!(undo_evict_count(&[10, 10], 10, 2, 1000), 1);
+        // 단계 수는 여유지만 예산 초과 → 넘지 않을 때까지 앞에서 버린다.
+        assert_eq!(undo_evict_count(&[10, 10, 10], 10, 100, 30), 1);
+        assert_eq!(undo_evict_count(&[10, 10, 10], 25, 100, 30), 3);
+        // 새 op 혼자 예산 초과 → 전부 버리되 개수는 기존 길이를 안 넘는다.
+        assert_eq!(undo_evict_count(&[10, 10], 9999, 100, 30), 2);
+        // 빈 스택.
+        assert_eq!(undo_evict_count(&[], 9999, 100, 30), 0);
+        // 단계 수 초과분이 2 이상인 경우(제한이 줄어든 상황)도 한 번에 정리.
+        assert_eq!(undo_evict_count(&[1, 1, 1, 1], 1, 2, 1000), 3);
+    }
+
+    /// `op_bytes`는 정확할 필요는 없지만 **과소평가하면 안 된다** — 내용이
+    /// 짧고 원소가 많은 op가 0으로 계산되면 예산이 통째로 무력해진다.
+    #[test]
+    fn op_bytes_counts_per_element_overhead() {
+        // 빈 문자열 1,000개라도 포인터·길이 몫은 잡힌다.
+        let many_empty = EditOp::Replace((0..1000).map(|i| (i, String::new())).collect());
+        assert!(op_bytes(&many_empty) >= 1000 * 8, "원소당 고정 비용을 세야 한다");
+        // 내용도 함께 잡힌다.
+        let with_text = EditOp::Replace(vec![(0, "x".repeat(5000))]);
+        assert!(op_bytes(&with_text) >= 5000);
+        // Batch는 안쪽 합.
+        let batch = EditOp::Batch(vec![
+            EditOp::Replace(vec![(0, "x".repeat(100))]),
+            EditOp::ReinsertRemoved { at: 0, lines: vec!["y".repeat(100)] },
+        ]);
+        assert!(op_bytes(&batch) >= 200);
+        // Reorder는 인덱스 배열 크기.
+        let reorder = EditOp::Reorder { inverse: vec![0u32; 1000], data_start: 0 };
+        assert_eq!(op_bytes(&reorder), 4000);
     }
 
     #[test]
