@@ -687,6 +687,31 @@ fn decode_logical_line(doc: &Document, logical: usize) -> Option<String> {
     })
 }
 
+/// IME를 캐럿 자리에 붙일 것인가. **편집 모드일 때만** 참이다.
+///
+/// 뷰 모드에서 IME를 켜면(= `output.ime`를 채우면) 입력할 수 없는 화면인데도
+/// 한글 조합 창이 뜬다 — 사용자가 친 글자는 아무 데도 들어가지 않고 사라진다.
+/// 뷰 모드에는 캐럿 자체가 없으므로 이 함수가 호출되는 일도 없어야 정상이지만,
+/// 판정을 이름으로 남겨 두면 나중에 캐럿을 뷰 모드로 넓힐 때 여기가 걸린다.
+fn ime_should_follow_caret(editing: bool) -> bool {
+    editing
+}
+
+/// IME(한글/일본어/중국어 조합 입력) 창의 위치를 캐럿 자리로 알린다.
+///
+/// egui `TextEdit`이 하는 것과 같다(`text_edit/builder.rs`) — 이 앱은 본문을
+/// `TextEdit` 없이 직접 그리므로 그 일을 대신 해 줘야 한다. 알리지 않으면
+/// 조합 창이 캐럿과 동떨어진 자리에 뜨고, 일부 IME는 활성화되지 않는다.
+///
+/// `rect`는 편집 영역, `cursor_rect`는 캐럿이다. 둘 다 화면 좌표여야 하는데,
+/// 이 앱은 본문에 `layer_transform`을 걸지 않으므로 UI 좌표가 곧 화면 좌표다
+/// (`TextEdit`은 변환을 곱해 주지만 여기서는 항등이다).
+fn set_ime_output(ctx: &egui::Context, rect: egui::Rect, cursor_rect: egui::Rect) {
+    ctx.output_mut(|o| {
+        o.ime = Some(egui::output::IMEOutput { rect, cursor_rect });
+    });
+}
+
 /// 줄 끝 개행 기호를 `at`(글자가 끝나는 자리)에 그린다. 개행이 없으면
 /// (`LineEnding::None`) 아무것도 하지 않는다.
 ///
@@ -4107,6 +4132,33 @@ fn newline_label(nl: crate::edit::Newline) -> &'static str {
     }
 }
 
+/// 저장 옵션을 **다이얼로그에서 고른 값**으로 만든다.
+///
+/// 셋 다 `app`에서 온다는 것이 요점이다. 개행만 문서(`EditBuffer.newline`)에서
+/// 읽던 시절이 있었는데, 그러면 콤보에서 LF를 골라도 CRLF로 저장된다 —
+/// `init_save_defaults`가 둘을 같은 값으로 맞춰 두기 때문에 **고르지 않으면
+/// 증상이 안 보이고**, 골랐을 때만 조용히 무시된다.
+fn save_options(app: &App) -> crate::save::SaveOptions {
+    crate::save::SaveOptions {
+        enc: app.save_enc,
+        bom: app.save_bom,
+        newline: app.save_newline,
+    }
+}
+
+/// 저장이 성공했을 때 문서에 반영할 것 — 개행 스타일 되쓰기 + dirty 해제.
+///
+/// 저장 경로 한가운데(rfd 파일 선택 창 뒤)에 있던 처리를 함수로 뺐다. 그
+/// 자리는 테스트가 구동할 수 없어, 두 처리 중 하나가 빠져도 아무 테스트도
+/// 깨지지 않았다. 이제 둘 다 여기서 검증된다.
+fn mark_saved(doc: &mut Document, nl: crate::edit::Newline) {
+    // 방금 이 스타일로 썼으므로 문서의 개행도 이것이다.
+    apply_save_newline(doc, nl);
+    if let Some(e) = &mut doc.edit {
+        e.dirty = false;
+    }
+}
+
 /// 다이얼로그에서 고른 개행 스타일을 편집 버퍼에 **되쓴다**.
 ///
 /// 되쓰지 않으면 저장은 LF로 나가는데 화면 기호는 계속 `␍␊`를 그린다 —
@@ -4237,14 +4289,7 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
         cur_path
     };
 
-    // 개행은 다이얼로그에서 고른 값을 쓴다(기본값은 원본과 같은 스타일 —
-    // `init_save_defaults`). 저장이 성공하면 문서에도 되써서 화면 기호가
-    // 파일과 일치하게 한다(아래 `apply_save_newline`).
-    let opts = crate::save::SaveOptions {
-        enc: app.save_enc,
-        bom: app.save_bom,
-        newline: app.save_newline,
-    };
+    let opts = save_options(app);
     let result = {
         let Some(e) = app.doc().and_then(|d| d.edit.as_ref()) else { return };
         crate::save::write_file(&target, &e.lines, &opts, None)
@@ -4255,11 +4300,10 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
             app.error = None;
             let chosen_newline = app.save_newline;
             if let Some(doc) = app.doc_mut() {
-                // 방금 이 스타일로 썼으므로 문서의 개행도 이것이다.
-                apply_save_newline(doc, chosen_newline);
-                if let Some(e) = &mut doc.edit {
-                    e.dirty = false;
-                }
+                // 저장이 성공했을 때 문서에 반영할 것들을 한 함수로 모았다 —
+                // 여기는 rfd 다이얼로그 뒤라 테스트가 구동할 수 없으므로,
+                // 판정을 밖으로 빼야 검증할 수 있다(`mark_saved` 참조).
+                mark_saved(doc, chosen_newline);
                 // ①경로 폴백 여부와 ②경로 갱신 여부는 반드시 같은 판정이어야
                 // 한다(`save_as_fallback` 참조) — 그렇지 않으면 추출본을 파일
                 // 선택 창으로 저장해 놓고도 탭은 계속 "추출본"이라 우겨서,
@@ -6118,6 +6162,7 @@ enum TextMenuAction {
 
 /// 텍스트 모드 캐럿/선택 이동·편집 인텐트. 키 입력 루프가 이걸 만들어 내고,
 /// 적용 단계에서 `doc.edit`에 반영한다.
+#[derive(Debug)]
 enum TextEditIntent {
     /// 문자 입력(개행 포함 가능). 선택이 있으면 먼저 지운다.
     Insert(String),
@@ -6740,14 +6785,20 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                     // 3) 캐럿(그 줄일 때만).
                     if caret.line == logical {
                         let x = x_of(caret.col);
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(x, cell_rect.top() + 2.0),
-                                egui::pos2(x + 1.5, cell_rect.bottom() - 2.0),
-                            ),
-                            0.0,
-                            caret_color,
+                        let caret_rect = egui::Rect::from_min_max(
+                            egui::pos2(x, cell_rect.top() + 2.0),
+                            egui::pos2(x + 1.5, cell_rect.bottom() - 2.0),
                         );
+                        painter.rect_filled(caret_rect, 0.0, caret_color);
+                        // IME 조합 창을 캐럿 자리로 보낸다. 이걸 알려 주지
+                        // 않으면 한글 조합 창이 캐럿과 동떨어진 곳(창 좌상단
+                        // 등)에 뜨고, **무엇보다 IME가 켜지지 않는다** —
+                        // egui-winit이 `let allow_ime = ime.is_some()`으로
+                        // 판단하기 때문(lib.rs:831). egui의 `TextEdit`도 같은
+                        // 일을 한다(`text_edit/builder.rs`의 `o.ime = Some(..)`).
+                        if ime_should_follow_caret(editing) {
+                            set_ime_output(ui.ctx(), cell_rect, caret_rect);
+                        }
                     }
 
                     // 4) 클릭/드래그 상호작용. 셀 전체가 대상.
@@ -6942,6 +6993,20 @@ fn collect_text_intents(i: &egui::InputState) -> Vec<TextEditIntent> {
     for ev in &i.events {
         match ev {
             egui::Event::Text(t) if !t.is_empty() => {
+                out.push(TextEditIntent::Insert(t.clone()));
+            }
+            // IME 확정 문자(한글/일본어/중국어). **이 분기가 없으면 한글이
+            // 아예 입력되지 않는다** — 조합 입력은 `Event::Text`로 오지 않고
+            // `Event::Ime`로만 온다.
+            //
+            // `Commit`만 받고 `Preedit`(조합 중간 상태)은 버린다. 조합 중인
+            // 글자를 버퍼에 넣으면 다음 Preedit마다 그것을 지우고 다시 넣어야
+            // 하는데, 그 되돌리기가 undo 스택에 낱글자로 쌓여 Ctrl+Z 한 번이
+            // "ㄱ→가→각"의 한 단계만 되돌리는 꼴이 된다. 확정된 것만 넣으면
+            // undo 단위가 단어가 되고 버퍼 불변식도 단순하게 유지된다.
+            // 대가는 조합 중 글자가 본문에 미리 보이지 않는 것인데, 그건
+            // IME 자체 창이 캐럿 자리에 띄워 준다(`set_ime_output` 참조).
+            egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => {
                 out.push(TextEditIntent::Insert(t.clone()));
             }
             egui::Event::Copy => out.push(TextEditIntent::Copy),
@@ -13979,5 +14044,182 @@ mod tests {
             assert_eq!(std::fs::read(&out).unwrap(), expect, "{nl:?}");
             std::fs::remove_file(&out).ok();
         }
+    }
+
+    // ---- IME(한글/일본어/중국어 조합) 입력 ----
+
+    /// `collect_text_intents`에 이벤트를 흘려 인텐트를 뽑는다.
+    ///
+    /// `InputState`는 비공개 필드가 있어 리터럴로 못 만든다. 실제 `Context`에
+    /// `RawInput`으로 넣어 한 프레임을 돌리는데, 이쪽이 진짜 이벤트 경로와
+    /// 같으므로 오히려 충실한 검증이다.
+    fn intents_from(events: Vec<egui::Event>) -> Vec<TextEditIntent> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let _ = ctx.run(input, |ctx| {
+            out = ctx.input(collect_text_intents);
+        });
+        out
+    }
+
+    /// **이 테스트가 회귀의 핵심이다.** 한글은 `Event::Text`가 아니라
+    /// `Event::Ime(Commit)`으로 들어온다. 그 분기가 없으면 편집 모드에서
+    /// 한글이 아예 입력되지 않는다(사용자 보고).
+    #[test]
+    fn ime_commit_becomes_insert_intent() {
+        let out = intents_from(vec![egui::Event::Ime(egui::ImeEvent::Commit(
+            "한글".to_owned(),
+        ))]);
+        assert_eq!(out.len(), 1, "확정 문자는 삽입 하나로 들어간다");
+        match &out[0] {
+            TextEditIntent::Insert(s) => assert_eq!(s, "한글"),
+            other => panic!("Insert를 기대했는데 {other:?}"),
+        }
+    }
+
+    /// 조합 중간(`Preedit`)은 버퍼에 넣지 않는다 — 넣으면 다음 Preedit마다
+    /// 지우고 다시 넣어야 하고, 그 되돌리기가 undo 스택에 낱글자로 쌓인다.
+    #[test]
+    fn ime_preedit_does_not_touch_the_buffer() {
+        let out = intents_from(vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("ㅎ".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Preedit("하".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Preedit("한".to_owned())),
+        ]);
+        assert!(out.is_empty(), "조합 중에는 아무 인텐트도 만들지 않는다: {out:?}");
+    }
+
+    /// 조합 → 확정의 전체 흐름. 확정된 글자 **하나만** 들어가야 한다
+    /// (조합 단계가 같이 들어가면 "ㅎ하한한"이 된다).
+    #[test]
+    fn ime_composition_then_commit_inserts_once() {
+        let out = intents_from(vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("ㅎ".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Preedit("한".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Commit("한".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ]);
+        assert_eq!(out.len(), 1, "확정 하나만: {out:?}");
+    }
+
+    /// 빈 Commit은 무시한다(조합을 취소하면 빈 문자열이 올 수 있다).
+    #[test]
+    fn ime_empty_commit_is_ignored() {
+        let out = intents_from(vec![egui::Event::Ime(egui::ImeEvent::Commit(String::new()))]);
+        assert!(out.is_empty());
+    }
+
+    /// IME 확정이 실제로 편집 버퍼에 반영되는지 — 인텐트 적용까지 끝에서 끝까지.
+    #[test]
+    fn ime_commit_reaches_the_edit_buffer() {
+        let mut app = find_test_doc(&["abc"]);
+        let doc = app.doc_mut().unwrap();
+        doc.text_caret = crate::edit::TextPos { line: 0, col: 3 };
+        let mut clip = String::new();
+        apply_text(doc, &mut clip, TextEditIntent::Insert("한글".into()));
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["abc한글"]));
+    }
+
+    /// 영문(`Event::Text`)과 한글(`Event::Ime`)이 같은 프레임에 섞여 와도
+    /// 순서대로 둘 다 들어간다.
+    #[test]
+    fn ascii_and_ime_text_both_arrive() {
+        let out = intents_from(vec![
+            egui::Event::Text("a".to_owned()),
+            egui::Event::Ime(egui::ImeEvent::Commit("가".to_owned())),
+        ]);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// IME 위치 통보가 `output.ime`를 채운다. **이것이 채워져야 winit이
+    /// `set_ime_allowed(true)`를 호출한다**(egui-winit lib.rs의
+    /// `let allow_ime = ime.is_some()`) — 즉 이 호출이 없으면 IME 자체가
+    /// 켜지지 않아 한글 입력이 시작조차 안 된다.
+    #[test]
+    fn set_ime_output_fills_platform_output() {
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 16.0));
+        let caret = egui::Rect::from_min_size(egui::pos2(50.0, 20.0), egui::vec2(1.5, 16.0));
+        set_ime_output(&ctx, rect, caret);
+        let got = ctx.output(|o| o.ime);
+        let got = got.expect("output.ime가 채워져야 IME가 켜진다");
+        assert_eq!(got.rect, rect);
+        assert_eq!(got.cursor_rect, caret, "조합 창이 캐럿 자리에 뜬다");
+    }
+
+    /// 저장 성공 처리는 **두 가지를 함께** 한다 — 개행 되쓰기와 dirty 해제.
+    /// 하나만 해도 아무 테스트가 안 깨지던 자리라 함수로 빼서 못박는다.
+    #[test]
+    fn mark_saved_applies_newline_and_clears_dirty() {
+        let mut doc = new_document();
+        doc.edit.as_mut().unwrap().dirty = true;
+        assert_eq!(
+            doc.edit.as_ref().unwrap().newline,
+            crate::edit::Newline::CrLf,
+            "전제: 새 문서는 CRLF"
+        );
+
+        mark_saved(&mut doc, crate::edit::Newline::Lf);
+
+        assert_eq!(
+            doc.edit.as_ref().unwrap().newline,
+            crate::edit::Newline::Lf,
+            "고른 개행이 문서에 반영된다"
+        );
+        assert!(!doc.edit.as_ref().unwrap().dirty, "저장했으므로 깨끗해진다");
+    }
+
+    /// IME는 **편집 모드에서만** 캐럿을 따라간다. 뷰 모드에서 켜면 입력할 수
+    /// 없는 화면에 조합 창이 뜨고 친 글자가 사라진다.
+    #[test]
+    fn ime_follows_caret_only_in_edit_mode() {
+        assert!(ime_should_follow_caret(true));
+        assert!(!ime_should_follow_caret(false));
+    }
+
+    /// 다이얼로그에서 고른 개행이 **실제 저장 옵션에 들어가는지**.
+    ///
+    /// 문서의 개행과 **다른** 값을 골랐을 때만 증상이 드러나므로, 일부러
+    /// 어긋나게 만들어 확인한다. 같은 값이면 어느 쪽에서 읽어도 통과한다.
+    #[test]
+    fn save_options_use_the_dialog_choice_not_the_document() {
+        let p = temp_ext(b"a\r\nb\r\n", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        assert_eq!(
+            app.doc().unwrap().edit.as_ref().unwrap().newline,
+            crate::edit::Newline::CrLf,
+            "전제: 문서는 CRLF"
+        );
+
+        // 사용자가 콤보에서 LF를 골랐다.
+        app.save_newline = crate::edit::Newline::Lf;
+
+        assert_eq!(
+            save_options(&app).newline,
+            crate::edit::Newline::Lf,
+            "문서가 CRLF여도 고른 LF로 저장해야 한다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 인코딩/BOM도 같은 출처(다이얼로그)에서 온다.
+    #[test]
+    fn save_options_carry_encoding_and_bom() {
+        let app = App {
+            save_enc: crate::parse::Encoding::Utf16Le,
+            save_bom: true,
+            ..App::default()
+        };
+        let o = save_options(&app);
+        assert_eq!(o.enc, crate::parse::Encoding::Utf16Le);
+        assert!(o.bom);
     }
 }
