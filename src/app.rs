@@ -676,6 +676,99 @@ fn decode_logical_line(doc: &Document, logical: usize) -> Option<String> {
     })
 }
 
+/// 줄 끝 개행 기호를 `at`(글자가 끝나는 자리)에 그린다. 개행이 없으면
+/// (`LineEnding::None`) 아무것도 하지 않는다.
+///
+/// **본문 galley와 분리해 그리는 것이 요점이다.** 기호를 본문 문자열에 이어
+/// 붙이면 그 galley가 캐럿 위치·클릭 역매핑·선택 범위의 진실이 되어, 존재하지
+/// 않는 글자 위에 캐럿이 서고 줄 끝 클릭이 기호 안으로 빨려 들어간다.
+/// 그래서 좌표(`x_of(len)`)만 받아 그 자리에 **덧그리기만** 한다.
+///
+/// 폰트에 `␍␊`(U+240D/U+240A)가 없으면 두부(□)가 되므로, 없을 때는 `\r`/`\n`
+/// 이스케이프 표기로 떨어진다 — 의미는 그대로 전해지고 두부는 나오지 않는다.
+fn paint_line_ending(
+    painter: &egui::Painter,
+    at: egui::Pos2,
+    ending: parse::LineEnding,
+    font_id: &egui::FontId,
+    ui: &egui::Ui,
+) {
+    let text = ending_glyphs(ending, |c| ui.fonts(|f| f.has_glyph(font_id, c)));
+    if text.is_empty() {
+        return;
+    }
+    painter.text(
+        at,
+        egui::Align2::LEFT_TOP,
+        text,
+        font_id.clone(),
+        crate::theme::line_ending_fg(),
+    );
+}
+
+/// 개행 기호로 실제로 그릴 문자열. 폰트에 제어문자 기호(U+240x)가 있으면 그것을,
+/// 없으면 이스케이프 표기(`\r`, `\n`)를 쓴다.
+///
+/// `has_glyph`를 인자로 받는 이유: 폰트 조회는 egui `Context`가 필요해 테스트가
+/// 만들 수 없다. 판정 자체를 순수 함수로 떼어 두면 두 분기를 다 검증할 수 있다
+/// (이 저장소가 GUI 클로저 안 판정에 쓰는 것과 같은 패턴).
+fn ending_glyphs(ending: parse::LineEnding, has_glyph: impl Fn(char) -> bool) -> String {
+    if matches!(ending, parse::LineEnding::None) {
+        return String::new();
+    }
+    // 기호는 CR/LF 각각 한 글자씩이고 CRLF는 그 둘을 이어붙인 것이므로
+    // (`LineEnding::symbol` 참조), 한 글자라도 폰트에 없으면 둘 다 폴백해야
+    // 표기가 섞이지 않는다("␍\n" 같은 꼴을 막는다).
+    let symbol = ending.symbol();
+    if symbol.chars().all(&has_glyph) {
+        return symbol.to_owned();
+    }
+    match ending {
+        parse::LineEnding::None => String::new(),
+        parse::LineEnding::Lf => "\\n".to_owned(),
+        parse::LineEnding::Cr => "\\r".to_owned(),
+        parse::LineEnding::CrLf => "\\r\\n".to_owned(),
+    }
+}
+
+/// `logical` 행이 어떤 개행으로 끝나는지. 화면에 기호로 그리기 위한 값이다.
+///
+/// **두 모드의 정확도가 다르고, 그 차이는 없앨 수 없다.**
+///
+/// - **뷰 모드(mmap):** 행 범위가 개행 바이트를 포함하므로(`LineIndex` 불변식)
+///   줄마다 **진짜** 개행을 읽어낸다. 섞인 파일(어떤 줄은 LF, 어떤 줄은 CRLF)도
+///   있는 그대로 보인다.
+/// - **편집 모드:** `EditBuffer.lines[i]`에는 개행이 없다(불변식). 로더가 줄을
+///   나누면서 떼어 버리고 파일 전체 스타일 하나(`EditBuffer.newline`)만 남긴다.
+///   그래서 모든 줄을 그 스타일로 그린다 — 섞인 파일을 편집 모드로 열면 화면이
+///   실제와 달라질 수 있다. 이건 표시의 한계가 아니라 **편집 버퍼가 그 정보를
+///   보관하지 않는다**는 사실의 결과이고, 저장할 때도 같은 스타일로 통일해
+///   쓰이므로(`save::write_file`) 화면이 곧 저장 결과와 일치한다.
+///
+/// **마지막 줄은 파일에 종결 개행이 있을 때만 기호가 붙는다.** 없는 개행을
+/// 그리면 "여기 개행이 있다"는 거짓말이 되고, 그 줄에 이어 쓸 때 사용자가
+/// 기대하는 동작도 달라진다. 뷰 모드는 바이트로 직접 알 수 있고, 편집 모드는
+/// 알 수 없으므로(로더가 버렸다) 마지막 줄에는 붙이지 않는다.
+fn line_ending_for_row(doc: &Document, logical: usize) -> parse::LineEnding {
+    match &doc.edit {
+        Some(e) => {
+            // 마지막 줄: 종결 개행이 있었는지 편집 버퍼는 모른다. 없다고 본다.
+            if logical + 1 >= e.lines.len() {
+                return parse::LineEnding::None;
+            }
+            match e.newline {
+                crate::edit::Newline::Lf => parse::LineEnding::Lf,
+                crate::edit::Newline::CrLf => parse::LineEnding::CrLf,
+            }
+        }
+        None => doc
+            .index
+            .line_range(logical)
+            .map(|(s, end)| parse::split_line_ending(doc.source.slice(s, end)).1)
+            .unwrap_or(parse::LineEnding::None),
+    }
+}
+
 /// 파일을 열자마자 편집 모드로 들어갈지. `open_path`가 부르는 순수 판정으로,
 /// 크기 하나만 본다(`AUTO_EDIT_MAX_BYTES` 이하).
 ///
@@ -6472,7 +6565,19 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                         // 방지). 검색 중일 때만 galley로 바꿔 부분 음영을 그린다 —
                         // 음영·글자만, 캐럿/선택/상호작용은 없다(뷰 모드엔 없으므로).
                         if !searching {
-                            ui.add(egui::Label::new(line).truncate());
+                            // 개행 기호를 그리려면 글자 끝 x를 알아야 하므로
+                            // `Label`이 그린 실제 폭(`response.rect`)을 쓴다 —
+                            // 여기서 galley를 따로 만들어 재면 Label의 레이아웃과
+                            // 어긋날 수 있다.
+                            let resp = ui.add(egui::Label::new(line).truncate());
+                            let ending = line_ending_for_row(doc, logical);
+                            paint_line_ending(
+                                ui.painter(),
+                                egui::pos2(resp.rect.right(), resp.rect.top()),
+                                ending,
+                                &font_id,
+                                ui,
+                            );
                             return;
                         }
                         let cell_rect = ui.max_rect();
@@ -6500,6 +6605,13 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                             .map(|m| (m.col, m.len));
                         paint_match_shades(&painter, cell_rect, &x_of, &matches, current);
                         painter.galley(origin, galley.clone(), text_color);
+                        paint_line_ending(
+                            &painter,
+                            egui::pos2(x_of(len), origin.y),
+                            line_ending_for_row(doc, logical),
+                            &font_id,
+                            ui,
+                        );
                         return;
                     }
 
@@ -6558,6 +6670,18 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                     }
                     // 2) 글자.
                     painter.galley(origin, galley.clone(), text_color);
+                    // 2.5) 줄 끝 개행 기호. **글자 galley 바깥에 따로 그린다** —
+                    // 기호를 galley에 넣으면 그 galley가 곧 char↔x 매핑의 진실
+                    // (`x_of`/`cursor_from_pos`)이므로 캐럿이 없는 글자 위에
+                    // 서거나 줄 끝 클릭이 기호 안쪽으로 빨려 들어간다. 그리는
+                    // 것과 좌표 계산을 분리해 두는 것이 핵심이다.
+                    paint_line_ending(
+                        &painter,
+                        egui::pos2(x_of(len), origin.y),
+                        line_ending_for_row(doc, logical),
+                        &font_id,
+                        ui,
+                    );
                     // 3) 캐럿(그 줄일 때만).
                     if caret.line == logical {
                         let x = x_of(caret.col);
@@ -13548,5 +13672,149 @@ mod tests {
             );
         }
         assert!(crate::find::unescape("").is_empty(), "빈 입력만 빈 결과");
+    }
+
+    // ---- 줄 끝 개행 기호 표시 ----
+
+    /// 폰트에 제어문자 기호가 있으면 그것을 쓴다. **CRLF는 두 글자**.
+    #[test]
+    fn ending_glyphs_uses_control_pictures_when_available() {
+        let all = |_c: char| true;
+        assert_eq!(ending_glyphs(parse::LineEnding::Lf, all).chars().count(), 1);
+        assert_eq!(ending_glyphs(parse::LineEnding::Cr, all).chars().count(), 1);
+        assert_eq!(
+            ending_glyphs(parse::LineEnding::CrLf, all).chars().count(),
+            2,
+            "CR과 LF를 둘 다 보여 준다"
+        );
+        assert_eq!(ending_glyphs(parse::LineEnding::None, all), "");
+    }
+
+    /// 폰트에 없으면 두부(□) 대신 이스케이프 표기로 떨어진다.
+    #[test]
+    fn ending_glyphs_falls_back_when_font_lacks_glyph() {
+        let none = |_c: char| false;
+        assert_eq!(ending_glyphs(parse::LineEnding::Lf, none), "\\n");
+        assert_eq!(ending_glyphs(parse::LineEnding::Cr, none), "\\r");
+        assert_eq!(ending_glyphs(parse::LineEnding::CrLf, none), "\\r\\n");
+        assert_eq!(ending_glyphs(parse::LineEnding::None, none), "");
+    }
+
+    /// 한 글자만 없어도 **둘 다** 폴백해야 한다 — 안 그러면 CRLF가
+    /// "␍\n"처럼 표기가 섞인 꼴로 나온다.
+    #[test]
+    fn ending_glyphs_does_not_mix_notations() {
+        // LF 기호(U+240A)만 없는 폰트를 흉내낸다.
+        let only_cr = |c: char| c != '\u{240A}';
+        let s = ending_glyphs(parse::LineEnding::CrLf, only_cr);
+        assert_eq!(s, "\\r\\n", "섞지 않고 통째로 폴백한다");
+        assert!(!s.contains('\u{240D}'), "기호와 이스케이프가 섞이면 안 된다");
+    }
+
+    /// 뷰 모드는 mmap 바이트를 직접 보므로 **줄마다** 진짜 개행을 읽어낸다.
+    /// 섞인 파일도 있는 그대로 나온다.
+    #[test]
+    fn view_mode_reports_real_per_line_endings() {
+        // 1행 CRLF, 2행 LF, 3행 종결 개행 없음.
+        let p = temp_ext(b"aaa\r\nbbb\nccc", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        view_doc(doc);
+
+        assert_eq!(line_ending_for_row(doc, 0), parse::LineEnding::CrLf);
+        assert_eq!(line_ending_for_row(doc, 1), parse::LineEnding::Lf);
+        assert_eq!(
+            line_ending_for_row(doc, 2),
+            parse::LineEnding::None,
+            "종결 개행이 없는 마지막 줄에는 없는 개행을 그리지 않는다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 뷰 모드에서 마지막 줄에 종결 개행이 **있으면** 표시한다.
+    #[test]
+    fn view_mode_shows_ending_on_terminated_last_line() {
+        let p = temp_ext(b"only\r\n", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        view_doc(doc);
+        assert_eq!(line_ending_for_row(doc, 0), parse::LineEnding::CrLf);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 편집 모드는 파일 전체 스타일로 그린다 — 편집 버퍼가 줄별 개행을
+    /// 보관하지 않기 때문(불변식: lines[i]에 개행 없음).
+    #[test]
+    fn edit_mode_uses_file_wide_newline_style() {
+        let p = temp_ext(b"aaa\r\nbbb\r\nccc\r\n", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        let doc = app.doc_mut().unwrap();
+        assert!(doc.edit.is_some(), "전제: 작은 파일이라 편집 모드");
+        assert_eq!(
+            doc.edit.as_ref().unwrap().newline,
+            crate::edit::Newline::CrLf
+        );
+        assert_eq!(line_ending_for_row(doc, 0), parse::LineEnding::CrLf);
+        assert_eq!(line_ending_for_row(doc, 1), parse::LineEnding::CrLf);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 편집 모드에서 LF 파일은 LF로.
+    #[test]
+    fn edit_mode_lf_file_shows_lf() {
+        let p = temp_ext(b"aaa\nbbb\n", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        let doc = app.doc().unwrap();
+        assert_eq!(line_ending_for_row(doc, 0), parse::LineEnding::Lf);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 편집 모드의 **마지막 줄**에는 기호를 붙이지 않는다. 편집 버퍼는 종결
+    /// 개행이 있었는지 모르므로, 붙이면 절반은 거짓말이 된다.
+    #[test]
+    fn edit_mode_last_line_has_no_marker() {
+        let p = temp_ext(b"aaa\nbbb\n", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        let doc = app.doc().unwrap();
+        let n = doc.edit.as_ref().unwrap().lines.len();
+        assert_eq!(
+            line_ending_for_row(doc, n - 1),
+            parse::LineEnding::None,
+            "마지막 줄에는 없는 개행을 그리지 않는다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 새 파일(빈 한 줄)에는 그릴 개행이 없다.
+    #[test]
+    fn new_document_has_no_line_ending_marker() {
+        let doc = new_document();
+        assert_eq!(line_ending_for_row(&doc, 0), parse::LineEnding::None);
+    }
+
+    /// 줄을 추가하면 앞줄에는 기호가 생기고 새 마지막 줄에는 없다 —
+    /// "마지막 줄만 예외"가 편집 중에도 유지되는지.
+    #[test]
+    fn marker_follows_last_line_as_document_grows() {
+        let mut doc = new_document();
+        doc.edit.as_mut().unwrap().lines = v(&["first", "second"]);
+        assert_ne!(
+            line_ending_for_row(&doc, 0),
+            parse::LineEnding::None,
+            "첫 줄은 다음 줄이 있으므로 개행으로 끝난다"
+        );
+        assert_eq!(line_ending_for_row(&doc, 1), parse::LineEnding::None);
     }
 }

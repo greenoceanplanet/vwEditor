@@ -46,6 +46,60 @@ pub fn decode_line(bytes: &[u8], enc: Encoding) -> String {
     cow.into_owned()
 }
 
+/// 한 줄이 어떤 개행으로 끝나는가. 화면에 기호로 표시하기 위한 값이라
+/// **줄마다 따로** 판정한다(파일 전체의 `edit::Newline`과 다른 층위다 —
+/// 그쪽은 "저장할 때 무엇으로 쓸까"이고, 이쪽은 "이 줄이 무엇으로 끝났나"다).
+///
+/// `Cr`이 따로 있는 이유: 옛 Mac 파일이나 깨진 파일에는 `\r`만으로 끝나는 줄이
+/// 있다. 인덱서는 `\n`으로만 줄을 나누므로 그런 파일은 한 줄로 보이지만,
+/// 줄 안에 낀 `\r`은 그대로 남아 화면에 보이지 않는 채 데이터에 섞인다.
+/// 표시할 수 있으면 표시하는 쪽이 에디터의 일이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEnding {
+    /// 개행 없음(파일 마지막 줄에 종결 개행이 없는 경우).
+    None,
+    Lf,
+    CrLf,
+    /// `\r` 하나로 끝남(옛 Mac / 깨진 파일).
+    Cr,
+}
+
+impl LineEnding {
+    /// 화면에 그릴 기호. **CRLF는 두 글자**(`\r`과 `\n`을 각각 보여 준다) —
+    /// 사용자가 보고 싶은 것은 "개행이 있다"가 아니라 "무엇으로 끝났나"이고,
+    /// CR과 LF가 둘 다 있다는 사실이 곧 그 답이기 때문이다.
+    ///
+    /// 기호 선택: `␍`(U+240D) / `␊`(U+240A)은 유니코드가 CR/LF 표시용으로
+    /// 배정한 문자라 의미가 정확하다. 다만 폰트에 없으면 두부(□)가 되므로
+    /// 폴백은 `theme`가 아니라 호출부에서 판단한다(`ending_glyphs` 참조).
+    pub fn symbol(self) -> &'static str {
+        match self {
+            LineEnding::None => "",
+            LineEnding::Lf => "␊",
+            LineEnding::CrLf => "␍␊",
+            LineEnding::Cr => "␍",
+        }
+    }
+}
+
+/// 줄 **바이트**(개행 포함)의 꼬리를 보고 개행 종류를 판정하고, 개행을 뗀
+/// 본문 바이트와 함께 돌려준다.
+///
+/// mmap 뷰 경로 전용이다 — 편집 버퍼는 이미 개행이 벗겨져 있어(불변식)
+/// 여기에 줄 것이 없다. 그래서 뷰 모드는 줄마다 **진짜** 개행을 보여줄 수
+/// 있고, 편집 모드는 파일 전체 스타일로 근사한다(`app::line_ending_for_row`).
+pub fn split_line_ending(bytes: &[u8]) -> (&[u8], LineEnding) {
+    if let Some(rest) = bytes.strip_suffix(b"\r\n") {
+        (rest, LineEnding::CrLf)
+    } else if let Some(rest) = bytes.strip_suffix(b"\n") {
+        (rest, LineEnding::Lf)
+    } else if let Some(rest) = bytes.strip_suffix(b"\r") {
+        (rest, LineEnding::Cr)
+    } else {
+        (bytes, LineEnding::None)
+    }
+}
+
 /// 화면을 어떻게 나눌지 결정하는 구분 모드.
 /// - `None`: 구분하지 않고 한 줄 전체를 텍스트로 표시(일반 텍스트/JSON/로그).
 /// - `Char(b)`: 바이트 `b`(콤마/탭/파이프/세미콜론/커스텀 한 글자)로 필드 분리.
@@ -688,5 +742,52 @@ mod tests {
     fn join_tab_delim() {
         let f = vec!["x".to_string(), "y".to_string()];
         assert_eq!(join_fields(&f, b'\t'), "x\ty");
+    }
+
+    // ---- 줄 끝 개행 판정 ----
+
+    #[test]
+    fn split_line_ending_recognizes_each_kind() {
+        assert_eq!(split_line_ending(b"abc\r\n"), (&b"abc"[..], LineEnding::CrLf));
+        assert_eq!(split_line_ending(b"abc\n"), (&b"abc"[..], LineEnding::Lf));
+        assert_eq!(split_line_ending(b"abc\r"), (&b"abc"[..], LineEnding::Cr));
+        assert_eq!(split_line_ending(b"abc"), (&b"abc"[..], LineEnding::None));
+    }
+
+    /// CRLF를 LF로 오판하면 본문 끝에 `\r`이 남아 화면에 보이지 않는 글자가
+    /// 생긴다. 순서(CRLF를 LF보다 **먼저** 본다)가 곧 정확성이다.
+    #[test]
+    fn split_line_ending_checks_crlf_before_lf() {
+        let (body, e) = split_line_ending(b"a\r\n");
+        assert_eq!(e, LineEnding::CrLf);
+        assert!(!body.ends_with(b"\r"), "본문에 CR이 남으면 안 된다");
+    }
+
+    /// 빈 줄도 개행만으로 끝날 수 있다.
+    #[test]
+    fn split_line_ending_handles_empty_body() {
+        assert_eq!(split_line_ending(b"\n"), (&b""[..], LineEnding::Lf));
+        assert_eq!(split_line_ending(b"\r\n"), (&b""[..], LineEnding::CrLf));
+        assert_eq!(split_line_ending(b""), (&b""[..], LineEnding::None));
+    }
+
+    /// **CRLF는 기호 두 개**(사용자 요청). 하나로 합치면 CR과 LF가 둘 다
+    /// 있다는 사실이 화면에서 사라진다.
+    #[test]
+    fn crlf_symbol_shows_both_characters() {
+        assert_eq!(LineEnding::CrLf.symbol().chars().count(), 2, "두 글자다");
+        assert_eq!(LineEnding::Lf.symbol().chars().count(), 1);
+        assert_eq!(LineEnding::Cr.symbol().chars().count(), 1);
+        assert_eq!(LineEnding::None.symbol(), "", "개행이 없으면 그릴 것도 없다");
+    }
+
+    /// CRLF 기호는 CR 기호와 LF 기호를 **이어붙인 것**이어야 한다 — 셋이
+    /// 따로 놀면 같은 개행을 두 모드에서 다르게 그리게 된다.
+    #[test]
+    fn crlf_symbol_is_cr_then_lf() {
+        assert_eq!(
+            LineEnding::CrLf.symbol(),
+            format!("{}{}", LineEnding::Cr.symbol(), LineEnding::Lf.symbol())
+        );
     }
 }
