@@ -406,9 +406,10 @@ impl App {
             .map_or(false, |e| e.dirty)
     }
 
-    /// 어느 탭이든 저장하지 않은 편집이 있는지. 창 닫기 확인에 쓴다.
+    /// 어느 탭이든 저장하지 않은 편집이 있는지(텍스트/헥스 모두). 창 닫기
+    /// 확인에 쓴다.
     pub fn any_dirty(&self) -> bool {
-        self.docs.iter().any(|d| d.edit.as_ref().map_or(false, |e| e.dirty))
+        self.docs.iter().any(doc_dirty)
     }
 
     /// 저장 다이얼로그를 열 때 인코딩/BOM 기본값을 현재 문서 기준으로 맞춘다.
@@ -1311,8 +1312,9 @@ impl eframe::App for App {
                         }
                         ui.close_menu();
                     }
-                    // 저장 항목은 편집 모드일 때만 의미가 있다(뷰 모드는 버퍼가 없다).
-                    let editing = self.doc().map_or(false, |d| d.edit.is_some());
+                    // 저장 항목은 편집 버퍼(텍스트 또는 헥스)가 있을 때만
+                    // 의미가 있다(뷰 모드는 저장할 버퍼가 없다).
+                    let editing = self.doc().map_or(false, doc_savable);
                     ui.add_enabled_ui(editing, |ui| {
                         if ui.button("Save").clicked() {
                             self.show_save_dialog = true;
@@ -1861,9 +1863,9 @@ impl eframe::App for App {
             self.open_new_tab();
         }
 
-        // Ctrl+S — 편집 모드에서 저장 다이얼로그 열기. 다른 다이얼로그가 떠
-        // 있으면 무시한다(중복 열기 방지).
-        if self.doc().map_or(false, |d| d.edit.is_some())
+        // Ctrl+S — 편집 모드(텍스트 또는 헥스)에서 저장 다이얼로그 열기.
+        // 다른 다이얼로그가 떠 있으면 무시한다(중복 열기 방지).
+        if self.doc().map_or(false, doc_savable)
             && !self.show_save_dialog
             && self.pending_action.is_none()
             && ctx.input_mut(|i| {
@@ -2015,13 +2017,10 @@ impl eframe::App for App {
                 }
                 self.active = i;
             }
-            // 탭 닫기: dirty 편집 버퍼가 있으면 확인 창을 띄우고, 아니면 즉시 닫는다.
+            // 탭 닫기: dirty 편집 버퍼(텍스트/헥스)가 있으면 확인 창을 띄우고,
+            // 아니면 즉시 닫는다.
             if let Some(i) = want_close {
-                let dirty = self
-                    .docs
-                    .get(i)
-                    .and_then(|d| d.edit.as_ref())
-                    .map_or(false, |e| e.dirty);
+                let dirty = self.docs.get(i).is_some_and(doc_dirty);
                 if dirty {
                     self.pending_action = Some(PendingAction::CloseTab(i));
                 } else {
@@ -2052,7 +2051,7 @@ pub(crate) fn tab_label(doc: &Document) -> String {
                 doc.path_label.clone()
             }
         });
-    let dirty = doc.edit.as_ref().map_or(false, |e| e.dirty);
+    let dirty = doc_dirty(doc);
     const CAP: usize = 24;
     let prefix_len = if dirty { 2 } else { 0 }; // "● "는 2글자(● + 공백).
     let budget = CAP - prefix_len;
@@ -4520,6 +4519,14 @@ fn mark_saved(doc: &mut Document, nl: crate::edit::Newline) {
     }
 }
 
+/// 헥스 저장 성공 반영. 텍스트의 `mark_saved`와 대칭(개행 되쓰기가 없을 뿐 —
+/// 헥스는 바이트가 곧 전부라 인코딩/개행 개념이 없다).
+fn mark_hex_saved(doc: &mut Document) {
+    if let Some(e) = doc.hex.as_mut().and_then(|h| h.edit.as_mut()) {
+        e.dirty = false;
+    }
+}
+
 /// 다이얼로그에서 고른 개행 스타일을 편집 버퍼에 **되쓴다**.
 ///
 /// 되쓰지 않으면 저장은 LF로 나가는데 화면 기호는 계속 `␍␊`를 그린다 —
@@ -4538,11 +4545,13 @@ fn apply_save_newline(doc: &mut Document, nl: crate::edit::Newline) {
 /// 저장 다이얼로그. 인코딩/BOM/개행을 고르고 저장하거나 취소한다.
 /// `app.save_as`가 참이면 rfd 파일 선택 창으로 경로를 새로 고른다.
 fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
-    // 편집 버퍼가 없으면(편집 모드 이탈 등) 다이얼로그를 닫는다.
-    if app.doc().map_or(true, |d| d.edit.is_none()) {
+    // 저장할 편집 버퍼(텍스트/헥스)가 없으면(편집 모드 이탈 등) 다이얼로그를
+    // 닫는다.
+    if app.doc().map_or(true, |d| !doc_savable(d)) {
         app.show_save_dialog = false;
         return;
     }
+    let is_hex = app.doc().is_some_and(|d| d.hex.is_some());
     let title = if app.save_as { "Save As" } else { "Save" };
     let cur_label = app
         .doc()
@@ -4565,49 +4574,57 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
             }
             ui.separator();
 
-            let enc_label = match app.save_enc {
-                Encoding::Utf8 => "UTF-8",
-                Encoding::Cp949 => "CP949",
-                Encoding::Utf16Le => "UTF-16LE",
-                Encoding::Utf16Be => "UTF-16BE",
-            };
-            egui::ComboBox::from_label(crate::theme::chrome_text("Encoding"))
-                .selected_text(enc_label)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut app.save_enc, Encoding::Utf8, "UTF-8");
-                    ui.selectable_value(&mut app.save_enc, Encoding::Cp949, "CP949");
-                    ui.selectable_value(&mut app.save_enc, Encoding::Utf16Le, "UTF-16LE");
-                    ui.selectable_value(&mut app.save_enc, Encoding::Utf16Be, "UTF-16BE");
-                });
+            if is_hex {
+                // 헥스는 바이트가 곧 전부다 — 인코딩/BOM/개행 개념이 없으므로
+                // 그 위젯들을 건너뛰고 이 사실만 한 줄로 알린다.
+                ui.label(crate::theme::chrome_text(
+                    "Binary file — bytes are saved as-is.",
+                ));
+            } else {
+                let enc_label = match app.save_enc {
+                    Encoding::Utf8 => "UTF-8",
+                    Encoding::Cp949 => "CP949",
+                    Encoding::Utf16Le => "UTF-16LE",
+                    Encoding::Utf16Be => "UTF-16BE",
+                };
+                egui::ComboBox::from_label(crate::theme::chrome_text("Encoding"))
+                    .selected_text(enc_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut app.save_enc, Encoding::Utf8, "UTF-8");
+                        ui.selectable_value(&mut app.save_enc, Encoding::Cp949, "CP949");
+                        ui.selectable_value(&mut app.save_enc, Encoding::Utf16Le, "UTF-16LE");
+                        ui.selectable_value(&mut app.save_enc, Encoding::Utf16Be, "UTF-16BE");
+                    });
 
-            // CP949는 BOM 개념이 없으므로 체크박스를 비활성 + 강제 해제.
-            let bom_allowed = app.save_enc != Encoding::Cp949;
-            if !bom_allowed {
-                app.save_bom = false;
-            }
-            ui.add_enabled_ui(bom_allowed, |ui| {
-                ui.checkbox(&mut app.save_bom, "Include BOM");
-            });
-            if !bom_allowed {
-                ui.label(crate::theme::chrome_text("(CP949 has no BOM)"));
-            }
-
-            // 개행 스타일. 파일 전체에 하나로 적용된다(줄마다 다르게 저장하는
-            // 기능은 없다 — 편집 버퍼가 줄별 개행을 보관하지 않는다).
-            egui::ComboBox::from_label(crate::theme::chrome_text("Line ending"))
-                .selected_text(newline_label(app.save_newline))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut app.save_newline,
-                        crate::edit::Newline::CrLf,
-                        newline_label(crate::edit::Newline::CrLf),
-                    );
-                    ui.selectable_value(
-                        &mut app.save_newline,
-                        crate::edit::Newline::Lf,
-                        newline_label(crate::edit::Newline::Lf),
-                    );
+                // CP949는 BOM 개념이 없으므로 체크박스를 비활성 + 강제 해제.
+                let bom_allowed = app.save_enc != Encoding::Cp949;
+                if !bom_allowed {
+                    app.save_bom = false;
+                }
+                ui.add_enabled_ui(bom_allowed, |ui| {
+                    ui.checkbox(&mut app.save_bom, "Include BOM");
                 });
+                if !bom_allowed {
+                    ui.label(crate::theme::chrome_text("(CP949 has no BOM)"));
+                }
+
+                // 개행 스타일. 파일 전체에 하나로 적용된다(줄마다 다르게 저장하는
+                // 기능은 없다 — 편집 버퍼가 줄별 개행을 보관하지 않는다).
+                egui::ComboBox::from_label(crate::theme::chrome_text("Line ending"))
+                    .selected_text(newline_label(app.save_newline))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut app.save_newline,
+                            crate::edit::Newline::CrLf,
+                            newline_label(crate::edit::Newline::CrLf),
+                        );
+                        ui.selectable_value(
+                            &mut app.save_newline,
+                            crate::edit::Newline::Lf,
+                            newline_label(crate::edit::Newline::Lf),
+                        );
+                    });
+            }
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -4641,10 +4658,15 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
         if let Some(name) = cur_path.file_name().and_then(|n| n.to_str()) {
             dlg = dlg.set_file_name(name);
         }
-        // 확장자 목록. 첫 항목이 다이얼로그의 기본 선택이므로 **지금 문서에
-        // 어울리는 것**을 앞에 둔다(`save_filters` 참조).
-        for (name, exts) in save_filters(&cur_path, app.doc().map(|d| d.sep)) {
-            dlg = dlg.add_filter(name, &exts);
+        if is_hex {
+            // 헥스는 형식 개념이 없다 — "All files"만 제시한다.
+            dlg = dlg.add_filter("All files", &["*"]);
+        } else {
+            // 확장자 목록. 첫 항목이 다이얼로그의 기본 선택이므로 **지금
+            // 문서에 어울리는 것**을 앞에 둔다(`save_filters` 참조).
+            for (name, exts) in save_filters(&cur_path, app.doc().map(|d| d.sep)) {
+                dlg = dlg.add_filter(name, &exts);
+            }
         }
         match dlg.save_file() {
             Some(p) => p,
@@ -4654,6 +4676,56 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
     } else {
         cur_path
     };
+
+    if is_hex {
+        let bytes = {
+            let Some(bytes) = app
+                .doc()
+                .and_then(|d| d.hex.as_ref())
+                .and_then(|h| h.edit.as_ref())
+                .map(|e| e.bytes.clone())
+            else {
+                return;
+            };
+            bytes
+        };
+        match crate::save::write_binary(&target, &bytes) {
+            Ok(()) => {
+                app.error = None;
+                if let Some(doc) = app.doc_mut() {
+                    // 텍스트의 mark_saved와 대칭 — dirty 해제.
+                    mark_hex_saved(doc);
+                    // 텍스트 저장과 같은 판정으로 경로를 갱신한다
+                    // (`save_as_fallback` 참조 — ①폴백 여부와 ②경로 갱신
+                    // 여부가 어긋나면 다음 저장마다 또 파일 선택 창이 뜬다).
+                    if path_will_update {
+                        doc.path_label = target.display().to_string();
+                        doc.path = target.clone();
+                    }
+                    // write_binary의 rename으로 옛 mmap이 낡았다. 텍스트 저장과
+                    // 같은 이유로 방금 쓴 파일에 다시 겨눠야 하지만,
+                    // `repoint_source_after_save`는 줄 인덱서를 새로 띄운다 —
+                    // 헥스 문서는 `indexer: None`이 불변식이므로(줄 개념이
+                    // 없다) 그 함수를 그대로 쓰면 깨진다. mmap만 다시 연다.
+                    match source::open(&target) {
+                        Ok(src) => {
+                            doc.source = Arc::new(src);
+                            doc.index = LineIndex::new(doc.source.len());
+                        }
+                        Err(e) => {
+                            app.error =
+                                Some(format!("Failed to reopen file after saving: {e}"));
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                // 실패하면 버퍼는 dirty인 채로 둔다(사용자가 다시 시도할 수 있게).
+                app.error = Some(format!("Save failed: {err}"));
+            }
+        }
+        return;
+    }
 
     let opts = save_options(app);
     let result = {
@@ -4794,10 +4866,14 @@ fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
         }
         Some(PendingAction::CloseApp) => {
             // 확인됐으니 실제로 닫는다. 이번엔 close_requested 훅이 dirty를
-            // 다시 보지 않도록 모든 탭의 dirty를 내려 둔다(이미 폐기 동의) —
-            // 활성 탭만 내리면 두 번째 X에서 다른 탭의 dirty가 다시 잡힌다.
+            // 다시 보지 않도록 모든 탭의 dirty(텍스트+헥스)를 내려 둔다(이미
+            // 폐기 동의) — 활성 탭만 내리면 두 번째 X에서 다른 탭의 dirty가
+            // 다시 잡힌다.
             for d in &mut app.docs {
                 if let Some(e) = &mut d.edit {
+                    e.dirty = false;
+                }
+                if let Some(e) = d.hex.as_mut().and_then(|h| h.edit.as_mut()) {
                     e.dirty = false;
                 }
             }
@@ -7818,6 +7894,24 @@ fn hex_visible_row_count(avail_height: f32) -> usize {
 /// 덕에 저절로 갈리지만, 그 성질을 함수로 뽑아 테스트로 박아 둔다.
 fn can_undo_text(d: &Document) -> bool {
     d.edit.is_some() && d.editing_cell.is_none()
+}
+
+/// 저장할 편집 내용이 있는가 — 텍스트 편집 버퍼 또는 헥스 편집 버퍼.
+fn doc_savable(doc: &Document) -> bool {
+    doc.edit.is_some() || doc.hex.as_ref().is_some_and(|h| h.edit.is_some())
+}
+
+/// 저장하지 않은 변경이 있는가 — 텍스트/헥스 어느 쪽 편집 버퍼든 dirty면 참.
+/// 닫기 확인(탭 닫기·앱 종료)과 탭 라벨의 ●/* 표시가 함께 이 함수를 본다 —
+/// 텍스트만 보던 시절엔 헥스를 수정하고 저장하지 않은 채 탭/앱을 닫아도
+/// 확인 없이 사라졌다(Task 6 리뷰에서 지적된 계획된 범위).
+fn doc_dirty(doc: &Document) -> bool {
+    doc.edit.as_ref().is_some_and(|e| e.dirty)
+        || doc
+            .hex
+            .as_ref()
+            .and_then(|h| h.edit.as_ref())
+            .is_some_and(|e| e.dirty)
 }
 
 /// 헥스 본문의 키 입력 한 건. 클릭(`HexClick`)과 같은 이유로 인텐트로
@@ -16273,6 +16367,68 @@ mod tests {
             "고른 개행이 문서에 반영된다"
         );
         assert!(!doc.edit.as_ref().unwrap().dirty, "저장했으므로 깨끗해진다");
+    }
+
+    /// `doc_savable`은 텍스트 편집 버퍼 또는 헥스 편집 버퍼 중 하나만 있어도
+    /// 참이어야 한다 — 뷰 상태(버퍼 없음)는 저장할 것이 없다.
+    #[test]
+    fn doc_savable_covers_hex_edit() {
+        let mut app = hex_test_doc(&[1, 2]);
+        assert!(!doc_savable(app.doc().unwrap()), "뷰 상태는 저장할 것이 없다");
+        let doc = app.doc_mut().unwrap();
+        doc.hex.as_mut().unwrap().edit = Some(crate::hex::HexEditBuffer::new(vec![1, 2]));
+        assert!(doc_savable(doc));
+    }
+
+    /// 헥스 저장: write_binary로 버퍼가 통째로 나가고 dirty가 꺼진다.
+    #[test]
+    fn hex_save_writes_buffer_and_clears_dirty() {
+        let p = temp_ext(b"\x00\x01", "bin");
+        let mut app = App::default();
+        app.open_path_hex(&p);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0xF)); // 승격+수정
+        // 저장 실행부가 부르는 것과 같은 조합:
+        let bytes = doc.hex.as_ref().unwrap().edit.as_ref().unwrap().bytes.clone();
+        crate::save::write_binary(&doc.path, &bytes).unwrap();
+        mark_hex_saved(doc);
+        assert!(!doc.hex.as_ref().unwrap().edit.as_ref().unwrap().dirty);
+        assert_eq!(std::fs::read(&p).unwrap(), vec![0xF0, 0x01]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 저장 다이얼로그는 헥스 문서에서 닫히지 않고(편집 버퍼가 있으면),
+    /// 인코딩/개행 콤보 없이 뜬다 — 상태 전이만 검사.
+    #[test]
+    fn save_dialog_stays_open_for_hex_edit() {
+        let mut app = hex_test_doc(&[1]);
+        app.doc_mut().unwrap().hex.as_mut().unwrap().edit =
+            Some(crate::hex::HexEditBuffer::new(vec![1]));
+        app.show_save_dialog = true;
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            render_save_dialog(ctx, &mut app);
+        });
+        assert!(app.show_save_dialog, "헥스 편집 중엔 다이얼로그가 유지된다");
+    }
+
+    /// `doc_dirty`는 텍스트/헥스 어느 쪽 편집 버퍼가 dirty여도 참이어야 한다 —
+    /// 닫기 확인이 두 종류의 dirty를 모두 봐야 하므로(Task 6 리뷰 지적 사항).
+    #[test]
+    fn doc_dirty_covers_both_text_and_hex() {
+        let mut app = hex_test_doc(&[1, 2]);
+        let doc = app.doc_mut().unwrap();
+        assert!(!doc_dirty(doc), "뷰 상태는 dirty가 아니다");
+        doc.hex.as_mut().unwrap().edit = Some(crate::hex::HexEditBuffer::new(vec![1, 2]));
+        assert!(!doc_dirty(doc), "막 승격한 버퍼는 깨끗하다");
+        doc.hex.as_mut().unwrap().edit.as_mut().unwrap().dirty = true;
+        assert!(doc_dirty(doc), "헥스 dirty도 doc_dirty가 잡아야 한다");
+
+        let mut text_doc = new_document();
+        assert!(!doc_dirty(&text_doc));
+        text_doc.edit.as_mut().unwrap().dirty = true;
+        assert!(doc_dirty(&text_doc), "텍스트 dirty도 그대로 잡힌다");
     }
 
     /// IME는 **편집 모드에서만** 캐럿을 따라간다. 뷰 모드에서 켜면 입력할 수

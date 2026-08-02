@@ -101,7 +101,6 @@ pub fn write_file(
 
 /// bytes를 임시 파일에 쓰고 path로 원자적 rename. `write_file`과 같은
 /// 패턴이되 인코딩/개행 개념이 없다(바이너리는 바이트가 곧 전부다).
-#[allow(dead_code)] // Task 7이 소비하면 제거
 pub fn write_binary(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = {
         let mut t = path.to_path_buf();
