@@ -65,18 +65,24 @@ pub enum LineEnding {
 }
 
 impl LineEnding {
-    /// 화면에 그릴 기호. **CRLF는 두 글자**(`\r`과 `\n`을 각각 보여 준다) —
-    /// 사용자가 보고 싶은 것은 "개행이 있다"가 아니라 "무엇으로 끝났나"이고,
-    /// CR과 LF가 둘 다 있다는 사실이 곧 그 답이기 때문이다.
+    /// 화면에 그릴 기호. **개행 하나에 화살표 하나**(`↵`, U+21B5).
     ///
-    /// 기호 선택: `␍`(U+240D) / `␊`(U+240A)은 유니코드가 CR/LF 표시용으로
-    /// 배정한 문자라 의미가 정확하다. 다만 폰트에 없으면 두부(□)가 되므로
-    /// 폴백은 `theme`가 아니라 호출부에서 판단한다(`ending_glyphs` 참조).
+    /// 에디터의 관행을 따른다 — VS Code·Sublime·EmEditor 모두 줄 끝을 꺾인
+    /// 화살표 하나로 표시한다. 개행이 CRLF인지 LF인지는 **어느 줄에나 같은**
+    /// 파일 단위 성질이라, 줄마다 기호 개수로 알릴 정보가 아니다. 그 답은
+    /// 저장 다이얼로그의 `Line ending` 콤보가 이름으로 말해 준다.
+    ///
+    /// `Cr`만은 여전히 구분해서 보여 준다(`↵` 대신 `␍`). 이건 파일 전체의
+    /// 스타일이 아니라 **그 줄만 이상하다**는 신호이기 때문이다 — 인덱서는
+    /// `\n`으로만 줄을 나누므로 `\r`로 끝나는 줄은 화면에 안 보이는 채
+    /// 데이터에 남는다. 같은 화살표로 그리면 그 이상을 숨기게 된다.
+    ///
+    /// 폰트에 없으면 두부(□)가 되므로 폴백은 호출부가 판단한다
+    /// (`app::ending_glyphs`).
     pub fn symbol(self) -> &'static str {
         match self {
             LineEnding::None => "",
-            LineEnding::Lf => "␊",
-            LineEnding::CrLf => "␍␊",
+            LineEnding::Lf | LineEnding::CrLf => "↵",
             LineEnding::Cr => "␍",
         }
     }
@@ -771,23 +777,38 @@ mod tests {
         assert_eq!(split_line_ending(b""), (&b""[..], LineEnding::None));
     }
 
-    /// **CRLF는 기호 두 개**(사용자 요청). 하나로 합치면 CR과 LF가 둘 다
-    /// 있다는 사실이 화면에서 사라진다.
+    /// **개행 하나에 기호 하나**. 에디터 관행(VS Code·Sublime·EmEditor)이고,
+    /// 두 글자로 늘리면 줄 끝이 눈에 시끄럽다.
     #[test]
-    fn crlf_symbol_shows_both_characters() {
-        assert_eq!(LineEnding::CrLf.symbol().chars().count(), 2, "두 글자다");
-        assert_eq!(LineEnding::Lf.symbol().chars().count(), 1);
-        assert_eq!(LineEnding::Cr.symbol().chars().count(), 1);
+    fn every_ending_draws_a_single_glyph() {
+        for e in [LineEnding::Lf, LineEnding::CrLf, LineEnding::Cr] {
+            assert_eq!(
+                e.symbol().chars().count(),
+                1,
+                "{e:?}는 한 글자여야 한다: {:?}",
+                e.symbol()
+            );
+        }
         assert_eq!(LineEnding::None.symbol(), "", "개행이 없으면 그릴 것도 없다");
     }
 
-    /// CRLF 기호는 CR 기호와 LF 기호를 **이어붙인 것**이어야 한다 — 셋이
-    /// 따로 놀면 같은 개행을 두 모드에서 다르게 그리게 된다.
+    /// LF와 CRLF는 **같은 화살표**로 그린다. 둘의 차이는 어느 줄에나 같은
+    /// 파일 단위 성질이라 줄마다 알릴 정보가 아니다(저장 다이얼로그가 말한다).
     #[test]
-    fn crlf_symbol_is_cr_then_lf() {
-        assert_eq!(
-            LineEnding::CrLf.symbol(),
-            format!("{}{}", LineEnding::Cr.symbol(), LineEnding::Lf.symbol())
+    fn lf_and_crlf_share_one_arrow() {
+        assert_eq!(LineEnding::Lf.symbol(), LineEnding::CrLf.symbol());
+        assert_eq!(LineEnding::Lf.symbol(), "\u{21B5}", "꺾인 화살표");
+    }
+
+    /// `Cr`만은 화살표와 **다르게** 그린다. 파일 전체의 스타일이 아니라
+    /// "이 줄만 이상하다"는 신호이므로, 정상 개행과 같은 모양이면 그 이상이
+    /// 화면에서 사라진다.
+    #[test]
+    fn lone_cr_is_visually_distinct() {
+        assert_ne!(
+            LineEnding::Cr.symbol(),
+            LineEnding::Lf.symbol(),
+            "CR만으로 끝난 줄은 정상 개행과 구분돼야 한다"
         );
     }
 }

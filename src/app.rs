@@ -89,6 +89,10 @@ pub struct Document {
     /// 필요하다 — egui의 primary_down은 전역 상태라 누름이 어디서 시작됐는지
     /// 알 수 없고, is_pointer_button_down_on()은 우클릭에도 참이다.
     pub text_drag_active: bool,
+    /// IME 조합 중인 글자(ㅎ → 하 → 한). **버퍼가 아니라 화면 전용**이라
+    /// 되돌리기·dirty·저장 어디에도 들어가지 않는다. 확정되면 비워지고 그
+    /// 글자는 `Insert`로 버퍼에 들어간다(`collect_text_intents` 참조).
+    pub ime_preview: String,
     /// 행 수가 너무 많아 사용자 확인을 기다리는 컬럼 연산.
     /// Some이면 확인 다이얼로그를 띄우고, "계속"이면 그대로 실행한다.
     /// (`BIG_COLUMN_OP_ROWS` 참조.)
@@ -491,6 +495,7 @@ impl App {
             text_sel: None,
             text_caret: crate::edit::TextPos { line: 0, col: 0 },
             text_drag_active: false,
+            ime_preview: String::new(),
             pending_column_op: None,
             // 찾기 상태 초기값. `FindOptions`가 `Default`를 구현해 두어
             // (match_case: false, scope: Partial) 여기가 옵션 기본값을
@@ -687,6 +692,71 @@ fn decode_logical_line(doc: &Document, logical: usize) -> Option<String> {
     })
 }
 
+/// IME 조합 중 글자를 캐럿 자리에 그리고, 그 **폭**을 돌려준다(캐럿을 그
+/// 뒤로 밀기 위해). 조합 중이 아니면 아무것도 그리지 않고 0을 돌려준다.
+///
+/// 본문과 같은 색·폰트로 그리되 **밑줄**을 깐다. 조합 중인 글자는 아직
+/// 확정되지 않아 Escape로 사라질 수 있으므로, 확정된 글자와 구분되어야 한다
+/// (Windows·macOS IME의 공통 관행).
+///
+/// 이 글자는 `EditBuffer`에 없다 — 화면에만 있다. 그래서 본문 galley의
+/// char↔x 매핑(`x_of`)에도 영향을 주지 않고, 클릭 위치 계산이 조합 글자
+/// 때문에 어긋나는 일이 없다.
+fn paint_ime_preview(
+    painter: &egui::Painter,
+    ui: &egui::Ui,
+    at: egui::Pos2,
+    text: &str,
+    font_id: &egui::FontId,
+    color: egui::Color32,
+) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font_id.clone(), color));
+    let size = galley.size();
+    painter.galley(at, galley, color);
+    // 밑줄 — 글자 아래 1px.
+    let y = at.y + size.y - 1.0;
+    painter.line_segment(
+        [egui::pos2(at.x, y), egui::pos2(at.x + size.x, y)],
+        egui::Stroke::new(1.0, color),
+    );
+    size.x
+}
+
+/// 이번 프레임의 편집 인텐트를 뽑고, Tab 이벤트를 소비한다.
+///
+/// **순서가 곧 정확성이다.** `consume_key`는 이벤트를 큐에서 *제거*하므로:
+/// - 수집을 먼저 해야 `collect_text_intents`가 Tab을 보고 탭 문자를 만든다.
+///   (소비를 먼저 하면 탭이 안 들어간다.)
+/// - 소비를 반드시 해야 egui가 프레임 끝에서 그 Tab을 위젯 순회에 쓰지
+///   않는다. (소비를 안 하면 탭은 들어가되 포커스가 툴바로 튄다.)
+///
+/// 두 줄짜리지만 함수로 둔 이유는 이 순서가 뒤집혀도 컴파일은 되고 테스트만
+/// 조용히 통과하던 자리이기 때문이다 — 호출부(`render_text`)는 egui 클로저
+/// 안이라 테스트가 구동할 수 없다.
+fn take_text_intents(ctx: &egui::Context) -> Vec<TextEditIntent> {
+    let collected = ctx.input(collect_text_intents);
+    consume_tab_key(ctx);
+    collected
+}
+
+/// Tab 키 이벤트를 소비해 egui의 **위젯 순회**에 쓰이지 않게 한다.
+///
+/// egui는 소비되지 않은 Tab을 프레임 끝에서 포커스 이동에 쓴다. 편집 모드
+/// 본문에서는 Tab이 글자여야 하므로(TSV를 만들려면 필수), 인텐트로 바꾼 뒤
+/// 이벤트 자체를 없애 포커스가 툴바 위젯으로 튀지 않게 한다.
+///
+/// Shift+Tab은 **소비하지 않는다**. 역방향 포커스 순회는 그대로 두는 편이
+/// 접근성에 낫고, 내어쓰기 기능이 없어 탭 문자로도 쓰지 않기 때문이다
+/// (`collect_text_intents`의 Tab 분기 주석 참조).
+fn consume_tab_key(ctx: &egui::Context) {
+    ctx.input_mut(|i| {
+        i.consume_key(egui::Modifiers::NONE, egui::Key::Tab);
+    });
+}
+
 /// IME를 캐럿 자리에 붙일 것인가. **편집 모드일 때만** 참이다.
 ///
 /// 뷰 모드에서 IME를 켜면(= `output.ime`를 채우면) 입력할 수 없는 화면인데도
@@ -752,13 +822,14 @@ fn ending_glyphs(ending: parse::LineEnding, has_glyph: impl Fn(char) -> bool) ->
     if matches!(ending, parse::LineEnding::None) {
         return String::new();
     }
-    // 기호는 CR/LF 각각 한 글자씩이고 CRLF는 그 둘을 이어붙인 것이므로
-    // (`LineEnding::symbol` 참조), 한 글자라도 폰트에 없으면 둘 다 폴백해야
-    // 표기가 섞이지 않는다("␍\n" 같은 꼴을 막는다).
     let symbol = ending.symbol();
     if symbol.chars().all(&has_glyph) {
         return symbol.to_owned();
     }
+    // 폴백은 화살표가 아니라 **이스케이프 표기**다. 여기서는 CRLF와 LF를
+    // 구분해 적는다 — 화살표 하나로 합친 이유는 "줄 끝 표시가 시끄럽지 않게"
+    // 였는데, 폴백은 이미 두부(□)를 피하려고 글자로 적는 상황이라 그 이유가
+    // 성립하지 않고, 적는 김에 정확한 편이 낫다.
     match ending {
         parse::LineEnding::None => String::new(),
         parse::LineEnding::Lf => "\\n".to_owned(),
@@ -3626,6 +3697,7 @@ fn build_extracted_doc(
         text_sel: None,
         text_caret: crate::edit::TextPos { line: 0, col: 0 },
         text_drag_active: false,
+        ime_preview: String::new(),
         pending_column_op: None,
         // 찾기 패널은 새 탭에서 닫힌 채 시작한다. 검색어/옵션과 하이라이트는
         // 호출부(`extract_matching_rows`)가 원본에서 물려받아 채운다 — 열자마자
@@ -6166,6 +6238,9 @@ enum TextMenuAction {
 enum TextEditIntent {
     /// 문자 입력(개행 포함 가능). 선택이 있으면 먼저 지운다.
     Insert(String),
+    /// IME 조합 중 글자의 **미리보기**. 버퍼를 바꾸지 않고 화면에만 그린다
+    /// (빈 문자열이면 미리보기 해제). `collect_text_intents`의 Preedit 주석 참조.
+    ImePreview(String),
     /// Enter — 선택 삭제 후 줄 나누기.
     Newline,
     Backspace,
@@ -6539,6 +6614,8 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
     // 표 모드와 같은 규율: 테이블 클로저는 doc을 불변으로만 빌리고, 상호작용
     // 결과는 여기 모아 두었다가 클로저 종료 후 doc.edit에 적용한다.
     let caret = doc.text_caret;
+    // IME 조합 중 글자. 버퍼에 없으므로 여기서 스냅샷해 캐럿 자리에 덧그린다.
+    let ime_preview = doc.ime_preview.clone();
     // 정규화한 선택(음영 그리기용).
     let sel_norm = doc
         .text_sel
@@ -6596,7 +6673,7 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
     let intents: Vec<TextEditIntent> = if editing {
         let keyboard_free = ui.memory(|m| m.focused().is_none());
         if keyboard_free {
-            ui.input(collect_text_intents)
+            take_text_intents(ui.ctx())
         } else {
             Vec::new()
         }
@@ -6785,6 +6862,20 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
                     // 3) 캐럿(그 줄일 때만).
                     if caret.line == logical {
                         let x = x_of(caret.col);
+                        // 3-a) IME 조합 중 글자를 캐럿 자리에 덧그린다. 버퍼에
+                        // 없는 글자이므로 본문 galley와 별개로 그리고, 조합
+                        // 중임이 보이도록 밑줄을 깐다(IME 관행).
+                        let ime_w = paint_ime_preview(
+                            &painter,
+                            ui,
+                            egui::pos2(x, origin.y),
+                            &ime_preview,
+                            &font_id,
+                            text_color,
+                        );
+                        // 캐럿은 조합 글자 **뒤에** 선다 — 다음 글자가 그
+                        // 자리에 붙기 때문.
+                        let x = x + ime_w;
                         let caret_rect = egui::Rect::from_min_max(
                             egui::pos2(x, cell_rect.top() + 2.0),
                             egui::pos2(x + 1.5, cell_rect.bottom() - 2.0),
@@ -6998,16 +7089,27 @@ fn collect_text_intents(i: &egui::InputState) -> Vec<TextEditIntent> {
             // IME 확정 문자(한글/일본어/중국어). **이 분기가 없으면 한글이
             // 아예 입력되지 않는다** — 조합 입력은 `Event::Text`로 오지 않고
             // `Event::Ime`로만 온다.
-            //
-            // `Commit`만 받고 `Preedit`(조합 중간 상태)은 버린다. 조합 중인
-            // 글자를 버퍼에 넣으면 다음 Preedit마다 그것을 지우고 다시 넣어야
-            // 하는데, 그 되돌리기가 undo 스택에 낱글자로 쌓여 Ctrl+Z 한 번이
-            // "ㄱ→가→각"의 한 단계만 되돌리는 꼴이 된다. 확정된 것만 넣으면
-            // undo 단위가 단어가 되고 버퍼 불변식도 단순하게 유지된다.
-            // 대가는 조합 중 글자가 본문에 미리 보이지 않는 것인데, 그건
-            // IME 자체 창이 캐럿 자리에 띄워 준다(`set_ime_output` 참조).
             egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => {
                 out.push(TextEditIntent::Insert(t.clone()));
+            }
+            // 조합 중간 상태(ㅎ → 하 → 한). **버퍼가 아니라 미리보기로**
+            // 넘긴다.
+            //
+            // 버퍼에 직접 넣으면 다음 Preedit마다 지우고 다시 넣어야 하고,
+            // 그 되돌리기가 undo 스택에 낱글자로 쌓여 Ctrl+Z 한 번이
+            // "ㅎ→하→한"의 한 단계만 되돌리게 된다. dirty 표시도 조합만
+            // 해도 켜진다. 그래서 조합 중 글자는 **화면에만** 그리고
+            // (`render_text`의 미리보기 galley), 확정될 때 비로소 Commit이
+            // 버퍼에 넣는다 — undo 단위는 확정된 글자, 화면은 조합 그대로다.
+            egui::Event::Ime(egui::ImeEvent::Preedit(t)) => {
+                out.push(TextEditIntent::ImePreview(t.clone()));
+            }
+            // 조합이 끝나거나 취소되면 미리보기를 지운다. `Disabled`만 보고
+            // `Commit` 뒤를 안 지우면 확정된 글자가 버퍼와 미리보기에 **둘 다**
+            // 있어 화면에 두 번 나온다(윈도우 IME는 Commit 뒤 빈 Preedit을
+            // 보내지만, 그것에 기대지 않고 여기서 명시적으로 지운다).
+            egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                out.push(TextEditIntent::ImePreview(String::new()));
             }
             egui::Event::Copy => out.push(TextEditIntent::Copy),
             egui::Event::Cut => out.push(TextEditIntent::Cut),
@@ -7022,6 +7124,19 @@ fn collect_text_intents(i: &egui::InputState) -> Vec<TextEditIntent> {
                 let ctrl = modifiers.ctrl || modifiers.command;
                 match key {
                     egui::Key::Enter => out.push(TextEditIntent::Newline),
+                    // Tab은 **글자다**. 에디터에서 Tab은 포커스 이동이 아니라
+                    // 탭 문자 입력이어야 한다(그렇지 않으면 TSV를 만들 수
+                    // 없다). egui는 Tab을 위젯 순회에 쓰므로 여기서 인텐트로
+                    // 바꾸는 것만으로는 부족하고, 이벤트를 **소비**해서
+                    // 포커스 이동이 일어나지 않게 막아야 한다
+                    // (`consume_tab_key` 참조).
+                    //
+                    // Shift+Tab은 넣지 않는다 — 관행상 "내어쓰기"인데 그
+                    // 기능이 아직 없다. 탭을 거꾸로 넣을 수는 없으므로
+                    // 아무것도 하지 않는 편이 낫다.
+                    egui::Key::Tab if !shift && !ctrl => {
+                        out.push(TextEditIntent::Insert("\t".to_owned()))
+                    }
                     egui::Key::Backspace => out.push(TextEditIntent::Backspace),
                     egui::Key::Delete => out.push(TextEditIntent::Delete),
                     egui::Key::A if ctrl => out.push(TextEditIntent::SelectAll),
@@ -7058,6 +7173,18 @@ fn apply_text_intent(
     intent: TextEditIntent,
 ) {
     use crate::edit::{backspace, delete_range, insert_str, normalize, selection_text, split_line};
+
+    // IME 미리보기는 **버퍼를 건드리지 않는다** — 화면에만 그릴 문자열이라
+    // 되돌리기·dirty·캐럿과 무관하다. 아래 편집 경로로 내려보내지 않고
+    // 여기서 끝낸다(그래야 조합 중 타이핑이 undo 스택을 오염시키지 않는다).
+    if let TextEditIntent::ImePreview(t) = intent {
+        doc.ime_preview = t;
+        return;
+    }
+    // 미리보기가 아닌 인텐트가 왔다는 것은 조합이 끝났다는 뜻이다(확정된
+    // Commit, 또는 조합을 깨는 이동·삭제 등). 여기서 지우지 않으면 확정된
+    // 글자가 **버퍼와 미리보기에 둘 다** 있어 화면에 두 번 나온다.
+    doc.ime_preview.clear();
 
     // 이 인텐트가 버퍼를 바꾸는가. 순수 이동/복사/전체선택은 되돌리기 기록이
     // 필요 없으므로 스냅샷 비용도 들이지 않는다.
@@ -7105,6 +7232,8 @@ fn apply_text_intent(
     let before_len = e.lines.len();
 
     match intent {
+        // 위에서 처리하고 반환했다(버퍼를 건드리지 않는 유일한 인텐트).
+        TextEditIntent::ImePreview(_) => unreachable!("미리보기는 위에서 끝낸다"),
         TextEditIntent::Insert(t) => {
             // \r은 버리고 \n만 남긴다 — insert_str이 \n을 줄 분할로 처리한다.
             let t = t.replace('\r', "");
@@ -13800,13 +13929,17 @@ mod tests {
     #[test]
     fn ending_glyphs_uses_control_pictures_when_available() {
         let all = |_c: char| true;
-        assert_eq!(ending_glyphs(parse::LineEnding::Lf, all).chars().count(), 1);
-        assert_eq!(ending_glyphs(parse::LineEnding::Cr, all).chars().count(), 1);
-        assert_eq!(
-            ending_glyphs(parse::LineEnding::CrLf, all).chars().count(),
-            2,
-            "CR과 LF를 둘 다 보여 준다"
-        );
+        for e in [
+            parse::LineEnding::Lf,
+            parse::LineEnding::Cr,
+            parse::LineEnding::CrLf,
+        ] {
+            assert_eq!(
+                ending_glyphs(e, all).chars().count(),
+                1,
+                "{e:?}는 기호 한 글자"
+            );
+        }
         assert_eq!(ending_glyphs(parse::LineEnding::None, all), "");
     }
 
@@ -13820,15 +13953,15 @@ mod tests {
         assert_eq!(ending_glyphs(parse::LineEnding::None, none), "");
     }
 
-    /// 한 글자만 없어도 **둘 다** 폴백해야 한다 — 안 그러면 CRLF가
-    /// "␍\n"처럼 표기가 섞인 꼴로 나온다.
+    /// 화살표가 없는 폰트면 이스케이프로 떨어지고, 기호와 이스케이프가
+    /// 섞이지 않는다.
     #[test]
     fn ending_glyphs_does_not_mix_notations() {
-        // LF 기호(U+240A)만 없는 폰트를 흉내낸다.
-        let only_cr = |c: char| c != '\u{240A}';
-        let s = ending_glyphs(parse::LineEnding::CrLf, only_cr);
-        assert_eq!(s, "\\r\\n", "섞지 않고 통째로 폴백한다");
-        assert!(!s.contains('\u{240D}'), "기호와 이스케이프가 섞이면 안 된다");
+        // 화살표(U+21B5)만 없는 폰트를 흉내낸다.
+        let no_arrow = |c: char| c != '\u{21B5}';
+        let s = ending_glyphs(parse::LineEnding::CrLf, no_arrow);
+        assert_eq!(s, "\\r\\n");
+        assert!(!s.contains('\u{21B5}'), "기호와 이스케이프가 섞이면 안 된다");
     }
 
     /// 뷰 모드는 mmap 바이트를 직접 보므로 **줄마다** 진짜 개행을 읽어낸다.
@@ -14081,21 +14214,70 @@ mod tests {
         }
     }
 
-    /// 조합 중간(`Preedit`)은 버퍼에 넣지 않는다 — 넣으면 다음 Preedit마다
-    /// 지우고 다시 넣어야 하고, 그 되돌리기가 undo 스택에 낱글자로 쌓인다.
+    /// 조합 중간(`Preedit`)은 **미리보기**로 온다 — 초·중·종성 단위로
+    /// 화면에 보여야 하기 때문(사용자 요청). 버퍼는 건드리지 않는다.
     #[test]
-    fn ime_preedit_does_not_touch_the_buffer() {
+    fn ime_preedit_becomes_preview_intents() {
         let out = intents_from(vec![
             egui::Event::Ime(egui::ImeEvent::Enabled),
             egui::Event::Ime(egui::ImeEvent::Preedit("ㅎ".to_owned())),
             egui::Event::Ime(egui::ImeEvent::Preedit("하".to_owned())),
             egui::Event::Ime(egui::ImeEvent::Preedit("한".to_owned())),
         ]);
-        assert!(out.is_empty(), "조합 중에는 아무 인텐트도 만들지 않는다: {out:?}");
+        let previews: Vec<&String> = out
+            .iter()
+            .filter_map(|i| match i {
+                TextEditIntent::ImePreview(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(previews, vec!["ㅎ", "하", "한"], "조합 단계가 그대로 보인다");
+        assert!(
+            !out.iter().any(|i| matches!(i, TextEditIntent::Insert(_))),
+            "조합 중에는 버퍼에 넣지 않는다: {out:?}"
+        );
     }
 
-    /// 조합 → 확정의 전체 흐름. 확정된 글자 **하나만** 들어가야 한다
-    /// (조합 단계가 같이 들어가면 "ㅎ하한한"이 된다).
+    /// 미리보기는 **버퍼·undo·dirty 어디에도** 들어가지 않는다. 조합만
+    /// 해도 dirty가 켜지면 저장 안 한 문서로 오인된다.
+    #[test]
+    fn ime_preview_does_not_dirty_the_buffer() {
+        let mut app = find_test_doc(&["abc"]);
+        let doc = app.doc_mut().unwrap();
+        doc.edit.as_mut().unwrap().dirty = false;
+        let undo_before = doc.edit.as_ref().unwrap().undo.len();
+        let mut clip = String::new();
+
+        apply_text(doc, &mut clip, TextEditIntent::ImePreview("ㅎ".into()));
+
+        assert_eq!(doc.ime_preview, "ㅎ", "화면에는 보인다");
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["abc"]), "버퍼는 그대로");
+        assert!(!doc.edit.as_ref().unwrap().dirty, "조합만으로 dirty가 되면 안 된다");
+        assert_eq!(
+            doc.edit.as_ref().unwrap().undo.len(),
+            undo_before,
+            "undo 스택도 그대로"
+        );
+    }
+
+    /// 확정되면 미리보기가 **지워지고** 그 글자가 버퍼에 들어간다.
+    /// 지우지 않으면 확정 글자가 화면에 두 번 나온다.
+    #[test]
+    fn ime_commit_clears_the_preview() {
+        let mut app = find_test_doc(&["abc"]);
+        let doc = app.doc_mut().unwrap();
+        doc.text_caret = crate::edit::TextPos { line: 0, col: 3 };
+        let mut clip = String::new();
+
+        apply_text(doc, &mut clip, TextEditIntent::ImePreview("한".into()));
+        apply_text(doc, &mut clip, TextEditIntent::Insert("한".into()));
+
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["abc한"]));
+        assert!(doc.ime_preview.is_empty(), "확정 뒤 미리보기가 남으면 두 번 보인다");
+    }
+
+    /// 조합 → 확정의 전체 흐름. 확정된 글자는 **한 번만** 삽입된다
+    /// (조합 단계가 같이 삽입되면 "ㅎ한한"이 된다).
     #[test]
     fn ime_composition_then_commit_inserts_once() {
         let out = intents_from(vec![
@@ -14105,7 +14287,133 @@ mod tests {
             egui::Event::Ime(egui::ImeEvent::Commit("한".to_owned())),
             egui::Event::Ime(egui::ImeEvent::Disabled),
         ]);
-        assert_eq!(out.len(), 1, "확정 하나만: {out:?}");
+        let inserts: Vec<&String> = out
+            .iter()
+            .filter_map(|i| match i {
+                TextEditIntent::Insert(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inserts, vec!["한"], "확정된 글자 하나만 버퍼로: {out:?}");
+    }
+
+    /// 조합이 취소되면(`Disabled`) 미리보기가 지워진다 — 남으면 확정도 안 된
+    /// 글자가 화면에 계속 떠 있다.
+    #[test]
+    fn ime_disabled_clears_the_preview() {
+        let out = intents_from(vec![
+            egui::Event::Ime(egui::ImeEvent::Preedit("ㅎ".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ]);
+        match out.last() {
+            Some(TextEditIntent::ImePreview(s)) => assert!(s.is_empty(), "빈 미리보기로 해제"),
+            other => panic!("마지막은 미리보기 해제여야 한다: {other:?}"),
+        }
+    }
+
+    // ---- Tab 키 ----
+
+    /// **Tab은 글자다.** 에디터에서 Tab이 포커스를 옮기면 TSV를 만들 수 없다
+    /// (사용자 보고).
+    #[test]
+    fn tab_inserts_a_tab_character() {
+        let out = intents_from(vec![egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        match out.as_slice() {
+            [TextEditIntent::Insert(s)] => assert_eq!(s, "\t"),
+            other => panic!("탭 문자 삽입을 기대했는데 {other:?}"),
+        }
+    }
+
+    /// Shift+Tab은 탭을 넣지 않는다 — 관행상 내어쓰기인데 그 기능이 없다.
+    /// 탭을 거꾸로 넣을 수는 없으므로 아무것도 하지 않는다.
+    #[test]
+    fn shift_tab_does_not_insert() {
+        let out = intents_from(vec![egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        }]);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// 탭 문자가 실제로 버퍼에 들어가는지 — 끝에서 끝까지.
+    #[test]
+    fn tab_reaches_the_edit_buffer() {
+        let mut app = find_test_doc(&["a"]);
+        let doc = app.doc_mut().unwrap();
+        doc.text_caret = crate::edit::TextPos { line: 0, col: 1 };
+        let mut clip = String::new();
+        apply_text(doc, &mut clip, TextEditIntent::Insert("\t".into()));
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["a\t"]));
+    }
+
+    /// **수집과 소비의 순서**를 못박는다. 소비가 먼저면 탭 문자가 안 들어가고,
+    /// 소비가 없으면 포커스가 튄다 — 둘 다 조용히 통과하던 자리다.
+    #[test]
+    fn take_text_intents_yields_tab_then_consumes_it() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut got = Vec::new();
+        let mut tab_left = 0;
+        let _ = ctx.run(input, |ctx| {
+            got = take_text_intents(ctx);
+            tab_left = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter(|e| matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }))
+                    .count()
+            });
+        });
+        match got.as_slice() {
+            [TextEditIntent::Insert(s)] => assert_eq!(s, "\t", "탭 문자는 들어가고"),
+            other => panic!("탭 삽입을 기대했는데 {other:?}"),
+        }
+        assert_eq!(tab_left, 0, "이벤트는 소비돼 포커스가 이동하지 않는다");
+    }
+
+    /// `consume_tab_key`가 Tab 이벤트를 **없앤다**. 없애지 않으면 egui가
+    /// 프레임 끝에서 그 Tab을 위젯 순회에 써서 포커스가 툴바로 튄다.
+    #[test]
+    fn consume_tab_key_removes_the_event() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut left_after = 0;
+        let _ = ctx.run(input, |ctx| {
+            consume_tab_key(ctx);
+            left_after = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter(|e| matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }))
+                    .count()
+            });
+        });
+        assert_eq!(left_after, 0, "Tab 이벤트가 남으면 포커스가 이동한다");
     }
 
     /// 빈 Commit은 무시한다(조합을 취소하면 빈 문자열이 올 수 있다).
