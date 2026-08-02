@@ -41,7 +41,10 @@ mod validate;
 
 fn main() -> eframe::Result<()> {
     // 첫 인자가 있으면 그 파일을 열고 시작한다(셸에서 실행하거나 exe에
-    // 파일을 끌어다 놓는 경우). 없으면 빈 상태로 시작.
+    // 파일을 끌어다 놓는 경우). 없으면 빈 새 파일로 시작한다.
+    //
+    // 시작 상태를 정하는 판단 자체는 `App::start`에 있다 — `main`은 테스트가
+    // 부를 수 없어서, 여기에 로직을 두면 검증이 안 되는 구멍이 된다.
     let initial = std::env::args().nth(1).map(std::path::PathBuf::from);
     let options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -51,9 +54,7 @@ fn main() -> eframe::Result<()> {
             // 폰트/텍스트 스타일/Visuals를 한 번에 설치한다(theme.rs).
             theme::install(&cc.egui_ctx);
             let mut app = app::App::default();
-            if let Some(p) = initial {
-                app.open_path(&p, &cc.egui_ctx);
-            }
+            app.start(initial.as_deref(), &cc.egui_ctx);
             Ok(Box::new(app))
         }),
     )

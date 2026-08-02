@@ -532,6 +532,36 @@ impl App {
         self.active = self.docs.len() - 1;
     }
 
+    /// 빈 새 파일을 **새 탭으로** 연다(File → New, Ctrl+N).
+    ///
+    /// 한 줄짜리 래퍼지만 함수로 둔다 — 진입점이 둘(메뉴 클릭, 단축키)이고
+    /// 메뉴 쪽은 egui 클로저 안이라 테스트가 구동할 수 없다. 두 진입점이 같은
+    /// 함수를 지나야 "새 탭으로 붙는다(기존 탭을 갈아치우지 않는다)"를
+    /// 한 번 검증하는 것으로 양쪽이 함께 지켜진다.
+    pub fn open_new_tab(&mut self) {
+        self.add_document(new_document());
+    }
+
+    /// 앱 시작 상태를 정한다. 실행 인자로 파일을 받았으면 그 파일을 열고,
+    /// 없으면 **빈 새 파일**로 시작한다 — 메모장처럼 바로 타이핑할 수 있게.
+    ///
+    /// `main`이 아니라 여기 있는 이유: `main`은 테스트가 부를 수 없다. 시작
+    /// 상태 판단을 `main`에 두면 "인자 없이 실행했을 때 새 문서가 생기는가"를
+    /// 검증할 방법이 없어진다.
+    ///
+    /// 파일 열기가 실패하면(`open_path`가 `self.error`를 채우고 탭을 안 만든다)
+    /// 탭이 하나도 없는 상태가 된다. 그 경우에도 빈 새 파일을 띄운다 — 사용자
+    /// 입장에서 "열려던 파일이 없었다"와 "앱이 텅 비었다"는 다른 문제이고,
+    /// 에러 메시지는 `self.error`가 이미 전한다.
+    pub fn start(&mut self, initial: Option<&Path>, ctx: &egui::Context) {
+        if let Some(p) = initial {
+            self.open_path(p, ctx);
+        }
+        if self.docs.is_empty() {
+            self.add_document(new_document());
+        }
+    }
+
     /// 탭을 닫는다. 활성 인덱스를 유효 범위로 다시 맞춘다.
     /// 마지막 탭을 닫으면 docs가 비고 active는 0이 된다.
     /// 제거된 Document가 dirty 편집 버퍼를 갖고 있어도 이 함수 자체는 묻지
@@ -910,6 +940,12 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    // 빈 새 파일을 새 탭으로. 저장할 때 경로를 묻는다.
+                    // 열려 있던 탭은 건드리지 않는다(`open_new_tab` 참조).
+                    if ui.button("New").clicked() {
+                        self.open_new_tab();
+                        ui.close_menu();
+                    }
                     if ui.button("Open…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             // 새 탭으로 열리므로 기존 탭을 대체하지 않는다 —
@@ -1435,6 +1471,15 @@ impl eframe::App for App {
             .map_or(false, |d| d.pending_column_op.is_some())
         {
             render_confirm_big_column_op_dialog(ctx, self);
+        }
+
+        // Ctrl+N — 빈 새 파일 탭. 다이얼로그가 떠 있으면 양보한다(Ctrl+S와 같은
+        // 규율). 탭이 늘고 active가 바뀌는 동작이라 확인 창 위에서 돌면 안 된다.
+        if !self.show_save_dialog
+            && self.pending_action.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N))
+        {
+            self.open_new_tab();
         }
 
         // Ctrl+S — 편집 모드에서 저장 다이얼로그 열기. 다른 다이얼로그가 떠
@@ -3480,6 +3525,46 @@ fn build_extracted_doc(
         row_errors_revision: 0,
         show_errors_window: false,
     }
+}
+
+/// 아직 저장한 적 없는 **새 파일** 문서를 만든다(빈 한 줄, 편집 모드).
+///
+/// **왜 `build_extracted_doc`을 재사용하나.** 필요한 것이 정확히 같다 —
+/// 인메모리 `Source` + 동기로 채운 완료 인덱스 + 빈 `path`. 필드 40개짜리
+/// 구조체 리터럴을 한 벌 더 두면 나중에 `Document`에 필드가 늘 때 한쪽만
+/// 고쳐질 자리가 생긴다. 다른 점은 셋뿐이라 여기서 덮어쓴다:
+/// `is_extracted`(새 파일은 추출본이 아니다 — 탭 라벨 접두사를 붙이면 안 된다),
+/// `path_label`(빈 문자열이라야 `tab_label`이 `"(untitled)"`로 떨어진다),
+/// 그리고 편집 모드 진입.
+///
+/// **왜 텍스트 모드(`SeparatorMode::None`)인가.** 빈 문서에는 감지할 구분자가
+/// 없다. 표 모드로 열면 컬럼이 하나뿐인 표가 되어, 사용자가 `a,b,c`를 쳐도
+/// 화면은 여전히 한 칸이다(구분자를 나중에 툴바에서 바꿔야 한다). 텍스트
+/// 모드는 무엇을 치든 그대로 보이므로 새 파일의 기대에 맞는다. 표가 필요하면
+/// 툴바 `Delimiter`로 언제든 바꿀 수 있고, 그건 보기 설정이라 데이터를
+/// 건드리지 않는다.
+///
+/// **`path`가 비어 있는 것이 저장 유도의 전부다.** `save_as_fallback`이
+/// 빈 경로를 보고 파일 선택 창으로 폴백하고, 저장에 성공하면 같은 판정으로
+/// `doc.path`/`path_label`을 새 경로로 갱신한다 — 그 뒤 Ctrl+S는 덮어쓰기가
+/// 된다. 추출본이 이미 지나다니는 길이라 새로 만들 것이 없다.
+///
+/// 인코딩 UTF-8 + 개행 CRLF로 시작한다. 파일에서 물려받을 값이 없으니 골라야
+/// 하는데, UTF-8은 이 앱의 기본 저장 인코딩(`App::default`)과 같고 CRLF는
+/// Windows 기본이다. 둘 다 저장 다이얼로그에서 바꿀 수 있다.
+pub fn new_document() -> Document {
+    let mut doc = build_extracted_doc(
+        &[String::new()],
+        Encoding::Utf8,
+        SeparatorMode::None,
+        false,
+        crate::edit::Newline::CrLf,
+        String::new(),
+    );
+    doc.is_extracted = false;
+    // 새 파일은 처음부터 편집 모드다 — 그러려고 만든 문서다.
+    enter_edit_mode(&mut doc);
+    doc
 }
 
 /// 추출본 탭의 표시 이름. `path`가 비어 있으므로 `tab_label`은 이 문자열을
@@ -7504,6 +7589,168 @@ mod tests {
         enter_edit_mode(doc);
         assert!(doc.edit.is_some());
         assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a,b", "1,2"]);
+    }
+
+    // ---- 새 파일 (File → New / 인자 없이 실행) ----
+
+    /// 새 문서의 기본 상태. 빈 한 줄 + 편집 모드 + 텍스트 모드.
+    #[test]
+    fn new_document_starts_empty_in_edit_mode() {
+        let doc = new_document();
+        assert!(doc.edit.is_some(), "새 파일은 처음부터 편집 모드");
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines,
+            vec![String::new()],
+            "빈 한 줄로 시작한다"
+        );
+        assert!(!doc.edit.as_ref().unwrap().dirty, "아직 아무것도 안 고쳤다");
+        assert_eq!(doc.sep, SeparatorMode::None, "빈 문서에 감지할 구분자는 없다");
+        assert!(!doc.has_header);
+        assert!(doc.indexer.is_none(), "인메모리라 붙일 인덱서 스레드가 없다");
+        assert_eq!(
+            doc.index.status().phase,
+            Phase::Complete,
+            "인덱스를 동기로 채웠으므로 상태바가 '인덱싱 중'으로 남으면 안 된다"
+        );
+    }
+
+    /// **저장하면 경로를 묻게 되는가** — 이 기능의 요구사항 그 자체.
+    ///
+    /// 유도 장치는 빈 `path` 하나다. `save_as_fallback`이 그것을 보고 파일
+    /// 선택 창으로 폴백한다(추출본이 이미 쓰는 길).
+    #[test]
+    fn new_document_has_no_path_so_save_asks_for_one() {
+        let doc = new_document();
+        assert_eq!(doc.path, std::path::PathBuf::new(), "디스크 대응 파일이 없다");
+        assert!(
+            save_as_fallback(false, doc.path.as_os_str().is_empty()),
+            "Save(다른 이름 아님)를 눌러도 경로를 묻는 쪽으로 폴백해야 한다"
+        );
+    }
+
+    /// 탭 라벨은 `"(untitled)"`. 추출본 접두사(`[hit] `)가 붙으면 안 된다 —
+    /// 새 파일은 추출본이 아니다.
+    #[test]
+    fn new_document_tab_label_is_untitled() {
+        let doc = new_document();
+        assert!(!doc.is_extracted, "새 파일은 추출본이 아니다");
+        assert_eq!(tab_label(&doc), "(untitled)");
+    }
+
+    /// 저장하고 나면 그 경로가 문서에 남아, **다음 Ctrl+S는 덮어쓰기**여야 한다.
+    /// 여기가 어긋나면 저장할 때마다 파일 선택 창이 다시 뜬다
+    /// (`save_as_fallback` 주석이 설명하는 과거 결함과 같은 종류).
+    #[test]
+    fn new_document_stops_asking_after_first_save() {
+        let mut doc = new_document();
+        doc.edit.as_mut().unwrap().lines = v(&["hello", "world"]);
+
+        // 저장이 경로를 확정한 상태를 흉내낸다(rfd 파일 선택 창은 테스트에서
+        // 띄울 수 없으므로, 저장 성공 뒤 갱신되는 두 필드를 직접 맞춘다).
+        let saved = temp(b"");
+        doc.path = saved.clone();
+        doc.path_label = saved.display().to_string();
+
+        assert!(
+            !save_as_fallback(false, doc.path.as_os_str().is_empty()),
+            "경로가 생겼으면 다음 저장은 묻지 않고 덮어쓴다"
+        );
+        assert_ne!(tab_label(&doc), "(untitled)", "탭 라벨도 파일명으로 바뀐다");
+        std::fs::remove_file(&saved).ok();
+    }
+
+    /// 새 문서에 친 내용이 실제로 파일로 저장되는가(끝에서 끝까지).
+    #[test]
+    fn new_document_content_round_trips_to_disk() {
+        let mut doc = new_document();
+        doc.edit.as_mut().unwrap().lines = v(&["a,b", "1,2"]);
+
+        let out = temp(b"");
+        let opts = crate::save::SaveOptions {
+            enc: crate::parse::Encoding::Utf8,
+            bom: false,
+            newline: doc.edit.as_ref().unwrap().newline,
+        };
+        crate::save::write_file(&out, &doc.edit.as_ref().unwrap().lines, &opts, None).unwrap();
+
+        let written = std::fs::read(&out).unwrap();
+        assert_eq!(
+            written,
+            b"a,b\r\n1,2\r\n".to_vec(),
+            "새 파일 기본 개행은 CRLF(Windows)"
+        );
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// File → New / Ctrl+N 은 **새 탭**으로 붙고 그 탭이 활성화된다.
+    /// 열려 있던 문서를 갈아치우면 안 된다.
+    #[test]
+    fn new_document_adds_a_tab_without_replacing_others() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&temp(b"a,b\n1,2\n"), &ctx);
+        let first_path = app.docs[0].path.clone();
+
+        // 메뉴/단축키가 실제로 부르는 함수를 지난다.
+        app.open_new_tab();
+
+        assert_eq!(app.docs.len(), 2, "탭이 하나 늘어난다");
+        assert_eq!(app.active, 1, "새 탭이 활성화된다");
+        assert_eq!(app.docs[0].path, first_path, "원래 탭은 그대로");
+        assert_eq!(tab_label(app.doc().unwrap()), "(untitled)");
+    }
+
+    /// 새 문서도 편집이 쌓이면 dirty가 되어 탭에 ●가 붙고, 닫을 때 확인
+    /// 대상이 된다 — 저장 안 한 새 파일이 조용히 사라지면 안 된다.
+    #[test]
+    fn new_document_becomes_dirty_and_is_guarded_on_close() {
+        let mut app = App::default();
+        app.add_document(new_document());
+        assert!(!app.any_dirty(), "막 만든 문서는 깨끗하다");
+
+        let doc = app.doc_mut().unwrap();
+        doc.edit.as_mut().unwrap().lines = v(&["typed something"]);
+        doc.edit.as_mut().unwrap().dirty = true;
+
+        assert!(app.any_dirty(), "닫기 확인이 걸려야 한다");
+        assert!(tab_label(app.doc().unwrap()).starts_with('●'));
+    }
+
+    /// 인자 없이 실행하면 빈 새 파일로 시작한다(`main`이 부르는 경로).
+    #[test]
+    fn start_without_argument_opens_a_new_file() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(None, &ctx);
+        assert_eq!(app.docs.len(), 1, "탭 하나로 시작한다");
+        let doc = app.doc().unwrap();
+        assert!(doc.edit.is_some(), "바로 타이핑할 수 있어야 한다");
+        assert_eq!(tab_label(doc), "(untitled)");
+        assert!(doc.path.as_os_str().is_empty(), "저장할 때 경로를 묻는다");
+    }
+
+    /// 인자로 파일을 받으면 그 파일을 연다 — 새 문서를 덧붙이지 않는다.
+    #[test]
+    fn start_with_argument_opens_that_file() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        assert_eq!(app.docs.len(), 1, "빈 새 파일이 덤으로 붙지 않는다");
+        assert_eq!(app.doc().unwrap().path, p);
+    }
+
+    /// 열기에 실패해도 창이 텅 비지 않는다. 에러는 `self.error`가 전하고,
+    /// 사용자는 곧바로 뭔가 칠 수 있는 상태여야 한다.
+    #[test]
+    fn start_with_bad_path_still_gives_a_usable_document() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let missing = std::path::PathBuf::from("Z:\\없는폴더\\없는파일_tv.csv");
+        app.start(Some(&missing), &ctx);
+        assert!(app.error.is_some(), "실패는 실패라고 알린다");
+        assert_eq!(app.docs.len(), 1, "그래도 빈 새 파일로 시작한다");
+        assert!(app.doc().unwrap().edit.is_some());
     }
 
     // ---- 작은 파일 자동 편집 모드 ----
