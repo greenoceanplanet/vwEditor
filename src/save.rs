@@ -99,6 +99,30 @@ pub fn write_file(
     }
 }
 
+/// bytes를 임시 파일에 쓰고 path로 원자적 rename. `write_file`과 같은
+/// 패턴이되 인코딩/개행 개념이 없다(바이너리는 바이트가 곧 전부다).
+#[allow(dead_code)] // Task 7이 소비하면 제거
+pub fn write_binary(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = {
+        let mut t = path.to_path_buf();
+        let name = t.file_name().map(|n| n.to_owned()).unwrap_or_default();
+        let mut n = name;
+        n.push(".tmp");
+        t.set_file_name(n);
+        t
+    };
+    match std::fs::write(&tmp, bytes) {
+        Ok(()) => {
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +209,34 @@ mod tests {
             t
         };
         assert!(!tmp.exists(), "임시 파일이 정리되어야 함");
+    }
+
+    #[test]
+    fn write_binary_roundtrip_bitwise() {
+        let p = tmp_path("bin");
+        let data: Vec<u8> = (0..=255u8).cycle().take(70_000).collect();
+        write_binary(&p, &data).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), data, "비트 단위 동일");
+        // 덮어쓰기도 동작(임시파일 → rename 경로)
+        write_binary(&p, &[0xDE, 0xAD]).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), vec![0xDE, 0xAD]);
+        // 임시파일 잔존 없음
+        let tmp = {
+            let mut t = p.clone();
+            let mut n = t.file_name().unwrap().to_owned();
+            n.push(".tmp");
+            t.set_file_name(n);
+            t
+        };
+        assert!(!tmp.exists());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn write_binary_empty_ok() {
+        let p = tmp_path("bin_empty");
+        write_binary(&p, &[]).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap().len(), 0);
+        std::fs::remove_file(&p).ok();
     }
 }
