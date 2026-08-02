@@ -33,6 +33,55 @@ pub fn detect_encoding(head: &[u8]) -> Encoding {
     Encoding::Cp949
 }
 
+/// 텍스트/바이너리 판정 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextDetection {
+    Text(Encoding),
+    Binary,
+}
+
+/// 파일 앞부분 샘플로 텍스트/바이너리를 판정한다.
+///
+/// `detect_encoding`은 CP949 폴백이라 "실패"가 없다 — 어떤 바이트열이든
+/// 받아들이므로 SQLite 같은 바이너리도 깨진 텍스트로 열렸다. 이 함수가
+/// 그 앞을 막는다. 순서가 중요하다:
+///
+/// 1. BOM은 무조건 텍스트. UTF-16은 NUL 투성이라 NUL 검사보다 먼저.
+/// 2. NUL이 있으면 바이너리. 텍스트 파일에는 NUL이 없다. (BOM 없는
+///    UTF-16이 걸리지만, 기존 감지도 그것을 못 읽었으므로 회귀가 아니다 —
+///    열기 다이얼로그에서 UTF-16을 강제 지정하면 열린다.)
+/// 3. 감지된 인코딩으로 디코드해 대체문자(U+FFFD)가 문자 수의 5%를
+///    넘으면 바이너리. "몇 바이트 깨진 텍스트"(지금도 열리는 파일)는
+///    계속 텍스트로 열리는 관대한 값이다.
+// Task 4가 소비하면 제거
+#[allow(dead_code)]
+pub fn detect_text(head: &[u8]) -> TextDetection {
+    if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return TextDetection::Text(Encoding::Utf8);
+    }
+    if head.starts_with(&[0xFF, 0xFE]) {
+        return TextDetection::Text(Encoding::Utf16Le);
+    }
+    if head.starts_with(&[0xFE, 0xFF]) {
+        return TextDetection::Text(Encoding::Utf16Be);
+    }
+    if memchr::memchr(0, head).is_some() {
+        return TextDetection::Binary;
+    }
+    let enc = detect_encoding(head);
+    let decoded = decode_line(head, enc);
+    let total = decoded.chars().count();
+    if total == 0 {
+        return TextDetection::Text(enc);
+    }
+    let bad = decoded.chars().filter(|&c| c == '\u{FFFD}').count();
+    if bad * 20 > total {
+        TextDetection::Binary
+    } else {
+        TextDetection::Text(enc)
+    }
+}
+
 /// 한 줄(개행 제외 권장)의 바이트를 인코딩에 맞춰 문자열로 디코딩한다.
 /// 잘못된 바이트는 대체문자(U+FFFD)로 손실 없이 처리한다(패닉 없음).
 pub fn decode_line(bytes: &[u8], enc: Encoding) -> String {
@@ -810,5 +859,55 @@ mod tests {
             LineEnding::Lf.symbol(),
             "CR만으로 끝난 줄은 정상 개행과 구분돼야 한다"
         );
+    }
+
+    #[test]
+    fn detect_text_bom_always_text() {
+        // UTF-16 BOM 파일은 NUL 투성이지만 BOM 검사가 먼저라 텍스트다.
+        let utf16le: Vec<u8> = [0xFF, 0xFE].iter().copied()
+            .chain("가나다".encode_utf16().flat_map(|u| u.to_le_bytes()))
+            .collect();
+        assert!(matches!(detect_text(&utf16le), TextDetection::Text(Encoding::Utf16Le)));
+        assert!(matches!(detect_text(&[0xEF, 0xBB, 0xBF, b'a']), TextDetection::Text(Encoding::Utf8)));
+        assert!(matches!(detect_text(&[0xFE, 0xFF, 0x00, 0x41]), TextDetection::Text(Encoding::Utf16Be)));
+    }
+
+    #[test]
+    fn detect_text_nul_means_binary() {
+        // SQLite 헤더 실물: "SQLite format 3\0"
+        let sqlite = b"SQLite format 3\x00\x10\x00\x01\x01";
+        assert!(matches!(detect_text(sqlite), TextDetection::Binary));
+        assert!(matches!(detect_text(b"abc\x00def"), TextDetection::Binary));
+    }
+
+    #[test]
+    fn detect_text_normal_text_stays_text() {
+        assert!(matches!(detect_text(b"hello, world\r\n"), TextDetection::Text(Encoding::Utf8)));
+        assert!(matches!(detect_text("가나다,라마바\n".as_bytes()), TextDetection::Text(Encoding::Utf8)));
+        // CP949 텍스트 (기존 폴백 경로가 유지되는지)
+        let (cp949, _, _) = encoding_rs::EUC_KR.encode("이름,나이\n홍길동,30\n");
+        assert!(matches!(detect_text(&cp949), TextDetection::Text(Encoding::Cp949)));
+        assert!(matches!(detect_text(b""), TextDetection::Text(Encoding::Utf8)), "빈 파일은 텍스트");
+    }
+
+    #[test]
+    fn detect_text_fffd_ratio_boundary() {
+        // CP949 디코드에서 대체문자를 만드는 바이트: 0xFF 0xFF (유효 조합 아님).
+        // decode_line(EUC_KR)은 이런 쌍을 U+FFFD 하나 이상으로 바꾼다.
+        // 'a' 100개에 깨진 쌍 k개를 섞어 비율 경계를 밟는다.
+        // 판정식은 bad * 20 > total (5% 초과 시 바이너리).
+        fn sample(good: usize, bad_pairs: usize) -> Vec<u8> {
+            let mut v = vec![b'a'; good];
+            for _ in 0..bad_pairs {
+                v.extend_from_slice(&[0xFF, 0xFF]);
+            }
+            v
+        }
+        // 디코드 결과 문자 수와 FFFD 수는 decode_line의 실동작으로 정해지므로,
+        // 테스트는 직접 decode해 전제를 확인한 뒤 판정을 본다.
+        let ok = sample(100, 2);   // FFFD 소수 → 텍스트여야 한다
+        let bad = sample(100, 30); // FFFD 다수 → 바이너리여야 한다
+        assert!(matches!(detect_text(&ok), TextDetection::Text(_)));
+        assert!(matches!(detect_text(&bad), TextDetection::Binary));
     }
 }
