@@ -297,6 +297,10 @@ pub struct App {
     pub save_as: bool,
     pub save_enc: crate::parse::Encoding,
     pub save_bom: bool,
+    /// 저장할 개행 스타일. 다이얼로그를 열 때 문서의 현재 값으로 맞추고
+    /// (`init_save_defaults`), 저장 시 문서에 **되써서**(`apply_save_newline`)
+    /// 화면 기호와 파일 내용이 어긋나지 않게 한다.
+    pub save_newline: crate::edit::Newline,
     /// 셀 복사/잘라내기 시 채우는 앱 내부 클립보드. egui 0.28은 시스템
     /// 클립보드 읽기를 직접 제공하지 않으므로(붙여넣기는 이벤트로만 들어온다),
     /// 우클릭 "붙여넣기"의 소스로 이 캐시를 쓴다. 복사 시 시스템 클립보드에도
@@ -335,6 +339,8 @@ impl Default for App {
             save_as: false,
             save_enc: crate::parse::Encoding::Utf8,
             save_bom: false,
+            // Windows 기본. 파일을 열면 그 파일의 스타일로 덮인다.
+            save_newline: crate::edit::Newline::CrLf,
             clipboard_cache: String::new(),
             pending_action: None,
             // eframe이 창을 만들 때 쓴 제목과 같은 값으로 시작한다(main.rs).
@@ -400,6 +406,11 @@ impl App {
                 enc,
                 crate::parse::Encoding::Utf16Le | crate::parse::Encoding::Utf16Be
             );
+        }
+        // 개행도 원본과 같은 스타일이 기본이다 — 저장이 개행을 조용히
+        // 바꿔 버리면 diff가 전 줄로 번진다.
+        if let Some(nl) = self.doc().and_then(|d| d.edit.as_ref()).map(|e| e.newline) {
+            self.save_newline = nl;
         }
     }
 
@@ -4086,7 +4097,32 @@ fn save_as_fallback(save_as: bool, cur_path_empty: bool) -> bool {
     save_as || cur_path_empty
 }
 
-/// 저장 다이얼로그. 인코딩/BOM을 고르고 저장하거나 취소한다.
+/// 개행 스타일의 화면 표기. 플랫폼 이름을 함께 적는 이유는 사용자가 고르는
+/// 기준이 대개 "어디서 쓸 파일인가"이기 때문이다 — `CRLF`/`LF`만으로는
+/// 리눅스에 보낼 파일에 무엇을 골라야 하는지 알 수 없다.
+fn newline_label(nl: crate::edit::Newline) -> &'static str {
+    match nl {
+        crate::edit::Newline::CrLf => "CRLF (Windows)",
+        crate::edit::Newline::Lf => "LF (Unix/Linux/macOS)",
+    }
+}
+
+/// 다이얼로그에서 고른 개행 스타일을 편집 버퍼에 **되쓴다**.
+///
+/// 되쓰지 않으면 저장은 LF로 나가는데 화면 기호는 계속 `␍␊`를 그린다 —
+/// 화면이 파일을 설명하지 못하게 된다(`line_ending_for_row`가 편집 모드에서
+/// `EditBuffer.newline`을 보기 때문). 저장은 "이 문서의 개행은 이제 이것"을
+/// 확정하는 사건이므로 문서 상태에 반영하는 것이 맞다.
+///
+/// `dirty`는 건드리지 않는다. 저장 직후 호출되므로 방금 쓴 파일과 버퍼가
+/// 일치하는 상태이고, 여기서 dirty를 켜면 저장하자마자 "저장 안 됨"이 된다.
+fn apply_save_newline(doc: &mut Document, nl: crate::edit::Newline) {
+    if let Some(e) = doc.edit.as_mut() {
+        e.newline = nl;
+    }
+}
+
+/// 저장 다이얼로그. 인코딩/BOM/개행을 고르고 저장하거나 취소한다.
 /// `app.save_as`가 참이면 rfd 파일 선택 창으로 경로를 새로 고른다.
 fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
     // 편집 버퍼가 없으면(편집 모드 이탈 등) 다이얼로그를 닫는다.
@@ -4143,6 +4179,23 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
                 ui.label(crate::theme::chrome_text("(CP949 has no BOM)"));
             }
 
+            // 개행 스타일. 파일 전체에 하나로 적용된다(줄마다 다르게 저장하는
+            // 기능은 없다 — 편집 버퍼가 줄별 개행을 보관하지 않는다).
+            egui::ComboBox::from_label(crate::theme::chrome_text("Line ending"))
+                .selected_text(newline_label(app.save_newline))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut app.save_newline,
+                        crate::edit::Newline::CrLf,
+                        newline_label(crate::edit::Newline::CrLf),
+                    );
+                    ui.selectable_value(
+                        &mut app.save_newline,
+                        crate::edit::Newline::Lf,
+                        newline_label(crate::edit::Newline::Lf),
+                    );
+                });
+
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
@@ -4184,14 +4237,13 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
         cur_path
     };
 
+    // 개행은 다이얼로그에서 고른 값을 쓴다(기본값은 원본과 같은 스타일 —
+    // `init_save_defaults`). 저장이 성공하면 문서에도 되써서 화면 기호가
+    // 파일과 일치하게 한다(아래 `apply_save_newline`).
     let opts = crate::save::SaveOptions {
         enc: app.save_enc,
         bom: app.save_bom,
-        newline: app
-            .doc()
-            .and_then(|d| d.edit.as_ref())
-            .map(|e| e.newline)
-            .unwrap_or(crate::edit::Newline::Lf),
+        newline: app.save_newline,
     };
     let result = {
         let Some(e) = app.doc().and_then(|d| d.edit.as_ref()) else { return };
@@ -4201,7 +4253,10 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
     match result {
         Ok(()) => {
             app.error = None;
+            let chosen_newline = app.save_newline;
             if let Some(doc) = app.doc_mut() {
+                // 방금 이 스타일로 썼으므로 문서의 개행도 이것이다.
+                apply_save_newline(doc, chosen_newline);
                 if let Some(e) = &mut doc.edit {
                     e.dirty = false;
                 }
@@ -13816,5 +13871,113 @@ mod tests {
             "첫 줄은 다음 줄이 있으므로 개행으로 끝난다"
         );
         assert_eq!(line_ending_for_row(&doc, 1), parse::LineEnding::None);
+    }
+
+    // ---- 저장 시 개행 스타일 선택 ----
+
+    /// 라벨에 플랫폼 이름이 있어야 한다 — 사용자가 고르는 기준은 대개
+    /// "어디서 쓸 파일인가"이고, CRLF/LF만으로는 답할 수 없다.
+    #[test]
+    fn newline_labels_name_the_platforms() {
+        let crlf = newline_label(crate::edit::Newline::CrLf);
+        let lf = newline_label(crate::edit::Newline::Lf);
+        assert!(crlf.contains("CRLF") && crlf.contains("Windows"), "{crlf}");
+        assert!(lf.contains("LF") && lf.contains("Linux"), "{lf}");
+        assert_ne!(crlf, lf);
+    }
+
+    /// 다이얼로그 기본값은 **원본과 같은 스타일**이다. 저장이 개행을 조용히
+    /// 바꾸면 diff가 전 줄로 번진다.
+    #[test]
+    fn save_defaults_keep_the_documents_newline() {
+        let p = temp_ext(b"a\nb\n", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        assert_eq!(
+            app.doc().unwrap().edit.as_ref().unwrap().newline,
+            crate::edit::Newline::Lf,
+            "전제: LF 파일로 열렸다"
+        );
+        app.save_newline = crate::edit::Newline::CrLf; // 이전 문서의 잔재를 흉내
+        app.init_save_defaults();
+        assert_eq!(
+            app.save_newline,
+            crate::edit::Newline::Lf,
+            "다이얼로그를 열면 이 문서의 스타일로 맞춘다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 저장한 개행이 문서에 **되쓰인다**. 되쓰지 않으면 파일은 LF인데 화면
+    /// 기호는 계속 CRLF를 그려 화면이 파일을 설명하지 못한다.
+    #[test]
+    fn saving_writes_chosen_newline_back_to_document() {
+        let p = temp_ext(b"a\r\nb\r\n", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        let doc = app.doc_mut().unwrap();
+        assert_eq!(
+            doc.edit.as_ref().unwrap().newline,
+            crate::edit::Newline::CrLf,
+            "전제: CRLF 파일"
+        );
+
+        apply_save_newline(doc, crate::edit::Newline::Lf);
+
+        assert_eq!(doc.edit.as_ref().unwrap().newline, crate::edit::Newline::Lf);
+        assert_eq!(
+            line_ending_for_row(doc, 0),
+            parse::LineEnding::Lf,
+            "화면 기호도 즉시 LF로 바뀐다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 되쓰기가 dirty를 켜면 안 된다 — 저장 직후라 버퍼와 파일이 같은
+    /// 상태인데, 저장하자마자 "저장 안 됨"이 되면 안 된다.
+    #[test]
+    fn applying_newline_does_not_mark_dirty() {
+        let mut doc = new_document();
+        doc.edit.as_mut().unwrap().dirty = false;
+        apply_save_newline(&mut doc, crate::edit::Newline::Lf);
+        assert!(!doc.edit.as_ref().unwrap().dirty);
+    }
+
+    /// 뷰 모드(편집 버퍼 없음)에서 불러도 패닉하지 않는다.
+    #[test]
+    fn applying_newline_is_noop_without_edit_buffer() {
+        let p = temp_ext(b"a\n", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        view_doc(doc);
+        apply_save_newline(doc, crate::edit::Newline::Lf); // 패닉하지 않는다
+        assert!(doc.edit.is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 고른 스타일이 실제 파일 바이트로 나간다 — LF를 고르면 `\r`이 없어야
+    /// 한다(리눅스로 보낼 파일의 요구사항 그 자체).
+    #[test]
+    fn chosen_newline_reaches_the_written_bytes() {
+        let lines = v(&["a", "b"]);
+        for (nl, expect) in [
+            (crate::edit::Newline::Lf, &b"a\nb\n"[..]),
+            (crate::edit::Newline::CrLf, &b"a\r\nb\r\n"[..]),
+        ] {
+            let out = temp(b"");
+            let opts = crate::save::SaveOptions {
+                enc: crate::parse::Encoding::Utf8,
+                bom: false,
+                newline: nl,
+            };
+            crate::save::write_file(&out, &lines, &opts, None).unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), expect, "{nl:?}");
+            std::fs::remove_file(&out).ok();
+        }
     }
 }
