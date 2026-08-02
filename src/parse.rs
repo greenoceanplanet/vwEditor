@@ -53,8 +53,6 @@ pub enum TextDetection {
 /// 3. 감지된 인코딩으로 디코드해 대체문자(U+FFFD)가 문자 수의 5%를
 ///    넘으면 바이너리. "몇 바이트 깨진 텍스트"(지금도 열리는 파일)는
 ///    계속 텍스트로 열리는 관대한 값이다.
-// Task 4가 소비하면 제거
-#[allow(dead_code)]
 pub fn detect_text(head: &[u8]) -> TextDetection {
     if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return TextDetection::Text(Encoding::Utf8);

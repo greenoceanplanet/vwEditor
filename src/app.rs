@@ -198,6 +198,11 @@ pub struct Document {
     pub row_errors_revision: u64,
     /// 오류 행 창 표시 여부. 탭마다 다르므로 `App`이 아니라 여기 둔다.
     pub show_errors_window: bool,
+    /// Some이면 이 문서는 헥스 모드다. 텍스트 문서와 배타적이며 텍스트
+    /// 관련 필드(sep, index, edit, …)는 헥스 문서에서 쓰이지 않는다.
+    /// 헥스 렌더링(뒤 태스크)이 읽기 시작하면 이 allow를 지운다.
+    #[allow(dead_code)]
+    pub hex: Option<crate::hex::HexState>,
 }
 
 /// 확인 없이 바로 수행할 컬럼 연산의 최대 행 수. 이보다 크면 사용자에게 묻는다.
@@ -316,6 +321,15 @@ pub struct App {
     /// 마지막으로 OS에 보낸 창 제목. 매 프레임 `ViewportCommand::Title`을 보내면
     /// 불필요한 창 시스템 왕복이 생기므로, 바뀔 때만 보내기 위해 기억해 둔다.
     pub window_title: String,
+    /// 바이너리로 판정돼 사용자의 열기 방식 선택을 기다리는 파일.
+    pub pending_binary_open: Option<PendingBinaryOpen>,
+}
+
+/// 바이너리 열기 다이얼로그의 보류 상태.
+pub struct PendingBinaryOpen {
+    pub path: std::path::PathBuf,
+    /// "텍스트로 열기"용 인코딩 선택값.
+    pub enc: Encoding,
 }
 
 /// dirty 편집 버퍼를 잃을 수 있어 확인이 필요한 동작.
@@ -349,6 +363,7 @@ impl Default for App {
             pending_action: None,
             // eframe이 창을 만들 때 쓴 제목과 같은 값으로 시작한다(main.rs).
             window_title: "textViewer".to_owned(),
+            pending_binary_open: None,
         }
     }
 }
@@ -418,11 +433,39 @@ impl App {
         }
     }
 
-    /// 파일을 열어 **새 탭으로 추가**하고 그 탭을 활성화한다. 앞부분으로
-    /// 인코딩/구분자/헤더를 감지한 뒤 백그라운드 인덱싱을 시작한다.
-    /// 실패하면 `self.error`를 채우고 탭은 추가하지 않는다(기존 탭은 그대로).
-    /// 드래그앤드롭·행 추출 등 나중 기능도 이 진입점을 쓴다.
+    /// 파일을 연다. 텍스트면 곧바로, 바이너리로 판정되면 열기 방식 선택
+    /// 다이얼로그를 보류한다(`render_binary_open_dialog`).
     pub fn open_path(&mut self, path: &Path, ctx: &egui::Context) {
+        self.error = None;
+        let head = match std::fs::File::open(path) {
+            Ok(mut f) => {
+                use std::io::Read;
+                let mut buf = vec![0u8; PRIME_BYTES];
+                let n = f.read(&mut buf).unwrap_or(0);
+                buf.truncate(n);
+                buf
+            }
+            Err(e) => {
+                self.error = Some(format!("Failed to open file: {e}"));
+                return;
+            }
+        };
+        match parse::detect_text(&head) {
+            parse::TextDetection::Binary => {
+                self.pending_binary_open = Some(PendingBinaryOpen {
+                    path: path.to_path_buf(),
+                    enc: Encoding::Utf8,
+                });
+            }
+            parse::TextDetection::Text(enc) => self.open_path_as_text(path, enc, ctx),
+        }
+    }
+
+    /// 감지를 건너뛰고 지정 인코딩으로 텍스트로 연다. 새 탭으로 추가하고
+    /// 그 탭을 활성화한다. 실패하면 `self.error`를 채우고 탭은 추가하지
+    /// 않는다(기존 탭은 그대로). 드래그앤드롭·행 추출 등 나중 기능도 이
+    /// 진입점(및 `open_path`)을 쓴다.
+    pub fn open_path_as_text(&mut self, path: &Path, enc: Encoding, ctx: &egui::Context) {
         self.error = None;
         let src = match source::open(path) {
             Ok(s) => Arc::new(s),
@@ -439,7 +482,6 @@ impl App {
             let n = (size as usize).min(PRIME_BYTES);
             src.slice(0, n as u64)
         };
-        let enc = parse::detect_encoding(head);
 
         // 앞부분을 줄 단위로 나눠 구분자/헤더 감지에 사용
         let head_text = parse::decode_line(head, enc);
@@ -521,6 +563,7 @@ impl App {
             error_scan: None,
             row_errors_revision: 0,
             show_errors_window: false,
+            hex: None,
         });
 
         // 작은 파일은 곧바로 편집 모드로. 뷰 모드로 열었다가 사용자가 메뉴에서
@@ -539,6 +582,19 @@ impl App {
                 enter_edit_mode(doc);
             }
         }
+    }
+
+    /// 헥스 모드로 연다. 줄 개념이 없으므로 인덱서를 돌리지 않는다.
+    pub fn open_path_hex(&mut self, path: &Path) {
+        self.error = None;
+        let src = match source::open(path) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                self.error = Some(format!("Failed to open file: {e}"));
+                return;
+            }
+        };
+        self.add_document(hex_document(src, path));
     }
 
     /// 이미 만들어진 Document를 새 탭으로 추가하고 활성화한다.
@@ -1762,6 +1818,11 @@ impl eframe::App for App {
         // 저장 다이얼로그.
         if self.show_save_dialog {
             render_save_dialog(ctx, self);
+        }
+
+        // 바이너리 열기 방식 선택 다이얼로그.
+        if self.pending_binary_open.is_some() {
+            render_binary_open_dialog(ctx, self);
         }
 
         // 저장하지 않은 변경 확인 다이얼로그.
@@ -3832,6 +3893,61 @@ fn build_extracted_doc(
         error_scan: None,
         row_errors_revision: 0,
         show_errors_window: false,
+        hex: None,
+    }
+}
+
+/// 헥스 문서를 만든다. 텍스트 전용 필드는 전부 불활성 값 —
+/// `open_path_as_text`의 리터럴과 같은 초기값이되, `indexer: None`(줄
+/// 인덱서를 돌리지 않는다)과 `hex: Some(..)`(헥스 상태)만 다르다.
+fn hex_document(source: Arc<Source>, path: &Path) -> Document {
+    Document {
+        index: LineIndex::new(source.len()),
+        source,
+        enc: Encoding::Utf8, // 표시 전용 — 헥스 문서에서 인코딩은 무의미
+        sep: SeparatorMode::None,
+        has_header: false,
+        indexer: None,
+        path: path.to_path_buf(),
+        path_label: path.display().to_string(),
+        is_extracted: false,
+        custom_sep_input: String::new(),
+        selected_col: None,
+        sort: None,
+        sort_job: None,
+        show_sort_dialog: false,
+        show_convert_dialog: false,
+        convert_target: None,
+        convert_custom_input: String::new(),
+        sort_specs: Vec::new(),
+        edit: None,
+        editing_cell: None,
+        cell_edit_text: String::new(),
+        cell_sel: None,
+        cell_drag_active: false,
+        text_sel: None,
+        text_caret: crate::edit::TextPos { line: 0, col: 0 },
+        text_drag_active: false,
+        ime_preview: String::new(),
+        pending_column_op: None,
+        show_find: false,
+        find_query: String::new(),
+        replace_text: String::new(),
+        find_opts: crate::find::FindOptions::default(),
+        find_escapes: false,
+        last_match: None,
+        find_status: String::new(),
+        find_focus_pending: false,
+        highlight: None,
+        pending_scroll_row: None,
+        pending_scroll_align: egui::Align::Center,
+        first_visible_row: 0,
+        visible_rows: 0,
+        row_errors: None,
+        error_scan: None,
+        row_errors_revision: 0,
+        show_errors_window: false,
+        hex: Some(crate::hex::HexState::new()),
     }
 }
 
@@ -4564,6 +4680,67 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
         Err(err) => {
             // 실패하면 버퍼는 dirty인 채로 둔다(사용자가 다시 시도할 수 있게).
             app.error = Some(format!("Save failed: {err}"));
+        }
+    }
+}
+
+/// 바이너리로 판정된 파일의 열기 방식 선택. Sort/Convert 다이얼로그와
+/// 같은 `egui::Window` 패턴.
+fn render_binary_open_dialog(ctx: &egui::Context, app: &mut App) {
+    let Some(pending) = &app.pending_binary_open else { return };
+    let path = pending.path.clone();
+    let mut open = true;
+    let mut choice: Option<bool> = None; // Some(true)=hex, Some(false)=text
+    egui::Window::new("Not a Text File")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(crate::theme::chrome_text(
+                "This file does not look like text.",
+            ));
+            ui.label(crate::theme::chrome_text(path.display().to_string()));
+            ui.separator();
+            if ui.button("Open as Binary (Hex)").clicked() {
+                choice = Some(true);
+            }
+            ui.separator();
+            ui.label(crate::theme::chrome_text("Or force a text encoding:"));
+            ui.horizontal(|ui| {
+                let enc = &mut app.pending_binary_open.as_mut().unwrap().enc;
+                let label = match enc {
+                    Encoding::Utf8 => "UTF-8",
+                    Encoding::Cp949 => "CP949",
+                    Encoding::Utf16Le => "UTF-16LE",
+                    Encoding::Utf16Be => "UTF-16BE",
+                };
+                egui::ComboBox::from_id_source("binary_open_enc")
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(enc, Encoding::Utf8, "UTF-8");
+                        ui.selectable_value(enc, Encoding::Cp949, "CP949");
+                        ui.selectable_value(enc, Encoding::Utf16Le, "UTF-16LE");
+                        ui.selectable_value(enc, Encoding::Utf16Be, "UTF-16BE");
+                    });
+                if ui.button("Open as Text").clicked() {
+                    choice = Some(false);
+                }
+            });
+            ui.separator();
+            if ui.button("Cancel").clicked() {
+                app.pending_binary_open = None;
+            }
+        });
+    if !open {
+        app.pending_binary_open = None;
+    }
+    if let Some(as_hex) = choice {
+        let enc = app.pending_binary_open.as_ref().map(|p| p.enc).unwrap_or(Encoding::Utf8);
+        app.pending_binary_open = None;
+        if as_hex {
+            app.open_path_hex(&path);
+        } else {
+            app.open_path_as_text(&path, enc, ctx);
         }
     }
 }
@@ -7626,6 +7803,17 @@ mod tests {
         p
     }
 
+    /// 메모리 바이트로 헥스 문서 탭 하나를 가진 App.
+    /// 이 태스크의 테스트는 아직 안 쓴다 — 헥스 렌더/편집을 다루는 뒤 태스크가
+    /// 소비하면 이 allow를 지운다.
+    #[allow(dead_code)]
+    fn hex_test_doc(bytes: &[u8]) -> App {
+        let mut app = App::default();
+        let src = Arc::new(Source::from_bytes(bytes.to_vec()));
+        app.add_document(hex_document(src, std::path::Path::new("")));
+        app
+    }
+
     #[test]
     fn open_detects_and_primes() {
         let p = temp(b"name,age\nAlice,30\nBob,25\n");
@@ -7670,6 +7858,61 @@ mod tests {
         app.open_path(std::path::Path::new("nope_xyz.csv"), &ctx);
         assert_eq!(app.docs.len(), 1, "실패한 열기는 기존 탭을 건드리지 않는다");
         assert!(app.error.is_some());
+    }
+
+    /// 바이너리 파일을 열면 문서를 만들지 않고 선택 다이얼로그를 보류한다.
+    #[test]
+    fn open_binary_defers_to_dialog() {
+        let p = temp_ext(b"SQLite format 3\x00\x10\x00\x01", "gpkg");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert_eq!(app.docs.len(), 0, "문서가 아직 없어야 한다");
+        let pending = app.pending_binary_open.as_ref().expect("보류 상태");
+        assert_eq!(pending.path, p);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 다이얼로그에서 "헥스로 열기"를 고르면 헥스 문서가 생긴다.
+    #[test]
+    fn open_path_hex_creates_hex_document() {
+        let p = temp_ext(b"\x00\x01\x02ABC", "bin");
+        let mut app = App::default();
+        app.open_path_hex(&p);
+        assert_eq!(app.docs.len(), 1);
+        let doc = app.doc().unwrap();
+        assert!(doc.hex.is_some());
+        assert!(doc.indexer.is_none(), "헥스 문서는 줄 인덱서를 돌리지 않는다");
+        assert!(matches!(doc.sep, SeparatorMode::None));
+        assert_eq!(doc.source.len(), 6);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// "텍스트로 열기"는 감지를 건너뛰고 지정 인코딩으로 기존 경로를 탄다.
+    #[test]
+    fn open_path_as_text_forces_encoding() {
+        let p = temp_ext(b"abc\x00def\nghi\n", "txt"); // NUL 때문에 감지는 바이너리
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path_as_text(&p, Encoding::Utf8, &ctx);
+        assert_eq!(app.docs.len(), 1);
+        let doc = app.doc().unwrap();
+        assert!(doc.hex.is_none(), "텍스트 문서다");
+        assert_eq!(doc.enc, Encoding::Utf8);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 텍스트 파일은 다이얼로그 없이 기존과 똑같이 열린다(회귀 방지).
+    #[test]
+    fn open_plain_text_skips_dialog() {
+        let p = temp_ext(b"a,b\n1,2\n", "csv");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert!(app.pending_binary_open.is_none());
+        assert_eq!(app.docs.len(), 1);
+        assert!(app.doc().unwrap().hex.is_none());
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
