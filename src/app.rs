@@ -558,6 +558,30 @@ impl App {
         self.add_document(new_document());
     }
 
+    /// 이번 프레임의 Tab을 **본문 탭 문자로 쓸 것인가**. 쓸 것이면 이벤트를
+    /// 소비해 egui의 위젯 순회에서 없앤다.
+    ///
+    /// `update()` 맨 앞에서 부른다 — 메뉴바가 본문보다 먼저 그려지므로,
+    /// 본문 렌더에서 소비하면 그 프레임에 이미 메뉴 버튼이 포커스 후보로
+    /// 등록되어 포커스가 File로 넘어간다(사용자 보고).
+    ///
+    /// 조건:
+    /// - **편집 모드**여야 한다. 뷰 모드에서 Tab은 평범한 포커스 순회다.
+    /// - **텍스트 모드**여야 한다. 표 모드에서 Tab은 셀 이동/포커스 순회이고,
+    ///   셀 안에 탭 문자가 들어가면 TSV에서는 필드가 갈라진다.
+    /// - **다이얼로그가 없어야** 한다. 저장·확인 창이 떠 있으면 그 안에서
+    ///   Tab이 버튼 사이를 옮겨 다녀야 한다.
+    /// - **인라인 셀 편집기가 없어야** 한다(표 모드 조건에 포함되지만 명시).
+    fn wants_tab_character(&self, ctx: &egui::Context) -> bool {
+        let body_takes_tab = self.doc().is_some_and(|d| {
+            d.edit.is_some() && matches!(d.sep, SeparatorMode::None) && d.editing_cell.is_none()
+        });
+        if !body_takes_tab || tab_bar_locked(&self.pending_action, self.show_save_dialog) {
+            return false;
+        }
+        consume_tab_key(ctx)
+    }
+
     /// 앱 시작 상태를 정한다. 실행 인자로 파일을 받았으면 그 파일을 열고,
     /// 없으면 **빈 새 파일**로 시작한다 — 메모장처럼 바로 타이핑할 수 있게.
     ///
@@ -725,30 +749,46 @@ fn paint_ime_preview(
     size.x
 }
 
-/// 편집 모드 한 프레임의 인텐트를 만든다. `render_text`의 키 처리 전체가
-/// 이 함수 하나로 표현되며, 여기 담긴 **순서와 게이트가 곧 정확성**이다.
+/// 본문이 Tab을 먹은 프레임이면 그 Tab이 넘긴 포커스를 걷어낸다.
 ///
-/// 1. **Tab을 가장 먼저 소비한다.** 소비하지 않으면 egui가 프레임 끝에서
-///    그것으로 포커스를 툴바 위젯에 옮기고, 그 순간 `keyboard_free`가 거짓이
-///    되어 다음 프레임부터 본문이 키를 아예 받지 못한다 — **Tab이 자기
-///    자신을 막는다**. 이게 "탭이 아직도 안 된다"의 원인이었다.
-/// 2. **나머지 키는 포커스 게이트를 탄다.** 툴바 입력란에 타이핑할 때 같은
-///    글자가 본문에도 들어가는 것을 막는 원래 목적이다.
-/// 3. **Tab은 그 게이트를 타지 않는다.** 게이트의 목적이 "글자 중복 방지"인데
-///    Tab은 입력란에 글자를 넣지 않으므로 중복될 것이 없고, 태우면 1번의
-///    자기 차단이 그대로 되살아난다.
+/// **이벤트 소비만으로는 못 막는다.** egui는 프레임 시작 시 `RawInput`에서
+/// Tab을 읽어 `focus_direction`을 정하므로(`memory.rs:444-462`), 프레임 도중
+/// 이벤트를 지워도 늦다. 포커스가 없는 상태의 Tab은 `give_to_next`를 켜고,
+/// 그 프레임에 **처음 등록되는 focusable 위젯**이 포커스를 가져간다
+/// (`memory.rs:543`) — 메뉴바가 본문보다 먼저 그려지므로 그게 File 버튼이다.
 ///
-/// 호출부(`render_text`)는 egui 클로저 안이라 테스트가 구동할 수 없어,
-/// 판정을 여기로 모아 검증한다.
-fn text_frame_intents(ctx: &egui::Context, editing: bool) -> Vec<TextEditIntent> {
-    let tab_pressed = editing && consume_tab_key(ctx);
+/// 그래서 UI를 다 그린 뒤 되돌린다. 본문은 원래 포커스를 갖지 않는 설계라
+/// (`TEXT_LINE_SENSE`의 `focusable: false`) "아무도 안 가진 상태"가 정상이다.
+fn release_focus_after_body_tab(ctx: &egui::Context, tab_for_body: bool) {
+    if tab_for_body {
+        ctx.memory_mut(|m| m.stop_text_input());
+    }
+}
+
+/// 편집 모드 한 프레임의 인텐트를 만든다.
+///
+/// `tab_pressed`는 **이미 소비된** Tab이다 — 소비는 `App::wants_tab_character`가
+/// `update()` 맨 앞에서 한다. 여기서 소비하면 메뉴바가 먼저 그려진 뒤라
+/// 포커스가 File 메뉴로 넘어간다(그 함수 주석 참조).
+///
+/// 게이트 규칙:
+/// - **일반 키는 포커스 게이트를 탄다.** 툴바 입력란에 타이핑한 글자가 본문에
+///   중복 입력되는 것을 막는 원래 목적이다.
+/// - **Tab은 타지 않는다.** 게이트의 목적이 글자 중복 방지인데 Tab은 입력란에
+///   글자를 넣지 않으므로 중복될 것이 없다. 반대로 태우면 첫 Tab이 포커스를
+///   옮긴 뒤 스스로를 영영 막는다.
+fn text_frame_intents(
+    ctx: &egui::Context,
+    editing: bool,
+    tab_pressed: bool,
+) -> Vec<TextEditIntent> {
     let keyboard_free = ctx.memory(|m| m.focused().is_none());
     let mut intents = if editing && keyboard_free {
         ctx.input(collect_text_intents)
     } else {
         Vec::new()
     };
-    if tab_pressed {
+    if editing && tab_pressed {
         intents.push(TextEditIntent::Insert("\t".to_owned()));
     }
     intents
@@ -1030,6 +1070,18 @@ fn parse_logical_line_edit(doc: &Document, logical: usize, delim: u8) -> Option<
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ---- Tab 소비 (다른 무엇보다 먼저) ----
+        //
+        // **위치가 곧 정확성이다.** 메뉴바가 본문보다 먼저 그려지므로
+        // (`TopBottomPanel::top("menubar")` → `CentralPanel`), 본문에서
+        // 소비하면 이미 늦다 — 그 프레임에 메뉴 버튼이 포커스 후보로
+        // 등록되어 탭 문자는 들어가면서 포커스는 File 메뉴로 간다.
+        // 어떤 패널도 그리기 전인 여기서 이벤트를 없애야 순회 자체가 없다.
+        //
+        // 편집 모드 + 본문이 키를 받을 수 있을 때만 먹는다. 뷰 모드나
+        // 다이얼로그가 떠 있을 때는 Tab이 평범한 포커스 순회여야 한다.
+        let tab_for_body = self.wants_tab_character(ctx);
+
         // Ctrl + 휠로 전역 확대/축소. zoom_factor를 조절하면 폰트뿐 아니라
         // UI 전체가 배율에 맞춰 커지고 작아진다. (0.5배 ~ 4.0배로 제한)
         let scroll_y = ctx.input(|i| {
@@ -1650,7 +1702,9 @@ impl eframe::App for App {
                 SeparatorMode::Char(delim) => {
                     render_table(ui, doc, delim, row_base, col_base, clipboard)
                 }
-                SeparatorMode::None => render_text(ui, doc, row_base, clipboard),
+                SeparatorMode::None => {
+                    render_text(ui, doc, row_base, clipboard, tab_for_body)
+                }
             }
         });
 
@@ -1713,6 +1767,20 @@ impl eframe::App for App {
         {
             render_confirm_big_column_op_dialog(ctx, self);
         }
+
+        // 본문이 Tab을 먹은 프레임이면, 그 Tab이 넘긴 포커스를 되돌린다.
+        //
+        // **이벤트를 지우는 것만으로는 부족하다.** egui는 프레임이 시작될 때
+        // `RawInput`에서 Tab을 읽어 `focus_direction`을 정하므로
+        // (`memory.rs:444-462`), 프레임 도중 이벤트를 제거해도 이미 늦다.
+        // 포커스 없는 상태에서 Tab은 `give_to_next`를 켜고, 그 프레임에 처음
+        // 등록되는 focusable 위젯 — 즉 **메뉴바의 File 버튼** — 이 포커스를
+        // 가져간다(`memory.rs:543`). 그래서 UI를 다 그린 뒤 여기서 걷어낸다.
+        //
+        // `stop_text_input`은 "포커스를 아무도 갖지 않게" 한다. 본문은 원래
+        // 포커스를 갖지 않는 설계이므로(`TEXT_LINE_SENSE`의 `focusable: false`)
+        // 이것이 곧 정상 상태로 되돌리는 것이다.
+        release_focus_after_body_tab(ctx, tab_for_body);
 
         // Ctrl+N — 빈 새 파일 탭. 다이얼로그가 떠 있으면 양보한다(Ctrl+S와 같은
         // 규율). 탭이 늘고 active가 바뀌는 동작이라 확인 창 위에서 돌면 안 된다.
@@ -6698,7 +6766,13 @@ fn render_match_gutter(ctx: &egui::Context, doc: &mut Document) {
 /// 그린다. 편집 모드에서는 캐럿/선택을 정확히 그려야 하므로 줄 텍스트를 직접
 /// 고정폭 galley로 레이아웃해 그리고, char↔x 매핑에 그 galley의
 /// `pos_from_ccursor` / `cursor_from_pos`를 쓴다(근사 아님).
-fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard: &mut String) {
+fn render_text(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    row_base: usize,
+    clipboard: &mut String,
+    tab_pressed: bool,
+) {
     use std::cell::Cell;
 
     // 찾기가 남긴 스크롤 요청(표 모드와 같은 이유·같은 방법 — render_table 주석 참조).
@@ -6780,7 +6854,7 @@ fn render_text(ui: &mut egui::Ui, doc: &mut Document, row_base: usize, clipboard
     //
     // 편집 모드에서만 소비한다. 뷰 모드에서는 Tab이 평범한 포커스 순회여야
     // 한다(접근성).
-    let intents: Vec<TextEditIntent> = text_frame_intents(ui.ctx(), editing);
+    let intents: Vec<TextEditIntent> = text_frame_intents(ui.ctx(), editing, tab_pressed);
 
     // 행 간격 — 표 모드와 같은 이유(`scroll_offset_for_row` 주석).
     let spacing_y = ui.spacing().item_spacing.y;
@@ -13454,7 +13528,7 @@ mod tests {
         let draw = |app: &mut App, clip: &mut String| {
             let _ = ctx.run(input.clone(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    render_text(ui, app.doc_mut().unwrap(), 0, clip);
+                    render_text(ui, app.doc_mut().unwrap(), 0, clip, false);
                 });
             });
         };
@@ -13547,7 +13621,7 @@ mod tests {
         let draw = |app: &mut App, clip: &mut String| {
             let _ = ctx.run(input.clone(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    render_text(ui, app.doc_mut().unwrap(), 0, clip);
+                    render_text(ui, app.doc_mut().unwrap(), 0, clip, false);
                 });
             });
         };
@@ -14279,6 +14353,15 @@ mod tests {
     /// `InputState`는 비공개 필드가 있어 리터럴로 못 만든다. 실제 `Context`에
     /// `RawInput`으로 넣어 한 프레임을 돌리는데, 이쪽이 진짜 이벤트 경로와
     /// 같으므로 오히려 충실한 검증이다.
+    /// 큐에 남아 있는 Tab 키 이벤트 수(0이면 소비된 것).
+    fn tab_events_left(ctx: &egui::Context) -> usize {
+        ctx.input(|i| {
+            i.events
+                .iter()
+                .filter(|e| matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }))
+                .count()
+        })
+    }
     /// Tab 키 눌림 이벤트 하나.
     fn tab_event(modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
@@ -14415,21 +14498,113 @@ mod tests {
     }
 
     // ---- Tab 키 ----
+    //
+    // 소비는 `App::wants_tab_character`가 `update()` 맨 앞에서 하고, 삽입은
+    // `text_frame_intents`가 그 결과(bool)를 받아 한다. 둘로 나뉜 이유는
+    // 메뉴바가 본문보다 먼저 그려지기 때문이다 — 아래 첫 테스트가 그 증상이다.
 
-    /// Shift+Tab은 탭을 넣지 않는다 — 관행상 내어쓰기인데 그 기능이 없다.
-    /// (`consume_tab_key`가 `Modifiers::NONE`만 소비하므로 그대로 통과한다.)
+    /// 편집 모드 + 텍스트 모드면 Tab을 먹는다(그리고 이벤트를 없앤다).
     #[test]
-    fn shift_tab_does_not_insert() {
+    fn wants_tab_character_in_text_edit_mode() {
+        let app = find_test_doc(&["ab"]);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![tab_event(egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        let mut took = false;
+        let mut left = 0;
+        let _ = ctx.run(input, |ctx| {
+            took = app.wants_tab_character(ctx);
+            left = tab_events_left(ctx);
+        });
+        assert!(took, "본문이 탭 문자를 받아야 한다");
+        assert_eq!(left, 0, "이벤트를 없애야 포커스 순회가 일어나지 않는다");
+    }
+
+    /// 표 모드에서는 Tab을 먹지 않는다 — 셀 안에 탭이 들어가면 TSV에서
+    /// 필드가 갈라지고, 표에서는 Tab이 이동 키로 쓰이는 것이 관행이다.
+    #[test]
+    fn wants_tab_character_is_false_in_table_mode() {
+        let mut app = find_test_doc(&["a,b"]);
+        app.doc_mut().unwrap().sep = SeparatorMode::Char(b',');
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![tab_event(egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        let mut took = false;
+        let mut left = 0;
+        let _ = ctx.run(input, |ctx| {
+            took = app.wants_tab_character(ctx);
+            left = tab_events_left(ctx);
+        });
+        assert!(!took);
+        assert_eq!(left, 1, "이벤트를 남겨 포커스 순회에 쓰이게 한다");
+    }
+
+    /// 뷰 모드에서는 Tab이 평범한 포커스 순회여야 한다(접근성).
+    #[test]
+    fn wants_tab_character_is_false_in_view_mode() {
+        let p = temp_ext(b"a\nb\n", "txt");
+        let ctx0 = egui::Context::default();
+        let mut app = App::default();
+        app.start(Some(&p), &ctx0);
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.indexer.take().unwrap().join().unwrap();
+            view_doc(doc);
+        }
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![tab_event(egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        let mut took = false;
+        let _ = ctx.run(input, |ctx| took = app.wants_tab_character(ctx));
+        assert!(!took);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 저장 다이얼로그가 떠 있으면 Tab은 그 안의 버튼 사이를 옮겨야 한다.
+    #[test]
+    fn wants_tab_character_is_false_while_a_dialog_is_open() {
+        let mut app = find_test_doc(&["ab"]);
+        app.show_save_dialog = true;
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![tab_event(egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        let mut took = false;
+        let _ = ctx.run(input, |ctx| took = app.wants_tab_character(ctx));
+        assert!(!took, "다이얼로그 위에서는 본문이 Tab을 가로채면 안 된다");
+    }
+
+    /// Shift+Tab은 먹지 않는다 — 관행상 내어쓰기인데 그 기능이 없고,
+    /// 역방향 포커스 순회로 남기는 편이 낫다.
+    ///
+    /// `consume_key`를 안 쓰는 이유가 여기 있다: 그쪽은 `matches_logically`라
+    /// Shift를 무시해서 Shift+Tab까지 먹는다(egui `input_state.rs:484`).
+    #[test]
+    fn shift_tab_is_left_alone() {
+        let app = find_test_doc(&["ab"]);
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             events: vec![tab_event(egui::Modifiers::SHIFT)],
             ..Default::default()
         };
-        let mut got = Vec::new();
-        let _ = ctx.run(input, |ctx| got = text_frame_intents(ctx, true));
-        assert!(got.is_empty(), "{got:?}");
+        let mut took = false;
+        let mut left = 0;
+        let _ = ctx.run(input, |ctx| {
+            took = app.wants_tab_character(ctx);
+            left = tab_events_left(ctx);
+        });
+        assert!(!took, "Shift+Tab은 탭 문자가 아니다");
+        assert_eq!(left, 1, "역방향 포커스 순회로 남긴다");
     }
-    /// 탭 문자가 실제로 버퍼에 들어가는지 — 끝에서 끝까지.
+
+    /// 탭 문자가 실제로 버퍼에 들어가는지.
     #[test]
     fn tab_reaches_the_edit_buffer() {
         let mut app = find_test_doc(&["a"]);
@@ -14440,37 +14615,24 @@ mod tests {
         assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["a\t"]));
     }
 
-    /// Tab 한 번에 **탭 문자 하나**가 나오고 이벤트는 소비된다.
+    /// 소비된 Tab(`tab_pressed`)이 삽입 인텐트로 되살아난다.
     #[test]
-    fn text_frame_intents_yields_tab_and_consumes_event() {
+    fn text_frame_intents_revives_the_consumed_tab() {
         let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            events: vec![tab_event(egui::Modifiers::NONE)],
-            ..Default::default()
-        };
         let mut got = Vec::new();
-        let mut tab_left = 0;
-        let _ = ctx.run(input, |ctx| {
-            got = text_frame_intents(ctx, true);
-            tab_left = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .filter(|e| matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }))
-                    .count()
-            });
+        let _ = ctx.run(Default::default(), |ctx| {
+            got = text_frame_intents(ctx, true, true);
         });
         match got.as_slice() {
-            [TextEditIntent::Insert(s)] => assert_eq!(s, "\t", "탭 문자 하나"),
+            [TextEditIntent::Insert(s)] => assert_eq!(s, "\t"),
             other => panic!("탭 삽입을 기대했는데 {other:?}"),
         }
-        assert_eq!(tab_left, 0, "이벤트는 소비돼 포커스가 이동하지 않는다");
     }
 
-    /// **이 버그의 핵심.** 포커스가 툴바 등 다른 위젯에 있어도 Tab은 본문에
-    /// 들어가야 한다. 게이트를 태우면 첫 Tab이 포커스를 옮긴 뒤 스스로를
-    /// 영영 막는다("탭이 아직도 안 된다"의 원인).
+    /// **이 버그의 핵심 성질.** 포커스가 다른 위젯에 있어도 탭은 들어가야
+    /// 한다 — 게이트를 태우면 첫 Tab이 포커스를 옮긴 뒤 스스로를 막는다.
     #[test]
-    fn tab_works_even_when_focus_is_elsewhere() {
+    fn tab_ignores_the_focus_gate() {
         let ctx = egui::Context::default();
         let other = egui::Id::new("toolbar_widget");
         let _ = ctx.run(Default::default(), |ctx| {
@@ -14485,20 +14647,18 @@ mod tests {
         });
         assert_eq!(ctx.memory(|m| m.focused()), Some(other), "전제: 포커스가 밖");
 
-        let input = egui::RawInput {
-            events: vec![tab_event(egui::Modifiers::NONE)],
-            ..Default::default()
-        };
         let mut got = Vec::new();
-        let _ = ctx.run(input, |ctx| got = text_frame_intents(ctx, true));
+        let _ = ctx.run(Default::default(), |ctx| {
+            got = text_frame_intents(ctx, true, true);
+        });
         match got.as_slice() {
             [TextEditIntent::Insert(s)] => assert_eq!(s, "\t"),
             other => panic!("포커스가 밖이어도 탭은 들어가야 한다: {other:?}"),
         }
     }
 
-    /// 반대로 **일반 글자**는 게이트를 타야 한다 — 툴바 입력란에 타이핑한
-    /// 글자가 본문에도 들어가면 안 된다(게이트의 원래 목적).
+    /// 반대로 **일반 글자**는 게이트를 타야 한다 — 툴바 입력란에 친 글자가
+    /// 본문에도 들어가면 안 된다(게이트의 원래 목적).
     #[test]
     fn ordinary_text_still_respects_the_focus_gate() {
         let ctx = egui::Context::default();
@@ -14518,61 +14678,20 @@ mod tests {
             ..Default::default()
         };
         let mut got = Vec::new();
-        let _ = ctx.run(input, |ctx| got = text_frame_intents(ctx, true));
+        let _ = ctx.run(input, |ctx| got = text_frame_intents(ctx, true, false));
         assert!(got.is_empty(), "포커스가 밖이면 글자는 본문에 안 들어간다: {got:?}");
     }
 
-    /// 뷰 모드에서는 Tab이 평범한 포커스 순회여야 한다(접근성).
+    /// 뷰 모드면 `tab_pressed`가 참으로 들어와도 삽입하지 않는다(이중 안전).
     #[test]
-    fn tab_is_not_consumed_in_view_mode() {
+    fn text_frame_intents_ignores_tab_in_view_mode() {
         let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            events: vec![tab_event(egui::Modifiers::NONE)],
-            ..Default::default()
-        };
         let mut got = Vec::new();
-        let mut tab_left = 0;
-        let _ = ctx.run(input, |ctx| {
-            got = text_frame_intents(ctx, false);
-            tab_left = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .filter(|e| matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }))
-                    .count()
-            });
+        let _ = ctx.run(Default::default(), |ctx| {
+            got = text_frame_intents(ctx, false, true);
         });
-        assert!(got.is_empty(), "뷰 모드는 편집 인텐트를 만들지 않는다");
-        assert_eq!(tab_left, 1, "이벤트를 남겨 포커스 순회에 쓰이게 한다");
+        assert!(got.is_empty(), "{got:?}");
     }
-
-    /// `consume_tab_key`가 Tab 이벤트를 **없앤다**. 없애지 않으면 egui가
-    /// 프레임 끝에서 그 Tab을 위젯 순회에 써서 포커스가 툴바로 튄다.
-    #[test]
-    fn consume_tab_key_removes_the_event() {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            events: vec![egui::Event::Key {
-                key: egui::Key::Tab,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-            ..Default::default()
-        };
-        let mut left_after = 0;
-        let _ = ctx.run(input, |ctx| {
-            consume_tab_key(ctx);
-            left_after = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .filter(|e| matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }))
-                    .count()
-            });
-        });
-        assert_eq!(left_after, 0, "Tab 이벤트가 남으면 포커스가 이동한다");
-    }
-
     /// 빈 Commit은 무시한다(조합을 취소하면 빈 문자열이 올 수 있다).
     #[test]
     fn ime_empty_commit_is_ignored() {
@@ -14688,92 +14807,6 @@ mod tests {
         assert!(o.bom);
     }
 
-    /// **끝에서 끝까지**: 실제 `render_text`에 Tab 키를 흘려 넣어 탭 문자가
-    /// 버퍼에 들어가는지 본다.
-    ///
-    /// 앞선 테스트들은 `take_text_intents`/`collect_text_intents`를 따로
-    /// 불러서, 그 사이의 게이트(`editing` + `keyboard_free`)나 렌더 경로가
-    /// 막고 있어도 통과했다. 사용자가 "아직도 안 된다"고 한 것이 이 간극이다.
-    #[test]
-    fn tab_key_through_render_text_inserts_tab() {
-        let mut app = find_test_doc(&["ab"]);
-        {
-            let doc = app.doc_mut().unwrap();
-            doc.text_caret = crate::edit::TextPos { line: 0, col: 2 };
-        }
-        let ctx = egui::Context::default();
-        let mut clip = String::new();
-        let mut input = egui::RawInput::default();
-        input.events.push(egui::Event::Key {
-            key: egui::Key::Tab,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        });
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                render_text(ui, app.doc_mut().unwrap(), 0, &mut clip);
-            });
-        });
-        assert_eq!(
-            app.doc().unwrap().edit.as_ref().unwrap().lines,
-            v(&["ab	"]),
-            "Tab 을 누르면 탭 문자가 들어가야 한다"
-        );
-    }
-
-    /// **가설 검증**: 다른 위젯이 포커스를 쥔 상태에서 Tab을 누르면?
-    ///
-    /// 실제 앱에는 툴바/메뉴 등 포커스 가능한 위젯이 있다. Tab이 한 번
-    /// 그쪽으로 포커스를 옮기고 나면 `keyboard_free`가 거짓이 되어
-    /// `take_text_intents`가 아예 호출되지 않는다 — 그러면 그 뒤로 Tab은
-    /// 영원히 본문에 들어오지 못한다.
-    #[test]
-    fn tab_after_focus_moved_elsewhere() {
-        let mut app = find_test_doc(&["ab"]);
-        {
-            let doc = app.doc_mut().unwrap();
-            doc.text_caret = crate::edit::TextPos { line: 0, col: 2 };
-        }
-        let ctx = egui::Context::default();
-        let mut clip = String::new();
-        let other = egui::Id::new("toolbar_widget");
-
-        // 1프레임: 다른 위젯이 포커스를 가져간다(툴바 클릭 등).
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let r = ui.interact(
-                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0)),
-                    other,
-                    egui::Sense::click(),
-                );
-                r.request_focus();
-            });
-        });
-        assert_eq!(ctx.memory(|m| m.focused()), Some(other), "전제: 포커스가 밖에 있다");
-
-        // 2프레임: Tab.
-        let mut input = egui::RawInput::default();
-        input.events.push(egui::Event::Key {
-            key: egui::Key::Tab,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        });
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                render_text(ui, app.doc_mut().unwrap(), 0, &mut clip);
-            });
-        });
-        assert_eq!(
-            app.doc().unwrap().edit.as_ref().unwrap().lines,
-            v(&["ab	"]),
-            "포커스가 밖에 있어도 본문 편집 중이면 Tab은 탭 문자여야 한다"
-        );
-    }
-
     // ---- 저장 다이얼로그 확장자 목록 ----
 
     fn names(v: &[(&str, Vec<&str>)]) -> Vec<String> {
@@ -14842,5 +14875,58 @@ mod tests {
         let f = save_filters(std::path::Path::new("z:/x/a.tsv"), None);
         let (_, exts) = f.iter().find(|(n, _)| *n == "TSV").unwrap();
         assert!(exts.contains(&"tsv") && exts.contains(&"tab"), "{exts:?}");
+    }
+
+    /// **끝에서 끝까지 — 이 버그의 회귀 테스트.**
+    ///
+    /// 실제 `App::update`를 한 프레임 돌린다. 메뉴바가 본문보다 먼저 그려지는
+    /// 진짜 순서를 그대로 타므로, Tab 소비가 본문 렌더 안에 있으면(옛 구조)
+    /// 탭 문자는 들어가도 포커스가 File 메뉴로 넘어간다 — 사용자가 보고한
+    /// 바로 그 증상이다.
+    #[test]
+    fn tab_inserts_without_moving_focus_to_the_menu() {
+        let mut app = find_test_doc(&["ab"]);
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.text_caret = crate::edit::TextPos { line: 0, col: 2 };
+        }
+        let ctx = egui::Context::default();
+        // eframe::Frame 없이 update를 부를 수 없으므로 ctx.run 안에서
+        // App::update 를 직접 호출하는 대신, update 가 부르는 두 조각을
+        // **같은 순서**로 태운다: wants_tab_character(맨 앞) → 메뉴바 → 본문.
+        let mut clip = String::new();
+        let draw = |app: &mut App, clip: &mut String, input: egui::RawInput| {
+            let _ = ctx.run(input, |ctx| {
+                let tab_for_body = app.wants_tab_character(ctx);
+                egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+                    egui::menu::bar(ui, |ui| {
+                        ui.menu_button("File", |_ui| {});
+                    });
+                });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_text(ui, app.doc_mut().unwrap(), 0, clip, tab_for_body);
+                });
+                // update()가 UI를 다 그린 뒤 하는 일(같은 함수를 부른다).
+                release_focus_after_body_tab(ctx, tab_for_body);
+            });
+        };
+        draw(&mut app, &mut clip, Default::default());
+
+        let input = egui::RawInput {
+            events: vec![tab_event(egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        draw(&mut app, &mut clip, input);
+
+        assert_eq!(
+            app.doc().unwrap().edit.as_ref().unwrap().lines,
+            v(&["ab\t"]),
+            "탭 문자가 들어가야 하고"
+        );
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            None,
+            "포커스가 File 메뉴로 가면 안 된다"
+        );
     }
 }
