@@ -200,8 +200,7 @@ pub struct Document {
     pub show_errors_window: bool,
     /// Some이면 이 문서는 헥스 모드다. 텍스트 문서와 배타적이며 텍스트
     /// 관련 필드(sep, index, edit, …)는 헥스 문서에서 쓰이지 않는다.
-    /// 헥스 렌더링(뒤 태스크)이 읽기 시작하면 이 allow를 지운다.
-    #[allow(dead_code)]
+    /// CentralPanel 분기가 이 필드로 `render_hex` 경로를 고른다.
     pub hex: Option<crate::hex::HexState>,
 }
 
@@ -1763,12 +1762,19 @@ impl eframe::App for App {
         let data_frame = egui::Frame::central_panel(&ctx.style()).fill(crate::theme::data_bg());
         egui::CentralPanel::default().frame(data_frame).show(ctx, |ui| {
             let Some(doc) = doc_opt else { return };
-            match doc.sep {
-                SeparatorMode::Char(delim) => {
-                    render_table(ui, doc, delim, row_base, col_base, clipboard)
-                }
-                SeparatorMode::None => {
-                    render_text(ui, doc, row_base, clipboard, tab_for_body)
+            // 헥스 문서는 표/텍스트와 배타적인 **세 번째 렌더 경로**다. `sep`는
+            // 헥스 문서에서 의미가 없으므로(`hex_document`가 None으로 둔다)
+            // 구분자 분기보다 먼저 가른다.
+            if doc.hex.is_some() {
+                render_hex(ui, doc);
+            } else {
+                match doc.sep {
+                    SeparatorMode::Char(delim) => {
+                        render_table(ui, doc, delim, row_base, col_base, clipboard)
+                    }
+                    SeparatorMode::None => {
+                        render_text(ui, doc, row_base, clipboard, tab_for_body)
+                    }
                 }
             }
         });
@@ -7425,6 +7431,352 @@ fn render_text(
     }
 }
 
+/// 헥스 문서의 논리 길이. 편집 중이면 버퍼(삽입/삭제로 소스와 다르다).
+fn hex_doc_len(doc: &Document) -> u64 {
+    match doc.hex.as_ref().and_then(|h| h.edit.as_ref()) {
+        Some(e) => e.bytes.len() as u64,
+        None => doc.source.len(),
+    }
+}
+
+/// 한 행(32바이트)의 바이트. 마지막 행은 짧을 수 있고 범위 밖은 빈 Vec.
+fn hex_row_bytes(doc: &Document, row: u64) -> Vec<u8> {
+    let start = row * crate::hex::BYTES_PER_ROW as u64;
+    let end = start + crate::hex::BYTES_PER_ROW as u64;
+    match doc.hex.as_ref().and_then(|h| h.edit.as_ref()) {
+        Some(e) => {
+            let len = e.bytes.len() as u64;
+            let s = start.min(len) as usize;
+            let t = end.min(len).max(start.min(len)) as usize;
+            e.bytes[s..t].to_vec()
+        }
+        None => doc.source.slice(start, end).to_vec(),
+    }
+}
+
+/// abs 바이트가 선택 범위 안인가. sel은 (anchor, caret) 방향 무관.
+fn byte_selected(sel: Option<(u64, u64)>, abs: u64) -> bool {
+    match sel {
+        Some((a, b)) => {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            abs >= lo && abs < hi
+        }
+        None => false,
+    }
+}
+
+/// abs 바이트가 마지막 찾기 매치 안인가.
+fn byte_in_match(last_match: Option<(u64, usize)>, abs: u64) -> bool {
+    match last_match {
+        Some((o, n)) => abs >= o && abs < o + n as u64,
+        None => false,
+    }
+}
+
+/// 헥스 본문의 클릭 한 번이 남기는 인텐트. 테이블 클로저 안에서는 `doc`이
+/// 불변으로만 빌려지므로(표/텍스트 렌더와 같은 규율) 여기 모아 두었다가
+/// 클로저가 끝난 뒤 한 번에 적용한다.
+#[derive(Clone, Copy)]
+struct HexClick {
+    /// 캐럿을 놓을 절대 바이트 오프셋.
+    abs: u64,
+    /// 상위 니블인가(문자 패널은 항상 true).
+    high: bool,
+    pane: crate::hex::HexPane,
+    /// Shift(또는 드래그 계속) — 앵커를 유지한 채 캐럿만 옮긴다.
+    extend: bool,
+}
+
+/// 헥스 본문. 오프셋 | 16진수(32바이트) | ASCII 세 컬럼 고정폭.
+///
+/// 모노스페이스 고정폭이므로 클릭 x → 문자 컬럼 → 바이트 인덱스가 산술로
+/// 떨어진다(`hex_click_byte`/`ascii_click_byte`) — 텍스트 모드처럼 갤리
+/// 히트테스트가 필요 없다.
+///
+/// 표/텍스트 렌더와 같은 스캐폴딩을 쓴다: `TableBuilder` 가상 스크롤,
+/// `pending_scroll_row` → `vertical_scroll_offset` 즉시 점프
+/// (`scroll_offset_for_row` 주석), `first_visible_row`/`visible_rows` 관측
+/// 기록. 헤더가 없다는 점만 다르므로 스크롤 뷰포트 계산에서 헤더 한 줄을
+/// 빼지 않는다.
+fn render_hex(ui: &mut egui::Ui, doc: &mut Document) {
+    use crate::hex::{ascii_char, ascii_click_byte, hex_click_byte, BYTES_PER_ROW};
+    use std::cell::Cell;
+
+    // 찾기가 남긴 스크롤 요청(표/텍스트 모드와 같은 이유·같은 방법).
+    let scroll_to = doc.pending_scroll_row.take();
+    let scroll_align = doc.pending_scroll_align;
+
+    let len = hex_doc_len(doc);
+    let total_rows = crate::hex::row_count(len);
+    let off_w = crate::hex::offset_width(len);
+    let avail_height = ui.available_height();
+
+    // ---- 상태 스냅샷 ----
+    // 클로저 안에서 `doc`을 불변으로 빌려 바이트를 읽으므로, 캐럿/선택 같은
+    // 작은 Copy 값은 미리 꺼내 둔다(빌림 충돌 회피 + 프레임 내내 일관).
+    let (caret, sel, last_match, pane) = {
+        let h = doc.hex.as_ref().expect("render_hex는 헥스 문서에서만 불린다");
+        (h.caret, h.sel, h.last_match, h.pane)
+    };
+
+    let font = text_font_id();
+    let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
+    let text_color = ui.visuals().text_color();
+
+    // 세 컬럼 폭은 전부 `char_w` 배수 — 오프셋 자릿수, 바이트당 3문자
+    // ("4F "), 문자 패널 1문자. 여기가 어긋나면 클릭 산술이 글자와 어긋난다.
+    let offset_px = char_w * (off_w as f32 + 2.0);
+    let hex_px = char_w * (BYTES_PER_ROW as f32 * 3.0);
+    let ascii_px = char_w * (BYTES_PER_ROW as f32 + 2.0);
+
+    // 클로저 → 바깥 인텐트 통로(표/텍스트 렌더와 같은 규율).
+    let click: Cell<Option<HexClick>> = Cell::new(None);
+    let min_drawn_row: Cell<Option<usize>> = Cell::new(None);
+
+    let shift_down = ui.input(|i| i.modifiers.shift);
+    let spacing_y = ui.spacing().item_spacing.y;
+
+    let mut table = TableBuilder::new(ui)
+        .striped(false)
+        .auto_shrink([false, false])
+        .max_scroll_height(avail_height)
+        .column(Column::exact(offset_px))
+        .column(Column::exact(hex_px))
+        .column(Column::exact(ascii_px));
+    if let Some(row) = scroll_to {
+        let row = row.min((total_rows as usize).saturating_sub(1));
+        table = table.vertical_scroll_offset(scroll_offset_for_row(
+            row,
+            scroll_align,
+            ROW_HEIGHT,
+            spacing_y,
+            avail_height,
+        ));
+    }
+
+    table.body(|body| {
+        body.rows(ROW_HEIGHT, total_rows as usize, |mut table_row| {
+            let row = table_row.index();
+            min_drawn_row.set(Some(min_drawn_row.get().map_or(row, |m: usize| m.min(row))));
+            let row_start = row as u64 * BYTES_PER_ROW as u64;
+            let bytes = hex_row_bytes(doc, row as u64);
+
+            // ---- 오프셋 ----
+            table_row.col(|ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(crate::hex::format_offset(row as u64, off_w))
+                        .font(font.clone())
+                        .color(crate::theme::hex_offset_fg()),
+                ));
+            });
+
+            // ---- 16진수 — 바이트별 LayoutJob 섹션(선택/매치 배경) ----
+            table_row.col(|ui| {
+                let mut job = egui::text::LayoutJob::default();
+                for (i, b) in bytes.iter().enumerate() {
+                    let abs = row_start + i as u64;
+                    let bg = hex_byte_bg(sel, last_match, abs);
+                    job.append(
+                        &format!("{b:02X}"),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: font.clone(),
+                            color: text_color,
+                            background: bg,
+                            ..Default::default()
+                        },
+                    );
+                    // 바이트 사이 공백. 선택 안쪽이면 공백도 칠해야 음영이
+                    // 끊기지 않는다 — 마지막 선택 바이트 뒤는 칠하지 않는다.
+                    let gap_bg = if byte_selected(sel, abs) && byte_selected(sel, abs + 1) {
+                        bg
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    job.append(
+                        " ",
+                        0.0,
+                        egui::TextFormat {
+                            font_id: font.clone(),
+                            color: text_color,
+                            background: gap_bg,
+                            ..Default::default()
+                        },
+                    );
+                }
+                let resp = paint_hex_cell(ui, job, hex_px);
+                if let Some((col, extend)) = hex_cell_hit(&resp, char_w, shift_down) {
+                    if let Some((bi, high)) = hex_click_byte(col) {
+                        click.set(Some(HexClick {
+                            abs: (row_start + bi as u64).min(len),
+                            high,
+                            pane: crate::hex::HexPane::Hex,
+                            extend,
+                        }));
+                    }
+                }
+                // 캐럿 표시 — 두 자리 폭 테두리. 헥스 패널이 활성일 때만
+                // 실선, 아니면 흐린 테두리로 "여기 있다"만 알린다.
+                if caret.0 >= row_start && caret.0 < row_start + BYTES_PER_ROW as u64 {
+                    let bi = (caret.0 - row_start) as f32;
+                    let x = resp.rect.left() + char_w * bi * 3.0;
+                    paint_hex_caret(
+                        ui,
+                        egui::Rect::from_min_size(
+                            egui::pos2(x, resp.rect.top()),
+                            egui::vec2(char_w * 2.0, resp.rect.height()),
+                        ),
+                        pane == crate::hex::HexPane::Hex,
+                    );
+                }
+            });
+
+            // ---- ASCII — 같은 요령, 폭 1문자 ----
+            table_row.col(|ui| {
+                let mut job = egui::text::LayoutJob::default();
+                for (i, b) in bytes.iter().enumerate() {
+                    let abs = row_start + i as u64;
+                    job.append(
+                        &ascii_char(*b).to_string(),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: font.clone(),
+                            color: text_color,
+                            background: hex_byte_bg(sel, last_match, abs),
+                            ..Default::default()
+                        },
+                    );
+                }
+                let resp = paint_hex_cell(ui, job, ascii_px);
+                if let Some((col, extend)) = hex_cell_hit(&resp, char_w, shift_down) {
+                    if let Some(bi) = ascii_click_byte(col) {
+                        click.set(Some(HexClick {
+                            abs: (row_start + bi as u64).min(len),
+                            // 문자 패널은 니블 개념이 없다 — 상위로 고정해
+                            // 패널을 오갈 때 캐럿이 바이트 앞에 서게 한다.
+                            high: true,
+                            pane: crate::hex::HexPane::Ascii,
+                            extend,
+                        }));
+                    }
+                }
+                if caret.0 >= row_start && caret.0 < row_start + BYTES_PER_ROW as u64 {
+                    let bi = (caret.0 - row_start) as f32;
+                    let x = resp.rect.left() + char_w * bi;
+                    paint_hex_caret(
+                        ui,
+                        egui::Rect::from_min_size(
+                            egui::pos2(x, resp.rect.top()),
+                            egui::vec2(char_w, resp.rect.height()),
+                        ),
+                        pane == crate::hex::HexPane::Ascii,
+                    );
+                }
+            });
+        });
+    });
+
+    // ---- 클로저 종료 → doc 가변 대여 가능 ----
+
+    // Page Up/Down이 읽을 관측값(표/텍스트 렌더와 같은 통로).
+    if let Some(first) = min_drawn_row.get() {
+        doc.first_visible_row = first;
+    }
+    doc.visible_rows = hex_visible_row_count(avail_height);
+
+    // 클릭 한 번을 캐럿/선택에 반영. `extend`면 앵커를 유지하고 캐럿만 옮긴다.
+    if let Some(c) = click.get() {
+        let h = doc.hex.as_mut().expect("render_hex는 헥스 문서에서만 불린다");
+        if c.extend {
+            let anchor = h.sel.map(|(a, _)| a).unwrap_or(h.caret.0);
+            h.sel = if anchor == c.abs { None } else { Some((anchor, c.abs)) };
+        } else {
+            h.sel = None;
+        }
+        h.caret = (c.abs, c.high);
+        h.pane = c.pane;
+    }
+}
+
+/// 한 바이트 칸의 배경. 선택이 매치보다 우선한다(선택은 지금 조작 중인 것).
+fn hex_byte_bg(
+    sel: Option<(u64, u64)>,
+    last_match: Option<(u64, usize)>,
+    abs: u64,
+) -> egui::Color32 {
+    if byte_selected(sel, abs) {
+        sel_shade()
+    } else if byte_in_match(last_match, abs) {
+        crate::theme::hex_match_bg()
+    } else {
+        egui::Color32::TRANSPARENT
+    }
+}
+
+/// 헥스 본문 한 칸(LayoutJob)을 칸 폭 전체를 차지하는 클릭 대상으로 그린다.
+///
+/// `Label`의 응답 rect는 **글자가 실제로 찬 만큼**이라(마지막 행은 짧다)
+/// 그것으로 클릭을 받으면 짧은 행의 오른쪽 빈 자리가 죽는다. 대신 칸의
+/// 왼쪽 위에 글자를 그리고, 상호작용은 컬럼 폭 전체(`width`)로 따로 잡는다.
+fn paint_hex_cell(
+    ui: &mut egui::Ui,
+    job: egui::text::LayoutJob,
+    width: f32,
+) -> egui::Response {
+    let cell = ui.max_rect();
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let origin = egui::pos2(cell.left(), cell.center().y - galley.size().y * 0.5);
+    ui.painter().with_clip_rect(cell).galley(
+        origin,
+        galley,
+        ui.visuals().text_color(),
+    );
+    // 상호작용 rect는 글자 원점에서 시작해야 클릭 x → 문자 컬럼 산술이
+    // 맞는다(`hex_click_byte`는 글자 첫 칸을 0으로 본다).
+    let hit = egui::Rect::from_min_size(
+        egui::pos2(origin.x, cell.top()),
+        egui::vec2(width.min(cell.width()), cell.height()),
+    );
+    ui.interact(hit, ui.id().with("hexcell"), egui::Sense::click_and_drag())
+}
+
+/// 헥스/문자 칸의 포인터 상호작용 → (문자 컬럼, 선택 확장인가).
+/// 누름 시작·클릭·드래그 전부를 같은 통로로 받는다 — 드래그는 앵커를 유지해야
+/// 하므로 `extend`로 표시한다.
+fn hex_cell_hit(resp: &egui::Response, char_w: f32, shift_down: bool) -> Option<(usize, bool)> {
+    let pos = resp.interact_pointer_pos()?;
+    if !(resp.clicked() || resp.drag_started() || resp.dragged()) {
+        return None;
+    }
+    let col = ((pos.x - resp.rect.left()) / char_w).max(0.0) as usize;
+    // 새 누름(클릭/드래그 시작)은 앵커를 새로 잡고, 이어지는 드래그와
+    // Shift는 확장이다.
+    let extend = shift_down || (resp.dragged() && !resp.drag_started());
+    Some((col, extend))
+}
+
+/// 캐럿 테두리. 활성 패널은 accent 실선, 비활성 패널은 같은 색 옅은 선 —
+/// "캐럿이 어느 패널에 있나"가 한눈에 보여야 타이핑이 어디로 갈지 안다.
+fn paint_hex_caret(ui: &egui::Ui, rect: egui::Rect, active: bool) {
+    let c = crate::theme::accent();
+    let stroke = if active {
+        egui::Stroke::new(1.5, c)
+    } else {
+        egui::Stroke::new(1.0, c.gamma_multiply(0.4))
+    };
+    ui.painter().rect_stroke(rect, 0.0, stroke);
+}
+
+/// 헥스 본문의 한 화면 행 수. 표/텍스트와 달리 **헤더가 없으므로**
+/// `visible_row_count`처럼 한 줄을 빼지 않는다(빼면 Page Down이 한 행씩
+/// 덜 움직인다).
+fn hex_visible_row_count(avail_height: f32) -> usize {
+    if avail_height <= 0.0 {
+        return 0;
+    }
+    (avail_height / ROW_HEIGHT) as usize
+}
+
 /// 이번 프레임의 입력 이벤트에서 텍스트 편집 인텐트를 뽑는다.
 /// egui-winit은 Ctrl+C/X/V를 `Event::Copy`/`Cut`/`Paste`로 변환해 보내고
 /// `Key` 이벤트는 만들지 않으므로, 그 세 개는 이벤트로만 처리한다.
@@ -7804,9 +8156,6 @@ mod tests {
     }
 
     /// 메모리 바이트로 헥스 문서 탭 하나를 가진 App.
-    /// 이 태스크의 테스트는 아직 안 쓴다 — 헥스 렌더/편집을 다루는 뒤 태스크가
-    /// 소비하면 이 allow를 지운다.
-    #[allow(dead_code)]
     fn hex_test_doc(bytes: &[u8]) -> App {
         let mut app = App::default();
         let src = Arc::new(Source::from_bytes(bytes.to_vec()));
@@ -13742,6 +14091,158 @@ mod tests {
             app.doc().unwrap().pending_scroll_row,
             Some(19),
             "Page Down 키가 실제로 소비되어 페이지 이동이 일어난다"
+        );
+    }
+
+    // ---- 헥스 렌더 ----
+
+    /// 행 바이트 출처: 편집 전이면 mmap(소스), 편집 중이면 버퍼.
+    #[test]
+    fn hex_row_bytes_switches_source() {
+        let mut app = hex_test_doc(&[0x41; 40]); // 32 + 8바이트, 2행
+        {
+            let doc = app.doc().unwrap();
+            assert_eq!(hex_row_bytes(doc, 0).len(), 32);
+            assert_eq!(hex_row_bytes(doc, 1), vec![0x41; 8]);
+            assert_eq!(hex_row_bytes(doc, 9), Vec::<u8>::new(), "범위 밖 행은 빈 슬라이스");
+        }
+        let doc = app.doc_mut().unwrap();
+        let h = doc.hex.as_mut().unwrap();
+        h.edit = Some(crate::hex::HexEditBuffer::new(vec![0x42; 3]));
+        assert_eq!(hex_row_bytes(doc, 0), vec![0x42; 3], "편집 중이면 버퍼가 진실");
+        assert_eq!(hex_doc_len(doc), 3);
+    }
+
+    /// 헥스 문서는 CentralPanel에서 render_hex 분기를 타고 패닉 없이 그려진다.
+    #[test]
+    fn hex_render_smoke() {
+        let mut app = hex_test_doc(b"SQLite format 3\x00\x10\x00\x01\x01\x00\x40\x20\x20");
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let doc = app.doc_mut().unwrap();
+                render_hex(ui, doc);
+            });
+        });
+        // 그리기만으로 상태가 바뀌면 안 된다.
+        let doc = app.doc().unwrap();
+        let h = doc.hex.as_ref().unwrap();
+        assert!(h.edit.is_none());
+        assert_eq!(h.caret, (0, true));
+    }
+
+    /// 헥스 패널 클릭이 캐럿을 그 바이트로 옮긴다 — 클릭 산술
+    /// (`hex_click_byte`)이 실제 렌더 좌표계에 붙어 있는지를 고정한다.
+    /// (순수 함수 테스트만으로는 배선이 끊겨도 다 통과한다.)
+    #[test]
+    fn hex_click_moves_caret_to_that_byte() {
+        let mut app = hex_test_doc(&vec![0x41u8; 256]);
+        let ctx = egui::Context::default();
+        let base = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(900.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let draw = |app: &mut App, input: egui::RawInput| {
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_hex(ui, app.doc_mut().unwrap());
+                });
+            });
+        };
+        // 첫 프레임으로 레이아웃을 잡는다(위젯 rect가 생겨야 클릭이 닿는다).
+        draw(&mut app, base.clone());
+
+        // 첫 행 헥스 패널의 세 번째 바이트 첫 칸 근처를 누른다. 오프셋 컬럼
+        // 폭 + 바이트 2개 폭만큼 오른쪽 — 폭 계산은 렌더와 같은 식이다.
+        let font = text_font_id();
+        let char_w = ctx.fonts(|f| f.glyph_width(&font, '0'));
+        let off_w = crate::hex::offset_width(256);
+        let x = char_w * (off_w as f32 + 2.0) + char_w * 2.0 * 3.0 + char_w * 0.5;
+        let y = ROW_HEIGHT * 0.5;
+        let pos = egui::pos2(x + 8.0, y + 8.0); // CentralPanel 마진 여유
+        let click_input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..base.clone()
+        };
+        draw(&mut app, click_input);
+
+        let h = app.doc().unwrap().hex.as_ref().unwrap();
+        // 세 번째 바이트(인덱스 2)를 눌렀다. CentralPanel 마진 때문에 한 칸
+        // 오차는 허용하되, "옮겨지긴 했다" 수준이 아니라 그 언저리여야 한다.
+        assert!(
+            (1..=3).contains(&h.caret.0),
+            "눌린 바이트 근처로 캐럿이 가야 한다(got {:?})",
+            h.caret
+        );
+        assert_eq!(h.pane, crate::hex::HexPane::Hex, "클릭한 패널이 활성이 된다");
+        assert!(h.sel.is_none(), "Shift 없는 단순 클릭은 선택을 만들지 않는다");
+    }
+
+    /// 헥스도 `pending_scroll_row`를 소비하고 관측값을 기록해야 한다 —
+    /// 찾기(뒤 태스크)가 매치 행으로 점프하는 길이 이 한 바퀴다.
+    /// (`render_records_first_visible_row_and_page_size`의 헥스판.)
+    #[test]
+    fn hex_render_consumes_scroll_request_and_records_observation() {
+        // 500행 = 16000바이트.
+        let mut app = hex_test_doc(&vec![0x41u8; 500 * 32]);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(600.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let draw = |app: &mut App| {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_hex(ui, app.doc_mut().unwrap());
+                });
+            });
+        };
+        draw(&mut app);
+        {
+            let doc = app.doc().unwrap();
+            assert_eq!(doc.first_visible_row, 0, "처음에는 맨 위를 보고 있다");
+            assert!(
+                doc.visible_rows > 0 && doc.visible_rows < 100,
+                "작은 창의 한 화면 행 수가 기록되어야 한다(got {})",
+                doc.visible_rows
+            );
+        }
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.pending_scroll_row = Some(200);
+            doc.pending_scroll_align = egui::Align::TOP;
+        }
+        draw(&mut app); // 스크롤 적용
+        assert_eq!(
+            app.doc().unwrap().pending_scroll_row,
+            None,
+            "요청은 한 번 쓰이고 소비된다(매 프레임 되돌아가면 안 된다)"
+        );
+        draw(&mut app); // 그 자리를 관측
+        let first = app.doc().unwrap().first_visible_row;
+        assert!(
+            (199..=200).contains(&first),
+            "요청한 행 언저리를 보고 있어야 한다(got {first})"
         );
     }
 

@@ -43,6 +43,24 @@ pub fn ascii_char(b: u8) -> char {
     }
 }
 
+/// 헥스 패널의 문자 컬럼 → (바이트 인덱스, 상위 니블). 바이트 i는
+/// "4F " 세 문자 [3i, 3i+3)를 차지한다. 공백 클릭은 하위 니블 취급 —
+/// 다음 바이트로 넘기면 바이트 사이 공백 클릭이 오른쪽으로 튀어 어색하다.
+pub fn hex_click_byte(char_col: usize) -> Option<(usize, bool)> {
+    let byte = char_col / 3;
+    if byte >= BYTES_PER_ROW {
+        return None;
+    }
+    // 세 문자 중 첫 칸("4"의 자리)만 상위 니블. 나머지 둘(하위 자리·공백)은
+    // 하위 니블이다. (`% 3 == 0`과 같은 뜻 — clippy가 이 형태를 권한다.)
+    Some((byte, char_col.is_multiple_of(3)))
+}
+
+/// 문자 패널의 문자 컬럼 → 바이트 인덱스(1문자 = 1바이트).
+pub fn ascii_click_byte(char_col: usize) -> Option<usize> {
+    (char_col < BYTES_PER_ROW).then_some(char_col)
+}
+
 /// 니블 타이핑: high면 상위 4비트, 아니면 하위 4비트를 바꾼 바이트.
 pub fn apply_nibble(byte: u8, high: bool, nibble: u8) -> u8 {
     if high {
@@ -294,6 +312,26 @@ mod tests {
         assert_eq!(apply_nibble(0xFF, false, 0x0), 0xF0);
         assert_eq!(apply_nibble(0x12, true, 0x3), 0x32);
         assert_eq!(apply_nibble(0x12, false, 0x3), 0x13);
+    }
+
+    // ---- 클릭 산술 ----
+
+    #[test]
+    fn hex_click_byte_maps_columns() {
+        // 바이트 i는 문자 컬럼 [3i, 3i+3) — "4F " 두 자리 + 공백.
+        assert_eq!(hex_click_byte(0), Some((0, true)));   // 상위 니블
+        assert_eq!(hex_click_byte(1), Some((0, false)));  // 하위 니블
+        assert_eq!(hex_click_byte(2), Some((0, false)));  // 공백은 그 바이트 하위로
+        assert_eq!(hex_click_byte(3), Some((1, true)));
+        assert_eq!(hex_click_byte(95), Some((31, false))); // 마지막 바이트 끝
+        assert_eq!(hex_click_byte(96), None, "행 폭 밖");
+    }
+
+    #[test]
+    fn ascii_click_byte_maps_columns() {
+        assert_eq!(ascii_click_byte(0), Some(0));
+        assert_eq!(ascii_click_byte(31), Some(31));
+        assert_eq!(ascii_click_byte(32), None);
     }
 
     // ---- 찾기 입력 해석 ----

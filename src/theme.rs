@@ -104,6 +104,21 @@ pub fn find_marker() -> Color32 {
     Color32::from_rgba_unmultiplied(150, 70, 200, 200)
 }
 
+/// 헥스 뷰 오프셋 컬럼 글자색. 본문과 구분되는 회청색.
+pub fn hex_offset_fg() -> Color32 {
+    Color32::from_rgb(120, 130, 145)
+}
+
+/// 헥스 찾기 매치 배경. 텍스트 하이라이트(`find_match_bg`)와 같은 계열이되
+/// 함수를 분리해 둔다 — 헥스 패널은 순백 위 고정폭 두 자리라 텍스트 본문과
+/// 대비 조건이 달라 조정 지점이 따로 필요하다.
+///
+/// `TextFormat::background`는 알파 합성 없이 그대로 칠해지므로(`find_match_bg`
+/// 처럼 반투명을 쓰면 글자 뒤가 탁해진다) 불투명한 옅은 노랑을 쓴다.
+pub fn hex_match_bg() -> Color32 {
+    Color32::from_rgb(255, 235, 160)
+}
+
 /// 폰트 후보를 순서대로 시도해 처음 읽히는 것을 등록하고 그 키를 돌려준다.
 /// 못 읽으면 `None`(해당 폰트는 건너뛴다 — 크래시 없음).
 fn load_font(fonts: &mut FontDefinitions, key: &str, paths: &[&str]) -> Option<String> {
