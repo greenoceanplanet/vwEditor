@@ -1766,7 +1766,7 @@ impl eframe::App for App {
             // 헥스 문서에서 의미가 없으므로(`hex_document`가 None으로 둔다)
             // 구분자 분기보다 먼저 가른다.
             if doc.hex.is_some() {
-                render_hex(ui, doc);
+                render_hex(ui, doc, clipboard);
             } else {
                 match doc.sep {
                     SeparatorMode::Char(delim) => {
@@ -1836,6 +1836,11 @@ impl eframe::App for App {
             render_confirm_discard_dialog(ctx, self);
         }
 
+        // 대형 바이너리의 편집 진입 확인.
+        if self.doc().is_some_and(|d| d.hex.as_ref().is_some_and(|h| h.confirm_load)) {
+            render_confirm_hex_load_dialog(ctx, self);
+        }
+
         // 대상 행이 아주 많은 컬럼 연산 확인 다이얼로그.
         if self
             .doc()
@@ -1872,9 +1877,8 @@ impl eframe::App for App {
 
         // Ctrl+Z — 되돌리기(편집 모드 전용). 인라인 셀 편집 중이거나 다른
         // 위젯이 포커스를 쥐고 있으면(툴바 TextEdit 등) 그쪽에 양보한다.
-        let can_undo_key = self.doc().map_or(false, |d| {
-            d.edit.is_some() && d.editing_cell.is_none()
-        }) && self.pending_action.is_none()
+        let can_undo_key = self.doc().is_some_and(can_undo_text)
+            && self.pending_action.is_none()
             && !self.show_save_dialog
             && ctx.memory(|m| m.focused().is_none());
         if can_undo_key
@@ -7498,7 +7502,7 @@ struct HexClick {
 /// (`scroll_offset_for_row` 주석), `first_visible_row`/`visible_rows` 관측
 /// 기록. 헤더가 없다는 점만 다르므로 스크롤 뷰포트 계산에서 헤더 한 줄을
 /// 빼지 않는다.
-fn render_hex(ui: &mut egui::Ui, doc: &mut Document) {
+fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
     use crate::hex::{ascii_char, ascii_click_byte, hex_click_byte, BYTES_PER_ROW};
     use std::cell::Cell;
 
@@ -7535,6 +7539,21 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document) {
 
     let shift_down = ui.input(|i| i.modifiers.shift);
     let spacing_y = ui.spacing().item_spacing.y;
+
+    // 키 입력은 프레임당 한 번, 표/텍스트와 **같은 게이트 규율**로 읽는다:
+    // 다른 위젯(툴바 TextEdit, 찾기 입력란 등)이 키보드 포커스를 쥐고 있으면
+    // 그쪽에 양보한다. 그렇지 않으면 찾기 입력란에 친 "de"가 본문 바이트를
+    // 덮어쓴다. 확인 다이얼로그가 떠 있는 동안도 마찬가지로 양보한다 —
+    // 그 창의 버튼이 키를 받아야 한다.
+    let dialog_open = doc.hex.as_ref().is_some_and(|h| h.confirm_load);
+    let keyboard_free = ui.ctx().memory(|m| m.focused().is_none());
+    let intents: Vec<HexIntent> = if keyboard_free && !dialog_open {
+        let pane_now = pane;
+        let rows = hex_visible_row_count(avail_height);
+        ui.input(|i| collect_hex_intents(i, pane_now, rows))
+    } else {
+        Vec::new()
+    };
 
     let mut table = TableBuilder::new(ui)
         .striped(false)
@@ -7696,6 +7715,20 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document) {
         h.caret = (c.abs, c.high);
         h.pane = c.pane;
     }
+
+    // 키 입력 인텐트 적용. 클릭 **뒤**라야 같은 프레임의 "클릭해 놓고 타이핑"이
+    // 옮겨진 캐럿에서 시작한다.
+    let want_copy = intents.contains(&HexIntent::Copy);
+    for intent in intents {
+        apply_hex_intent(doc, clipboard, intent);
+    }
+    // 복사는 캐시(`clipboard_cache`)와 OS 클립보드를 겸한다 — 표/텍스트 모드의
+    // 복사와 같은 방식이다. `apply_hex_intent`는 egui를 모르는 순수 함수라
+    // OS 쪽 쓰기만 여기서 한다.
+    if want_copy && !clipboard.is_empty() {
+        let text = clipboard.clone();
+        ui.output_mut(|o| o.copied_text = text);
+    }
 }
 
 /// 한 바이트 칸의 배경. 선택이 매치보다 우선한다(선택은 지금 조작 중인 것).
@@ -7775,6 +7808,377 @@ fn hex_visible_row_count(avail_height: f32) -> usize {
         return 0;
     }
     (avail_height / ROW_HEIGHT) as usize
+}
+
+/// 전역 Ctrl+Z(텍스트 되돌리기)가 이 문서에서 발동해도 되는가.
+///
+/// **헥스 문서에서는 반드시 거짓이어야 한다.** 헥스의 Ctrl+Z는
+/// `collect_hex_intents`가 `HexIntent::Undo`로 받으므로, 여기서도 참이면 한 번
+/// 누른 undo가 두 경로에서 두 번 일어난다. 조건이 `d.edit`(텍스트 편집 버퍼)인
+/// 덕에 저절로 갈리지만, 그 성질을 함수로 뽑아 테스트로 박아 둔다.
+fn can_undo_text(d: &Document) -> bool {
+    d.edit.is_some() && d.editing_cell.is_none()
+}
+
+/// 헥스 본문의 키 입력 한 건. 클릭(`HexClick`)과 같은 이유로 인텐트로
+/// 모았다가 렌더 클로저 밖에서 적용한다.
+#[derive(Debug, Clone, PartialEq)]
+enum HexIntent {
+    /// 상대 이동(바이트 단위). `extend`면 선택을 늘린다.
+    Move { delta: i64, extend: bool },
+    /// 절대 이동. 찾기가 매치 오프셋으로 캐럿을 옮길 때 쓴다 —
+    /// 지금은 테스트만 만든다. // Task 7이 소비하면 제거
+    #[allow(dead_code)]
+    MoveTo { offset: u64, extend: bool },
+    /// 행 시작/행 마지막 바이트.
+    MoveHome { extend: bool },
+    MoveEnd { extend: bool },
+    /// 문서 처음/끝(끝 = len, 삽입 지점).
+    MoveDocStart { extend: bool },
+    MoveDocEnd { extend: bool },
+    /// 헥스 패널의 16진수 한 글자.
+    Nibble(u8),
+    /// 문자 패널의 글자(한글은 UTF-8 여러 바이트).
+    Ascii(String),
+    DeleteForward,
+    Backspace,
+    ToggleInsert,
+    Copy,
+    Paste(String),
+    Undo,
+    Redo,
+    /// Escape — 선택만 지운다.
+    ClearSelection,
+}
+
+/// 512MB 초과면 확인이 필요하다. (실파일로 테스트할 수 없어 뽑아 둔 순수 가드.)
+fn hex_load_needs_confirm(len: u64) -> bool {
+    len > crate::hex::HEX_EDIT_CONFIRM_BYTES
+}
+
+/// 정규화된 선택 범위 [lo, hi). 빈 선택은 None — 역방향 선택도 여기서 편다.
+fn hex_selection_range(h: &crate::hex::HexState) -> Option<(u64, u64)> {
+    let (a, b) = h.sel?;
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    (lo < hi).then_some((lo, hi))
+}
+
+/// 편집 버퍼를 보장한다. 이미 있으면 true, 작으면 로드 후 true,
+/// 크면 `confirm_load`만 세우고 false(그 조작은 버려진다 — 스펙).
+fn ensure_hex_edit(doc: &mut Document) -> bool {
+    let len = doc.source.len();
+    let bytes = if doc.hex.as_ref().is_some_and(|h| h.edit.is_none()) && !hex_load_needs_confirm(len)
+    {
+        Some(doc.source.as_bytes().to_vec())
+    } else {
+        None
+    };
+    let Some(h) = doc.hex.as_mut() else { return false };
+    if h.edit.is_some() {
+        return true;
+    }
+    match bytes {
+        Some(b) => {
+            h.edit = Some(crate::hex::HexEditBuffer::new(b));
+            true
+        }
+        None => {
+            h.confirm_load = true;
+            false
+        }
+    }
+}
+
+/// 인텐트 하나를 헥스 문서에 적용한다. 편집 인텐트는 `ensure_hex_edit`로
+/// 메모리 승격을 먼저 거치고, 승격이 확인 대기로 막히면 그 조작은 버린다.
+fn apply_hex_intent(doc: &mut Document, clipboard: &mut String, intent: HexIntent) {
+    let len = hex_doc_len(doc);
+    let row_bytes = crate::hex::BYTES_PER_ROW as u64;
+
+    // ---- 이동 계열: 승격 없이 캐럿/선택만 만진다 ----
+    let target = match &intent {
+        HexIntent::Move { delta, .. } => {
+            let cur = doc.hex.as_ref().map_or(0, |h| h.caret.0) as i64;
+            Some((cur.saturating_add(*delta).max(0) as u64).min(len))
+        }
+        HexIntent::MoveTo { offset, .. } => Some((*offset).min(len)),
+        HexIntent::MoveHome { .. } => {
+            let cur = doc.hex.as_ref().map_or(0, |h| h.caret.0);
+            Some(cur - cur % row_bytes)
+        }
+        HexIntent::MoveEnd { .. } => {
+            let cur = doc.hex.as_ref().map_or(0, |h| h.caret.0);
+            // 행의 마지막 **바이트**. 문서 끝 행은 짧을 수 있고, 빈 문서는 0.
+            let row_last = cur - cur % row_bytes + row_bytes - 1;
+            Some(row_last.min(len.saturating_sub(1)))
+        }
+        HexIntent::MoveDocStart { .. } => Some(0),
+        HexIntent::MoveDocEnd { .. } => Some(len),
+        _ => None,
+    };
+    if let Some(abs) = target {
+        let extend = match &intent {
+            HexIntent::Move { extend, .. }
+            | HexIntent::MoveTo { extend, .. }
+            | HexIntent::MoveHome { extend }
+            | HexIntent::MoveEnd { extend }
+            | HexIntent::MoveDocStart { extend }
+            | HexIntent::MoveDocEnd { extend } => *extend,
+            _ => false,
+        };
+        let Some(h) = doc.hex.as_mut() else { return };
+        if extend {
+            // 앵커는 확장이 시작되기 **전** 위치다 — 클릭 확장(`HexClick`)과
+            // 같은 규칙이라 마우스/키보드 선택이 어긋나지 않는다.
+            let anchor = h.sel.map(|(a, _)| a).unwrap_or(h.caret.0);
+            h.sel = if anchor == abs { None } else { Some((anchor, abs)) };
+        } else {
+            h.sel = None;
+        }
+        h.caret = (abs, true);
+        return;
+    }
+
+    match intent {
+        HexIntent::ClearSelection => {
+            if let Some(h) = doc.hex.as_mut() {
+                h.sel = None;
+            }
+        }
+        // 상태 플래그일 뿐이라 승격이 필요 없다.
+        HexIntent::ToggleInsert => {
+            if let Some(h) = doc.hex.as_mut() {
+                h.insert_mode = !h.insert_mode;
+            }
+        }
+        // 복사는 읽기다 — 승격시키지 않는다(GB급 파일에서 복사 한 번에 전체
+        // 로드가 일어나면 안 된다).
+        HexIntent::Copy => {
+            let Some(h) = doc.hex.as_ref() else { return };
+            let Some((lo, hi)) = hex_selection_range(h) else { return };
+            let text = match h.edit.as_ref() {
+                Some(e) => hex_join(&e.bytes[(lo as usize).min(e.bytes.len())..(hi as usize).min(e.bytes.len())]),
+                None => hex_join(doc.source.slice(lo, hi)),
+            };
+            *clipboard = text;
+        }
+        HexIntent::Undo | HexIntent::Redo => {
+            let is_undo = intent == HexIntent::Undo;
+            let Some(h) = doc.hex.as_mut() else { return };
+            let Some(e) = h.edit.as_mut() else { return };
+            let pos = if is_undo { e.undo() } else { e.redo() };
+            if let Some(p) = pos {
+                let cap = e.bytes.len() as u64;
+                h.caret = (p.min(cap), true);
+                h.sel = None;
+            }
+        }
+        HexIntent::Nibble(_)
+        | HexIntent::Ascii(_)
+        | HexIntent::Paste(_)
+        | HexIntent::DeleteForward
+        | HexIntent::Backspace => {
+            // 붙여넣기는 해석 실패면 아무 일도 아니다 — 승격보다 먼저 판정해
+            // 확인 다이얼로그가 헛되이 뜨지 않게 한다.
+            let pane = doc.hex.as_ref().map(|h| h.pane);
+            let paste_bytes = match (&intent, pane) {
+                (HexIntent::Paste(s), Some(crate::hex::HexPane::Hex)) => {
+                    match crate::hex::parse_hex_query(s) {
+                        Some(b) => Some(b),
+                        None => return,
+                    }
+                }
+                (HexIntent::Paste(s), _) => Some(s.as_bytes().to_vec()),
+                _ => None,
+            };
+            if !ensure_hex_edit(doc) {
+                return;
+            }
+            let Some(h) = doc.hex.as_mut() else { return };
+            let insert_mode = h.insert_mode;
+            let sel = hex_selection_range(h);
+            let Some(e) = h.edit.as_mut() else { return };
+
+            // 선택이 있으면 어느 편집이든 먼저 지우고 그 자리에서 시작한다
+            // (텍스트 편집과 같은 관행).
+            let mut caret = h.caret;
+            if let Some((lo, hi)) = sel {
+                e.delete_range(lo, hi);
+                caret = (lo, true);
+                h.sel = None;
+            }
+            let buf_len = e.bytes.len() as u64;
+
+            match intent {
+                HexIntent::Nibble(n) => {
+                    if caret.0 >= buf_len {
+                        // 파일 끝에는 덮어쓸 바이트가 없다 — 삽입 모드와 무관하게 삽입.
+                        e.insert(buf_len, &[n << 4]);
+                        caret = (buf_len, false);
+                    } else if insert_mode && caret.1 {
+                        e.insert(caret.0, &[n << 4]);
+                        caret.1 = false;
+                    } else {
+                        let cur = e.bytes[caret.0 as usize];
+                        e.overwrite(caret.0, &[crate::hex::apply_nibble(cur, caret.1, n)]);
+                        caret = if caret.1 { (caret.0, false) } else { (caret.0 + 1, true) };
+                    }
+                }
+                HexIntent::Ascii(s) => {
+                    let b = s.as_bytes();
+                    if b.is_empty() {
+                        return;
+                    }
+                    if insert_mode {
+                        e.insert(caret.0, b);
+                    } else {
+                        e.overwrite(caret.0, b);
+                    }
+                    caret = (caret.0 + b.len() as u64, true);
+                }
+                HexIntent::Paste(_) => {
+                    let b = paste_bytes.unwrap_or_default();
+                    if b.is_empty() {
+                        return;
+                    }
+                    // 붙여넣기는 관행상 **삽입**이다(스펙).
+                    e.insert(caret.0, &b);
+                    caret = (caret.0 + b.len() as u64, true);
+                }
+                HexIntent::DeleteForward => {
+                    if sel.is_none() {
+                        if caret.0 >= buf_len {
+                            return; // 끝에서 Delete는 no-op
+                        }
+                        e.delete_range(caret.0, caret.0 + 1);
+                    }
+                    caret.1 = true;
+                }
+                HexIntent::Backspace => {
+                    if sel.is_none() {
+                        if caret.0 == 0 {
+                            return; // 처음에서 Backspace는 no-op
+                        }
+                        e.delete_range(caret.0 - 1, caret.0);
+                        caret = (caret.0 - 1, true);
+                    } else {
+                        caret.1 = true;
+                    }
+                }
+                _ => unreachable!("이 갈래는 편집 인텐트만 온다"),
+            }
+            h.caret = caret;
+        }
+        // 위 이동 분기에서 이미 처리하고 반환했다.
+        HexIntent::Move { .. }
+        | HexIntent::MoveTo { .. }
+        | HexIntent::MoveHome { .. }
+        | HexIntent::MoveEnd { .. }
+        | HexIntent::MoveDocStart { .. }
+        | HexIntent::MoveDocEnd { .. } => unreachable!("이동은 위에서 끝낸다"),
+    }
+}
+
+/// 복사 형식 — `"4F 4B"`. 참고 UI와 같은 대문자 공백 조인이다.
+fn hex_join(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+}
+
+/// 이번 프레임의 입력 이벤트에서 헥스 편집 인텐트를 뽑는다. 순수 함수 —
+/// 패널(`pane`)과 한 화면 행 수(`visible_rows`)를 받아 `Event::Text`를 가르고
+/// Page 키의 폭을 정한다. (`collect_text_intents`와 같은 규율.)
+fn collect_hex_intents(
+    i: &egui::InputState,
+    pane: crate::hex::HexPane,
+    visible_rows: usize,
+) -> Vec<HexIntent> {
+    let row = crate::hex::BYTES_PER_ROW as i64;
+    let page = row * visible_rows.max(1) as i64;
+    let mut out = Vec::new();
+    for ev in &i.events {
+        match ev {
+            egui::Event::Text(t) if !t.is_empty() => match pane {
+                // 헥스 패널은 16진수 한 글자 = 니블 하나. 그 밖의 글자는 버린다.
+                crate::hex::HexPane::Hex => {
+                    for c in t.chars() {
+                        if let Some(d) = c.to_digit(16) {
+                            out.push(HexIntent::Nibble(d as u8));
+                        }
+                    }
+                }
+                crate::hex::HexPane::Ascii => out.push(HexIntent::Ascii(t.clone())),
+            },
+            // IME 확정 문자(한글 등)는 문자 패널에서만 의미가 있다.
+            egui::Event::Ime(egui::ImeEvent::Commit(t))
+                if !t.is_empty() && pane == crate::hex::HexPane::Ascii =>
+            {
+                out.push(HexIntent::Ascii(t.clone()));
+            }
+            egui::Event::Copy => out.push(HexIntent::Copy),
+            // 헥스에는 "잘라내기"를 두지 않는다 — 복사 후 삭제는 두 조작이
+            // 명확하고, Cut을 삭제로 오해하면 되돌릴 수 없는 바이너리가 상한다.
+            egui::Event::Paste(s) => out.push(HexIntent::Paste(s.clone())),
+            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                let shift = modifiers.shift;
+                let ctrl = modifiers.ctrl || modifiers.command;
+                match key {
+                    egui::Key::ArrowLeft => out.push(HexIntent::Move { delta: -1, extend: shift }),
+                    egui::Key::ArrowRight => out.push(HexIntent::Move { delta: 1, extend: shift }),
+                    egui::Key::ArrowUp => out.push(HexIntent::Move { delta: -row, extend: shift }),
+                    egui::Key::ArrowDown => out.push(HexIntent::Move { delta: row, extend: shift }),
+                    egui::Key::PageUp => out.push(HexIntent::Move { delta: -page, extend: shift }),
+                    egui::Key::PageDown => out.push(HexIntent::Move { delta: page, extend: shift }),
+                    // Ctrl+Home/End는 문서 처음/끝(에디터 관행).
+                    egui::Key::Home if ctrl => out.push(HexIntent::MoveDocStart { extend: shift }),
+                    egui::Key::End if ctrl => out.push(HexIntent::MoveDocEnd { extend: shift }),
+                    egui::Key::Home => out.push(HexIntent::MoveHome { extend: shift }),
+                    egui::Key::End => out.push(HexIntent::MoveEnd { extend: shift }),
+                    egui::Key::Delete => out.push(HexIntent::DeleteForward),
+                    egui::Key::Backspace => out.push(HexIntent::Backspace),
+                    egui::Key::Insert => out.push(HexIntent::ToggleInsert),
+                    egui::Key::Escape => out.push(HexIntent::ClearSelection),
+                    // Ctrl+Z/Y. 전역 Ctrl+Z 처리는 텍스트 편집 버퍼에만 걸리므로
+                    // (`can_undo_text`) 헥스에서 두 번 소비될 일이 없다.
+                    egui::Key::Z if ctrl && shift => out.push(HexIntent::Redo),
+                    egui::Key::Z if ctrl => out.push(HexIntent::Undo),
+                    egui::Key::Y if ctrl => out.push(HexIntent::Redo),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 512MB 초과 파일의 메모리 로드 확인. "Load"면 그 자리에서 로드한다.
+fn render_confirm_hex_load_dialog(ctx: &egui::Context, app: &mut App) {
+    let len = app.doc().map_or(0, |d| d.source.len());
+    egui::Window::new("Load Entire File?")
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(crate::theme::chrome_text(format!(
+                "Editing loads the entire file into memory ({:.1} MB). Continue?",
+                len as f64 / 1e6
+            )));
+            ui.horizontal(|ui| {
+                if ui.button("Load").clicked() {
+                    if let Some(doc) = app.doc_mut() {
+                        let bytes = doc.source.as_bytes().to_vec();
+                        if let Some(h) = doc.hex.as_mut() {
+                            h.edit = Some(crate::hex::HexEditBuffer::new(bytes));
+                            h.confirm_load = false;
+                        }
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    if let Some(h) = app.doc_mut().and_then(|d| d.hex.as_mut()) {
+                        h.confirm_load = false;
+                    }
+                }
+            });
+        });
 }
 
 /// 이번 프레임의 입력 이벤트에서 텍스트 편집 인텐트를 뽑는다.
@@ -14121,7 +14525,7 @@ mod tests {
         let _ = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let doc = app.doc_mut().unwrap();
-                render_hex(ui, doc);
+                render_hex(ui, doc, &mut String::new());
             });
         });
         // 그리기만으로 상태가 바뀌면 안 된다.
@@ -14148,7 +14552,7 @@ mod tests {
         let draw = |app: &mut App, input: egui::RawInput| {
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    render_hex(ui, app.doc_mut().unwrap());
+                    render_hex(ui, app.doc_mut().unwrap(), &mut String::new());
                 });
             });
         };
@@ -14213,7 +14617,7 @@ mod tests {
         let draw = |app: &mut App| {
             let _ = ctx.run(input.clone(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    render_hex(ui, app.doc_mut().unwrap());
+                    render_hex(ui, app.doc_mut().unwrap(), &mut String::new());
                 });
             });
         };
@@ -14243,6 +14647,311 @@ mod tests {
         assert!(
             (199..=200).contains(&first),
             "요청한 행 언저리를 보고 있어야 한다(got {first})"
+        );
+    }
+
+    // ---- 헥스 편집 ----
+
+    /// 편집 조작이 오면 뷰 → 편집으로 승격되고 조작이 적용된다.
+    #[test]
+    fn first_edit_promotes_to_memory() {
+        let mut app = hex_test_doc(&[0x00, 0x11, 0x22]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0xF));
+        let h = doc.hex.as_ref().unwrap();
+        let e = h.edit.as_ref().expect("승격됨");
+        assert_eq!(e.bytes, vec![0xF0, 0x11, 0x22], "상위 니블 먼저");
+        assert_eq!(h.caret, (0, false), "니블 하나 전진");
+        assert!(e.dirty);
+    }
+
+    /// 니블 두 번 = 바이트 완성, 캐럿이 다음 바이트로.
+    #[test]
+    fn two_nibbles_complete_a_byte() {
+        let mut app = hex_test_doc(&[0x00, 0x11]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0xA));
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0xB));
+        assert_eq!(
+            doc.hex.as_ref().unwrap().edit.as_ref().unwrap().bytes,
+            vec![0xAB, 0x11]
+        );
+        assert_eq!(doc.hex.as_ref().unwrap().caret, (1, true));
+    }
+
+    /// 문자 패널 입력: ASCII는 1바이트, 한글은 UTF-8 3바이트 덮어쓰기.
+    #[test]
+    fn ascii_pane_typing_overwrites_utf8_bytes() {
+        let mut app = hex_test_doc(&[0x61, 0x62, 0x63, 0x64]);
+        let doc = app.doc_mut().unwrap();
+        doc.hex.as_mut().unwrap().pane = crate::hex::HexPane::Ascii;
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Ascii("한".into()));
+        let e = doc.hex.as_ref().unwrap().edit.as_ref().unwrap();
+        assert_eq!(&e.bytes[..3], "한".as_bytes());
+        assert_eq!(e.bytes[3], 0x64);
+        assert_eq!(doc.hex.as_ref().unwrap().caret, (3, true), "쓴 바이트 수만큼 전진");
+    }
+
+    /// 선택 삭제 — 중간을 훅 지우는 사용자 시나리오.
+    #[test]
+    fn delete_selection_removes_middle() {
+        let mut app = hex_test_doc(&[1, 2, 3, 4, 5]);
+        let doc = app.doc_mut().unwrap();
+        doc.hex.as_mut().unwrap().sel = Some((3, 1)); // 역방향 선택도 정규화
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::DeleteForward);
+        let e = doc.hex.as_ref().unwrap().edit.as_ref().unwrap();
+        assert_eq!(e.bytes, vec![1, 4, 5]);
+        assert_eq!(doc.hex.as_ref().unwrap().caret, (1, true));
+        assert!(doc.hex.as_ref().unwrap().sel.is_none());
+    }
+
+    /// 삽입 모드에서 니블 입력은 새 바이트를 끼워 넣는다.
+    #[test]
+    fn insert_mode_inserts_new_byte() {
+        let mut app = hex_test_doc(&[0xAA, 0xBB]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::ToggleInsert);
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0x1));
+        let e = doc.hex.as_ref().unwrap().edit.as_ref().unwrap();
+        assert_eq!(e.bytes, vec![0x10, 0xAA, 0xBB], "새 바이트 삽입, 하위 니블 대기");
+        assert_eq!(doc.hex.as_ref().unwrap().caret, (0, false));
+    }
+
+    /// Ctrl+Z / Ctrl+Y가 버퍼를 되돌리고 캐럿을 옮긴다.
+    #[test]
+    fn hex_undo_redo_moves_caret() {
+        let mut app = hex_test_doc(&[1, 2, 3]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        doc.hex.as_mut().unwrap().caret = (2, true);
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0xF));
+        apply_hex_intent(doc, &mut clip, HexIntent::Undo);
+        let h = doc.hex.as_ref().unwrap();
+        assert_eq!(h.edit.as_ref().unwrap().bytes, vec![1, 2, 3]);
+        assert_eq!(h.caret, (2, true), "되돌린 자리로");
+        apply_hex_intent(app.doc_mut().unwrap(), &mut clip, HexIntent::Redo);
+        assert_eq!(
+            app.doc().unwrap().hex.as_ref().unwrap().edit.as_ref().unwrap().bytes,
+            vec![1, 2, 0xF3]
+        );
+    }
+
+    /// Ctrl+C: 선택 구간을 "4F 4B" 형식으로 클립보드에.
+    #[test]
+    fn hex_copy_formats_selection() {
+        let mut app = hex_test_doc(&[0x4F, 0x4B, 0x00]);
+        let doc = app.doc_mut().unwrap();
+        doc.hex.as_mut().unwrap().sel = Some((0, 2));
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Copy);
+        assert_eq!(clip, "4F 4B");
+        assert!(
+            doc.hex.as_ref().unwrap().edit.is_none(),
+            "복사는 편집 승격을 일으키지 않는다"
+        );
+    }
+
+    /// 붙여넣기: 헥스 패널이면 16진수 해석, 해석 불가면 무시.
+    #[test]
+    fn hex_paste_parses_hex_in_hex_pane() {
+        let mut app = hex_test_doc(&[0xAA]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Paste("DE AD".into()));
+        let e = doc.hex.as_ref().unwrap().edit.as_ref().unwrap();
+        assert_eq!(e.bytes, vec![0xDE, 0xAD, 0xAA], "붙여넣기는 삽입");
+        let before = e.bytes.clone();
+        apply_hex_intent(app.doc_mut().unwrap(), &mut clip, HexIntent::Paste("XYZ".into()));
+        assert_eq!(
+            app.doc().unwrap().hex.as_ref().unwrap().edit.as_ref().unwrap().bytes,
+            before,
+            "해석 불가 무시"
+        );
+    }
+
+    /// 512MB 초과는 즉시 승격하지 않고 확인을 세운다.
+    #[test]
+    fn big_file_requires_confirm_before_load() {
+        // 실제 512MB를 만들 수는 없으므로 ensure_hex_edit의 게이트만 검사한다 —
+        // 소스 길이를 크게 보이게 할 수 없으니 임계 판정을 순수 함수로 뽑는다.
+        assert!(!hex_load_needs_confirm(crate::hex::HEX_EDIT_CONFIRM_BYTES));
+        assert!(hex_load_needs_confirm(crate::hex::HEX_EDIT_CONFIRM_BYTES + 1));
+    }
+
+    /// 이동: 방향키 좌우는 1바이트, 상하는 32바이트, 경계 클램프.
+    #[test]
+    fn move_clamps_to_document() {
+        let mut app = hex_test_doc(&[0; 40]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Move { delta: -1, extend: false });
+        assert_eq!(doc.hex.as_ref().unwrap().caret.0, 0, "앞 경계");
+        apply_hex_intent(doc, &mut clip, HexIntent::Move { delta: 9999, extend: false });
+        assert_eq!(doc.hex.as_ref().unwrap().caret.0, 40, "끝(파일 끝 삽입 지점) 클램프");
+        apply_hex_intent(doc, &mut clip, HexIntent::Move { delta: -32, extend: true });
+        assert_eq!(
+            doc.hex.as_ref().unwrap().sel,
+            Some((40, 8)),
+            "Shift 이동이 선택을 만든다"
+        );
+    }
+
+    /// Home/End/문서 처음·끝 — 브리프가 요구한 "변형을 추가하면 테스트도".
+    #[test]
+    fn hex_home_end_and_doc_bounds() {
+        let mut app = hex_test_doc(&[0; 100]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveTo { offset: 40, extend: false });
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveHome { extend: false });
+        assert_eq!(doc.hex.as_ref().unwrap().caret, (32, true), "행 시작");
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveEnd { extend: false });
+        assert_eq!(doc.hex.as_ref().unwrap().caret.0, 63, "행 마지막 바이트");
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveDocEnd { extend: false });
+        assert_eq!(doc.hex.as_ref().unwrap().caret.0, 100, "문서 끝 = 삽입 지점");
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveDocStart { extend: false });
+        assert_eq!(doc.hex.as_ref().unwrap().caret, (0, true));
+        // 마지막 짧은 행의 End는 그 행의 마지막 바이트에서 멈춘다.
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveTo { offset: 96, extend: false });
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveEnd { extend: false });
+        assert_eq!(doc.hex.as_ref().unwrap().caret.0, 99);
+    }
+
+    /// Escape는 선택만 지우고 캐럿은 그대로 둔다.
+    #[test]
+    fn hex_escape_clears_selection_only() {
+        let mut app = hex_test_doc(&[1, 2, 3, 4]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveTo { offset: 3, extend: true });
+        assert!(doc.hex.as_ref().unwrap().sel.is_some(), "사전 조건: 선택 있음");
+        apply_hex_intent(doc, &mut clip, HexIntent::ClearSelection);
+        let h = doc.hex.as_ref().unwrap();
+        assert!(h.sel.is_none());
+        assert_eq!(h.caret.0, 3, "캐럿은 남는다");
+    }
+
+    /// Backspace는 캐럿 앞 바이트를 지우고 캐럿을 물린다. 0에서는 no-op.
+    #[test]
+    fn hex_backspace_deletes_previous_byte() {
+        let mut app = hex_test_doc(&[1, 2, 3]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveTo { offset: 2, extend: false });
+        apply_hex_intent(doc, &mut clip, HexIntent::Backspace);
+        assert_eq!(doc.hex.as_ref().unwrap().edit.as_ref().unwrap().bytes, vec![1, 3]);
+        assert_eq!(doc.hex.as_ref().unwrap().caret, (1, true));
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveTo { offset: 0, extend: false });
+        apply_hex_intent(doc, &mut clip, HexIntent::Backspace);
+        assert_eq!(
+            doc.hex.as_ref().unwrap().edit.as_ref().unwrap().bytes,
+            vec![1, 3],
+            "0에서 Backspace는 no-op"
+        );
+    }
+
+    /// 파일 끝(캐럿 == len)에서는 덮어쓸 바이트가 없으므로 항상 삽입이다.
+    #[test]
+    fn nibble_at_eof_appends() {
+        let mut app = hex_test_doc(&[0xAA]);
+        let doc = app.doc_mut().unwrap();
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::MoveTo { offset: 1, extend: false });
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0x7));
+        assert_eq!(doc.hex.as_ref().unwrap().edit.as_ref().unwrap().bytes, vec![0xAA, 0x70]);
+        assert_eq!(doc.hex.as_ref().unwrap().caret, (1, false));
+    }
+
+    /// 수집: 헥스 패널의 글자는 니블로, 문자 패널에서는 통째로 Ascii로.
+    #[test]
+    fn collect_hex_intents_splits_by_pane() {
+        let events = vec![
+            egui::Event::Text("a".into()),
+            egui::Event::Text("Z".into()), // 16진수 아님 → 헥스 패널에서 무시
+            egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+        ];
+        let collect = |pane| {
+            let input = egui::RawInput { events: events.clone(), ..Default::default() };
+            let ctx = egui::Context::default();
+            let mut out = Vec::new();
+            let _ = ctx.run(input, |ctx| {
+                out = ctx.input(|i| collect_hex_intents(i, pane, 10));
+            });
+            out
+        };
+        let hex = collect(crate::hex::HexPane::Hex);
+        assert!(
+            matches!(hex[0], HexIntent::Nibble(0xA)),
+            "헥스 패널의 'a'는 니블(got {:?})",
+            hex[0]
+        );
+        assert!(
+            matches!(hex[1], HexIntent::Move { delta: 32, extend: true }),
+            "Shift+Down은 32바이트 확장 이동(got {:?})",
+            hex[1]
+        );
+        assert_eq!(hex.len(), 2, "16진수 아닌 'Z'는 헥스 패널에서 버려진다");
+        let ascii = collect(crate::hex::HexPane::Ascii);
+        assert!(matches!(&ascii[0], HexIntent::Ascii(s) if s == "a"));
+        assert!(matches!(&ascii[1], HexIntent::Ascii(s) if s == "Z"));
+    }
+
+    /// **회귀**: 전역 Ctrl+Z(텍스트 undo)와 헥스 Ctrl+Z가 동시에 소비되면
+    /// 한 번 누른 undo가 두 번 일어난다. 전역 게이트는 `d.edit.is_some()`
+    /// (텍스트 편집 버퍼)라 헥스 문서에서는 절대 참이 되면 안 된다.
+    #[test]
+    fn hex_undo_not_double_consumed_by_global_handler() {
+        let mut app = hex_test_doc(&[1, 2, 3]);
+        let mut clip = String::new();
+        {
+            let doc = app.doc_mut().unwrap();
+            apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0xF));
+        }
+        // 전역 Ctrl+Z 게이트의 조건(`doc.edit.is_some()`)이 헥스 문서에서는 거짓.
+        let doc = app.doc().unwrap();
+        assert!(doc.edit.is_none(), "헥스 문서는 텍스트 편집 버퍼를 갖지 않는다");
+        assert!(doc.hex.as_ref().unwrap().edit.is_some(), "헥스 버퍼만 승격됐다");
+        assert!(
+            !can_undo_text(doc),
+            "전역 Ctrl+Z 경로는 헥스 문서에서 발동하지 않는다"
+        );
+    }
+
+    /// 헥스 렌더에 키 입력이 실제로 배선돼 있는가 — 순수 함수 테스트만으로는
+    /// 배선이 끊겨도 다 통과한다.
+    #[test]
+    fn hex_render_applies_typed_nibble() {
+        let mut app = hex_test_doc(&[0x00, 0x11]);
+        let mut clip = String::new();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(900.0, 400.0),
+            )),
+            events: vec![egui::Event::Text("f".into())],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_hex(ui, app.doc_mut().unwrap(), &mut clip);
+            });
+        });
+        let h = app.doc().unwrap().hex.as_ref().unwrap();
+        assert_eq!(
+            h.edit.as_ref().expect("타이핑이 승격시킨다").bytes,
+            vec![0xF0, 0x11]
         );
     }
 
