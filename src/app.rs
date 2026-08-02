@@ -576,10 +576,35 @@ impl App {
         let body_takes_tab = self.doc().is_some_and(|d| {
             d.edit.is_some() && matches!(d.sep, SeparatorMode::None) && d.editing_cell.is_none()
         });
-        if !body_takes_tab || tab_bar_locked(&self.pending_action, self.show_save_dialog) {
+        // 다른 위젯(툴바 TextEdit 등)이 포커스를 쥐고 있으면 Tab은 그 위젯을
+        // 벗어나는 평범한 포커스 순회여야 한다 — 본문이 가로채면 입력란에
+        // 갇힌다.
+        let keyboard_free = ctx.memory(|m| m.focused().is_none());
+        if !body_takes_tab
+            || !keyboard_free
+            || tab_bar_locked(&self.pending_action, self.show_save_dialog)
+        {
             return false;
         }
-        consume_tab_key(ctx)
+        let took = consume_tab_key(ctx);
+        if took {
+            // **깜빡임 방지가 여기다.** 이벤트를 지워도 늦다 — egui는 프레임
+            // 시작(`Memory::begin_frame`)에 이미 Tab을 읽어 `give_to_next`를
+            // 켜 두었고, 그 프레임에 **처음 `interested_in_focus`로 등록되는
+            // 위젯**이 포커스를 가져가며 플래그를 끈다(`memory.rs:543-545`).
+            // 메뉴바가 본문보다 먼저 그려지므로 그게 File 버튼이었다 — 끝에서
+            // 걷어내는 방식은 File이 한 프레임 하이라이트를 **그린 뒤**라
+            // 깜빡임이 남고, 그 포커스 변화가 리페인트를 하나 더 유발한다.
+            //
+            // 그래서 어떤 패널보다 먼저 **더미 id를 등록해 give_to_next를
+            // 선점·소진**시키고, 곧바로 포커스를 비운다. File 차례가 왔을 때는
+            // 플래그가 꺼져 있어 하이라이트 프레임 자체가 생기지 않는다.
+            ctx.memory_mut(|m| {
+                m.interested_in_focus(egui::Id::new("body_tab_sink"));
+                m.stop_text_input();
+            });
+        }
+        took
     }
 
     /// 앱 시작 상태를 정한다. 실행 인자로 파일을 받았으면 그 파일을 열고,
@@ -747,22 +772,6 @@ fn paint_ime_preview(
         egui::Stroke::new(1.0, color),
     );
     size.x
-}
-
-/// 본문이 Tab을 먹은 프레임이면 그 Tab이 넘긴 포커스를 걷어낸다.
-///
-/// **이벤트 소비만으로는 못 막는다.** egui는 프레임 시작 시 `RawInput`에서
-/// Tab을 읽어 `focus_direction`을 정하므로(`memory.rs:444-462`), 프레임 도중
-/// 이벤트를 지워도 늦다. 포커스가 없는 상태의 Tab은 `give_to_next`를 켜고,
-/// 그 프레임에 **처음 등록되는 focusable 위젯**이 포커스를 가져간다
-/// (`memory.rs:543`) — 메뉴바가 본문보다 먼저 그려지므로 그게 File 버튼이다.
-///
-/// 그래서 UI를 다 그린 뒤 되돌린다. 본문은 원래 포커스를 갖지 않는 설계라
-/// (`TEXT_LINE_SENSE`의 `focusable: false`) "아무도 안 가진 상태"가 정상이다.
-fn release_focus_after_body_tab(ctx: &egui::Context, tab_for_body: bool) {
-    if tab_for_body {
-        ctx.memory_mut(|m| m.stop_text_input());
-    }
 }
 
 /// 편집 모드 한 프레임의 인텐트를 만든다.
@@ -1768,19 +1777,8 @@ impl eframe::App for App {
             render_confirm_big_column_op_dialog(ctx, self);
         }
 
-        // 본문이 Tab을 먹은 프레임이면, 그 Tab이 넘긴 포커스를 되돌린다.
-        //
-        // **이벤트를 지우는 것만으로는 부족하다.** egui는 프레임이 시작될 때
-        // `RawInput`에서 Tab을 읽어 `focus_direction`을 정하므로
-        // (`memory.rs:444-462`), 프레임 도중 이벤트를 제거해도 이미 늦다.
-        // 포커스 없는 상태에서 Tab은 `give_to_next`를 켜고, 그 프레임에 처음
-        // 등록되는 focusable 위젯 — 즉 **메뉴바의 File 버튼** — 이 포커스를
-        // 가져간다(`memory.rs:543`). 그래서 UI를 다 그린 뒤 여기서 걷어낸다.
-        //
-        // `stop_text_input`은 "포커스를 아무도 갖지 않게" 한다. 본문은 원래
-        // 포커스를 갖지 않는 설계이므로(`TEXT_LINE_SENSE`의 `focusable: false`)
-        // 이것이 곧 정상 상태로 되돌리는 것이다.
-        release_focus_after_body_tab(ctx, tab_for_body);
+        // (Tab이 넘기려던 포커스는 `wants_tab_character`가 update() 맨 앞에서
+        //  give_to_next를 선점해 이미 막았다 — 여기서 되돌릴 것이 없다.)
 
         // Ctrl+N — 빈 새 파일 탭. 다이얼로그가 떠 있으면 양보한다(Ctrl+S와 같은
         // 규율). 탭이 늘고 active가 바뀌는 동작이라 확인 창 위에서 돌면 안 된다.
@@ -14568,6 +14566,71 @@ mod tests {
 
     /// 저장 다이얼로그가 떠 있으면 Tab은 그 안의 버튼 사이를 옮겨야 한다.
     #[test]
+    fn wants_tab_character_yields_to_a_focused_widget() {
+        // 툴바 TextEdit 등이 포커스를 쥐고 있으면 Tab은 그 위젯을 벗어나는
+        // 포커스 순회여야 한다 — 본문이 가로채면 입력란에 갇힌다.
+        let app = find_test_doc(&["ab"]);
+        let ctx = egui::Context::default();
+        let other = egui::Id::new("toolbar_input");
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.interact(
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0)),
+                    other,
+                    egui::Sense::click(),
+                );
+                r.request_focus();
+            });
+        });
+        assert_eq!(ctx.memory(|m| m.focused()), Some(other), "전제: 포커스가 밖");
+
+        let input = egui::RawInput {
+            events: vec![tab_event(egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        let mut took = false;
+        let mut left = 0;
+        let _ = ctx.run(input, |ctx| {
+            took = app.wants_tab_character(ctx);
+            left = tab_events_left(ctx);
+        });
+        assert!(!took, "포커스를 쥔 위젯이 있으면 본문이 가로채지 않는다");
+        assert_eq!(left, 1, "이벤트를 남겨 포커스 순회에 쓰이게 한다");
+    }
+
+    /// **깜빡임 회귀 방지.** 본문이 Tab을 먹은 프레임에는 give_to_next가
+    /// 선점·소진되어, 그 뒤에 그려지는 focusable 위젯이 포커스를 받지 못한다.
+    #[test]
+    fn body_tab_leaves_nothing_for_later_widgets() {
+        let app = find_test_doc(&["ab"]);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![tab_event(egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        let mut took = false;
+        let _ = ctx.run(input, |ctx| {
+            took = app.wants_tab_character(ctx);
+            // 그다음에 그려지는 메뉴 버튼 흉내 — give_to_next가 남아 있으면
+            // 이 위젯이 포커스를 가져가 하이라이트가 깜빡인다.
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.interact(
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(30.0, 10.0)),
+                    egui::Id::new("menu_file_button"),
+                    egui::Sense::click(),
+                );
+                ui.memory_mut(|m| m.interested_in_focus(egui::Id::new("menu_file_button")));
+            });
+        });
+        assert!(took, "전제: 본문이 Tab을 먹었다");
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            None,
+            "본문이 먹은 Tab은 뒤에 그려지는 위젯에 포커스를 주면 안 된다"
+        );
+    }
+
+    #[test]
     fn wants_tab_character_is_false_while_a_dialog_is_open() {
         let mut app = find_test_doc(&["ab"]);
         app.show_save_dialog = true;
@@ -14906,8 +14969,10 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     render_text(ui, app.doc_mut().unwrap(), 0, clip, tab_for_body);
                 });
-                // update()가 UI를 다 그린 뒤 하는 일(같은 함수를 부른다).
-                release_focus_after_body_tab(ctx, tab_for_body);
+                // 끝에서 걷어내는 단계는 **일부러 없다** — 프레임이 끝난 뒤
+                // 포커스가 None이라는 것은 File이 애초에 받지 못했다는 뜻이다
+                // (받았다면 아무도 지우지 않아 남아 있어야 한다). 이게 곧
+                // "하이라이트 깜빡임 없음"의 관측 가능한 증거다.
             });
         };
         draw(&mut app, &mut clip, Default::default());
