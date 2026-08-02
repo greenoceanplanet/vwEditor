@@ -346,6 +346,24 @@ impl Default for App {
 /// 프라이밍 시 감지에 쓸 앞부분 바이트 크기.
 const PRIME_BYTES: usize = 64 * 1024;
 
+/// 이 크기 이하의 파일은 열자마자 편집 모드로 들어간다(`auto_edit_on_open`).
+///
+/// 10MB는 "읽는 값"이 아니라 **기다림의 값**으로 고른 수다. 편집 모드 진입은
+/// `load_edit_buffer`의 동기 로드라 그 시간만큼 UI가 멈춘다 — 프레임을 하나
+/// 건너뛰는 정도면 사용자는 인지하지 못하지만, 100ms를 넘기면 "느린 앱"이 된다.
+/// 비용은 바이트 수가 아니라 **줄 수**가 지배한다(줄당 `String` 하나를 할당한다).
+///
+/// 실측(릴리스 빌드, 9.0MB / 34.6만 행 CSV): `open_path` 전체가 감지·인덱서
+/// 기동·편집 버퍼 로드를 통틀어 **첫 회 21ms, 이후 8ms**. 같은 경로가 11MB
+/// 파일에서는 편집 버퍼를 만들지 않아 0.1ms다. 상한에서도 한 프레임 안에
+/// 들어오므로 여유가 있다.
+///
+/// 반대쪽 극단을 보면 왜 상한이 필요한지 분명해진다. 이 앱의 목표인 10GB급
+/// 파일에서 편집 버퍼는 수억 개의 `String`이 되어 메모리와 시간 둘 다 감당이
+/// 안 된다. 그래서 큰 파일은 지금처럼 mmap 뷰로 열고, 편집은 사용자가 명시적으로
+/// 켤 때만 부담한다.
+const AUTO_EDIT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
 impl App {
     /// 활성 문서(읽기). 열린 문서가 없으면 None.
     pub fn doc(&self) -> Option<&Document> {
@@ -399,8 +417,11 @@ impl App {
             }
         };
 
+        // `src`는 아래에서 `Document`로 옮겨 가므로 크기를 미리 잡아 둔다.
+        let size = src.len();
+
         let head = {
-            let n = (src.len() as usize).min(PRIME_BYTES);
+            let n = (size as usize).min(PRIME_BYTES);
             src.slice(0, n as u64)
         };
         let enc = parse::detect_encoding(head);
@@ -485,6 +506,23 @@ impl App {
             row_errors_revision: 0,
             show_errors_window: false,
         });
+
+        // 작은 파일은 곧바로 편집 모드로. 뷰 모드로 열었다가 사용자가 메뉴에서
+        // 켜는 것과 결과가 같아야 하므로 같은 함수(`enter_edit_mode`)를 부른다 —
+        // 여기서 `edit`만 채우면 정렬 폐기·오류 목록 무효화 같은 부수 처리를
+        // 놓친다. `add_document`가 방금 넣은 탭을 활성화해 두므로 `doc_mut`가
+        // 그 문서다.
+        //
+        // **지금은** 갓 만든 `Document`라 `sort`/`row_errors`가 이미 None이므로
+        // 그 부수 처리가 관측 가능한 차이를 내지 않는다(그래서 이 호출을 인라인
+        // 대입으로 바꾸는 변이를 잡는 테스트를 쓸 수 없다 — 두 구현이 실제로
+        // 구별되지 않는다). 그래도 `enter_edit_mode`를 부르는 이유는 진입 처리가
+        // 나중에 늘어날 때 이 경로만 조용히 빠지지 않게 하기 위해서다.
+        if auto_edit_on_open(size) {
+            if let Some(doc) = self.doc_mut() {
+                enter_edit_mode(doc);
+            }
+        }
     }
 
     /// 이미 만들어진 Document를 새 탭으로 추가하고 활성화한다.
@@ -606,6 +644,20 @@ fn decode_logical_line(doc: &Document, logical: usize) -> Option<String> {
             .trim_end_matches(['\r', '\n'])
             .to_owned()
     })
+}
+
+/// 파일을 열자마자 편집 모드로 들어갈지. `open_path`가 부르는 순수 판정으로,
+/// 크기 하나만 본다(`AUTO_EDIT_MAX_BYTES` 이하).
+///
+/// **인덱싱 상태를 조건에 넣지 않는 이유.** 편집 모드에서는 `edit.lines`가
+/// 진실이고 mmap 인덱스는 쓰이지 않는다(`logical_line` 참고). 인덱서는 계속
+/// 돌지만 화면은 그 결과를 보지 않으므로 기다릴 이유가 없다 — 이 크기 대역에서는
+/// 어차피 곧 끝난다. 편집 모드를 끄면 그때 인덱스가 다시 화면의 바탕이 된다.
+///
+/// **구분자/헤더도 보지 않는 이유.** 텍스트 모드(구분자 없음)도 편집 대상이다.
+/// 표냐 텍스트냐는 *보기* 방식이지 편집 가능 여부가 아니다.
+fn auto_edit_on_open(size: u64) -> bool {
+    size <= AUTO_EDIT_MAX_BYTES
 }
 
 /// 편집 모드로 진입: 파일 전체를 현재 인코딩으로 줄 배열 로드.
@@ -7454,11 +7506,145 @@ mod tests {
         assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a,b", "1,2"]);
     }
 
+    // ---- 작은 파일 자동 편집 모드 ----
+
+    /// 경계값. `<=`가 맞는지(상한 자체는 포함) 두 방향으로 못박는다.
+    /// 이 테스트가 있어야 `<`로 바뀌거나 상한이 흔들릴 때 잡힌다.
+    #[test]
+    fn auto_edit_threshold_is_inclusive_at_10mb() {
+        assert!(auto_edit_on_open(0), "빈 파일");
+        assert!(auto_edit_on_open(AUTO_EDIT_MAX_BYTES - 1));
+        assert!(auto_edit_on_open(AUTO_EDIT_MAX_BYTES), "상한은 포함");
+        assert!(!auto_edit_on_open(AUTO_EDIT_MAX_BYTES + 1));
+        assert!(!auto_edit_on_open(10 * 1024 * 1024 * 1024), "10GB는 뷰 모드");
+    }
+
+    /// 작은 파일을 열면 메뉴를 건드리지 않아도 편집 버퍼가 채워져 있어야 한다.
+    #[test]
+    fn small_file_opens_in_edit_mode() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().unwrap();
+        assert!(doc.edit.is_some(), "10MB 이하는 자동 편집 모드");
+        assert_eq!(doc.edit.as_ref().unwrap().lines, vec!["a,b", "1,2"]);
+        assert!(!doc.edit.as_ref().unwrap().dirty, "열기만 했으니 깨끗하다");
+    }
+
+    /// 구분자가 없는 텍스트 파일도 편집 대상이다. 표/텍스트는 *보기* 방식일 뿐.
+    #[test]
+    fn small_text_file_also_opens_in_edit_mode() {
+        let p = temp_ext(b"hello\nworld\n", "txt");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().unwrap();
+        assert_eq!(doc.sep, SeparatorMode::None, "전제: 텍스트 모드로 열렸다");
+        assert!(doc.edit.is_some(), "텍스트 모드도 자동 편집 모드");
+    }
+
+    /// 상한이 **10MB 그 값**인지. 위/아래 양쪽에서 못박는다.
+    ///
+    /// `auto_edit_threshold_is_inclusive_at_10mb`는 상수를 기준으로 상대
+    /// 비교만 하므로 상수가 1MB로 바뀌어도 그대로 통과한다. 사용자가 정한 값은
+    /// "10MB"라는 절대 숫자이므로 여기서 리터럴로 고정한다.
+    #[test]
+    fn auto_edit_limit_is_exactly_ten_megabytes() {
+        assert_eq!(AUTO_EDIT_MAX_BYTES, 10 * 1024 * 1024);
+        assert!(auto_edit_on_open(9 * 1024 * 1024), "9MB는 편집 모드");
+        assert!(!auto_edit_on_open(11 * 1024 * 1024), "11MB는 뷰 모드");
+    }
+
+    /// 상한을 넘는 파일은 예전처럼 뷰 모드로 열려야 한다 — 큰 파일에서 편집
+    /// 버퍼를 강제로 만들면 이 앱의 목적(즉시 열기)이 무너진다.
+    #[test]
+    fn large_file_stays_in_view_mode() {
+        // 실제로 10MB를 넘기되 테스트가 느려지지 않을 만큼만 넘긴다.
+        let mut content = Vec::with_capacity(AUTO_EDIT_MAX_BYTES as usize + 64);
+        while (content.len() as u64) <= AUTO_EDIT_MAX_BYTES {
+            content.extend_from_slice(b"0123456789,0123456789\n");
+        }
+        assert!(content.len() as u64 > AUTO_EDIT_MAX_BYTES, "전제: 상한 초과");
+
+        let p = temp(&content);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().unwrap();
+        assert!(doc.edit.is_none(), "상한 초과 파일은 뷰 모드로 열린다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 편집 모드 진입에는 버퍼 로드 말고도 딸린 처리가 있다 — 뷰 permutation
+    /// 정렬 폐기와 오류 목록 무효화.
+    ///
+    /// **범위 주의.** 이 테스트는 `enter_edit_mode`의 계약을 지킨다. `open_path`의
+    /// 자동 진입이 그 함수를 거치는지는 여기서 확인하지 못한다 — 갓 만든
+    /// `Document`는 `sort`/`row_errors`가 이미 None이라 두 구현이 관측 가능하게
+    /// 갈리지 않기 때문이다(`open_path`의 주석 참고). 여기서 지키는 것은
+    /// "이 계약이 사라지면 알아챈다"까지다.
+    #[test]
+    fn enter_edit_mode_clears_view_mode_leftovers() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        assert!(doc.edit.is_some(), "전제: 자동 편집 모드로 열렸다");
+
+        // 뷰 모드에서 넘어온 것처럼 잔재를 심는다.
+        view_doc(doc);
+        doc.sort = Some(SortState {
+            permutation: vec![1, 0],
+            col: 0,
+            kind: SortKind::Text,
+            dir: SortDir::Asc,
+            spec_count: 1,
+        });
+        doc.row_errors = Some(crate::validate::ScanResult { errors: Vec::new(), dropped: 0 });
+
+        enter_edit_mode(doc);
+        assert!(doc.edit.is_some());
+        assert!(doc.sort.is_none(), "편집 모드는 뷰 permutation 정렬을 폐기한다");
+        assert!(doc.row_errors.is_none(), "편집 모드 진입은 오류 목록을 무효화한다");
+    }
+
+    /// 자동 진입으로 만들어진 버퍼가 수동 진입과 같은 내용인지.
+    #[test]
+    fn auto_edit_buffer_matches_manual_enter() {
+        let p = temp(b"a,b\n1,2\n");
+        let ctx = egui::Context::default();
+
+        // 자동 경로
+        let mut auto = App::default();
+        auto.open_path(&p, &ctx);
+
+        // 수동 경로: 같은 파일을 열고, 자동 진입분을 걷어낸 뒤 손으로 켠다.
+        let mut manual = App::default();
+        manual.open_path(&p, &ctx);
+        {
+            let doc = manual.doc_mut().unwrap();
+            view_doc(doc);
+            enter_edit_mode(doc);
+        }
+
+        let a = auto.doc().unwrap().edit.as_ref().unwrap();
+        let m = manual.doc().unwrap().edit.as_ref().unwrap();
+        assert_eq!(a.lines, m.lines);
+        assert_eq!(a.dirty, m.dirty);
+        assert_eq!(a.newline, m.newline);
+    }
+
     // -----------------------------------------------------------------------
     // 구분자 변환 (Convert Delimiter)
     // -----------------------------------------------------------------------
 
-    /// 변환 준비가 끝난 문서를 연다(인덱싱 완료까지 기다린다).
+    /// 변환 준비가 끝난 **뷰 모드** 문서를 연다(인덱싱 완료까지 기다린다).
+    ///
+    /// 테스트가 쓰는 파일은 전부 작아서 `open_path`가 자동으로 편집 모드에
+    /// 넣는다(`auto_edit_on_open`). 뷰 모드 동작을 보려는 테스트는 그걸
+    /// 되돌려야 하므로 `view_doc`을 거친다.
     fn convert_doc(content: &[u8]) -> (App, egui::Context) {
         let p = temp(content);
         let ctx = egui::Context::default();
@@ -7466,7 +7652,19 @@ mod tests {
         app.open_path(&p, &ctx);
         let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
+        view_doc(doc);
         (app, ctx)
+    }
+
+    /// 자동 편집 모드를 되돌려 **뷰 모드(mmap 경로)** 문서로 만든다.
+    ///
+    /// 작은 파일 자동 편집 모드가 들어오면서, "파일을 열면 뷰 모드"라는 옛
+    /// 전제를 깔고 있던 테스트들이 전부 편집 모드를 받게 됐다. 각자
+    /// `exit_edit_mode`를 부르는 대신 의도를 이름으로 남긴다 — 이 테스트들이
+    /// 보려는 것은 **mmap 경로**이지 "편집 모드가 아닌 상태"가 아니다.
+    fn view_doc(doc: &mut Document) {
+        exit_edit_mode(doc);
+        assert!(doc.edit.is_none(), "뷰 모드 전제를 세우지 못했다");
     }
 
     // ---- 파싱 오류 행 검출 (Task 12/13 배선) ----
@@ -9293,7 +9491,7 @@ mod tests {
         app.open_path(&p, &ctx);
         let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
-        assert!(doc.edit.is_none());
+        view_doc(doc);
         undo_once(doc); // 패닉하지 않고 조용히 통과
         assert!(doc.edit.is_none());
     }
@@ -9506,7 +9704,7 @@ mod tests {
         app.open_path(&p, &ctx);
         let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
-        assert!(doc.edit.is_none(), "사전 조건: 뷰 모드");
+        view_doc(doc);
         doc.find_query = "hit".to_owned();
         doc.replace_text = "Z".to_owned();
         apply_find_action(doc, FindAction::ReplaceAll);
@@ -11689,6 +11887,9 @@ mod tests {
         let mut app = extract_test_app(b"name,city\nAlice,Seoul\nBob,Busan\n");
         {
             let doc = app.doc_mut().unwrap();
+            // "추출이 원본을 편집 모드로 끌고 가지 않는다"를 보려면 원본이
+            // 뷰 모드여야 한다(작은 파일은 열 때 자동으로 편집 모드가 된다).
+            view_doc(doc);
             doc.find_query = "Seoul".to_owned();
             // 원본의 선택 상태가 추출 때문에 흔들리면 안 된다.
             doc.cell_sel = Some((2, 0, 2, 1));
@@ -12622,10 +12823,9 @@ mod tests {
         let mut app = App::default();
         app.open_path(&p, &ctx);
         app.doc_mut().unwrap().indexer.take().unwrap().join().unwrap();
-        assert!(
-            app.doc().unwrap().edit.is_none(),
-            "사전 조건: 편집 모드에 들어가지 않은 뷰 전용 문서"
-        );
+        // 파일이 작아 `open_path`가 자동으로 편집 모드에 넣는다 — 이 테스트의
+        // 존재 이유가 뷰 전용 경로이므로 되돌린다.
+        view_doc(app.doc_mut().unwrap());
 
         let mut clip = String::new();
         let mut input = egui::RawInput::default();
