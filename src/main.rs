@@ -30,6 +30,7 @@ mod app;
 mod convert;
 mod edit;
 mod find;
+mod hex;
 mod index;
 mod indexer;
 mod parse;
