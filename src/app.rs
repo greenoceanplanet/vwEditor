@@ -1724,11 +1724,16 @@ impl eframe::App for App {
                 find_action = render_find_panel(ctx, doc);
             }
         }
-        // 추출만 `App`(탭 목록 + active)을 건드리므로 따로 태운다. 나머지는
-        // 활성 `Document` 하나로 끝난다.
+        // 추출만 `App`(탭 목록 + active)을 건드리므로 따로 태운다. 헥스 찾기도
+        // 텍스트 전용인 `apply_find_action`이 아니라 `hex_find_next`가 처리한다.
+        // 나머지는 활성 `Document` 하나로 끝난다.
         if let Some(act) = find_action {
             if act == FindAction::Extract {
                 self.extract_matching_rows();
+            } else if act == FindAction::HexNext {
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    hex_find_next(doc);
+                }
             } else if let Some(doc) = self.docs.get_mut(self.active) {
                 apply_find_action(doc, act);
             }
@@ -1921,7 +1926,13 @@ impl eframe::App for App {
                     // 조건과 같은 근거이므로 **날 문자열**을 본다(디코딩 결과가
                     // 빌 수 없으므로 어차피 판정은 같지만, 근거를 통일한다).
                     if !doc.find_query.is_empty() {
-                        apply_find_action(doc, FindAction::Next);
+                        // 헥스 문서는 `apply_find_action`(텍스트 전용 로직)이
+                        // 아니라 `hex_find_next`로 간다 — 패널의 갈래와 같다.
+                        if doc.hex.is_some() {
+                            hex_find_next(doc);
+                        } else {
+                            apply_find_action(doc, FindAction::Next);
+                        }
                     }
                 }
             }
@@ -2121,6 +2132,10 @@ enum FindAction {
     /// 끝나지 않고 `App`(탭 목록)을 건드리므로 `apply_find_action`이 아니라
     /// `App::extract_matching_rows`가 처리한다.
     Extract,
+    /// 헥스 문서의 다음 찾기. 텍스트 모드의 `Next`와 갈래가 다르다 —
+    /// `apply_find_action`(텍스트 전용 로직)이 아니라 `hex_find_next`가 처리한다.
+    /// `render_find_panel`의 헥스 전용 분기에서만 나온다.
+    HexNext,
 }
 
 /// 문서의 논리 행 수(두 모드 공통). 편집 모드면 버퍼 길이, 아니면 인덱스가
@@ -2713,6 +2728,9 @@ fn apply_find_action(doc: &mut Document, act: FindAction) {
         // 돌려보내므로 여기까지 오지 않는다 — 와도 조용히 무시한다
         // (뷰 모드에서 바꾸기를 무시하는 것과 같은 방어).
         FindAction::Extract => {}
+        // 헥스 찾기도 마찬가지로 `Document` 하나로 끝나지 않는 별도 로직이라
+        // 호출부가 `hex_find_next`로 직접 돌려보낸다 — 와도 조용히 무시한다.
+        FindAction::HexNext => {}
     }
 }
 
@@ -4266,11 +4284,109 @@ fn find_count_text(match_rows_len: usize, find_status: &str, has_query: bool) ->
     }
 }
 
+// ---------------------------------------------------------------------------
+// 헥스 찾기 (순수 해석은 `crate::hex`, 여기는 Document에 붙이는 연결부)
+// ---------------------------------------------------------------------------
+
+/// 찾기 입력 해석. as_hex면 16진수(공백 무시), 아니면 UTF-8 바이트.
+/// None = 검색 불가(버튼 비활성 근거).
+fn hex_needle(query: &str, as_hex: bool) -> Option<Vec<u8>> {
+    if as_hex {
+        crate::hex::parse_hex_query(query)
+    } else if query.is_empty() {
+        None
+    } else {
+        Some(query.as_bytes().to_vec())
+    }
+}
+
+/// 다음 매치를 찾아 last_match와 스크롤 요청을 갱신한다.
+fn hex_find_next(doc: &mut Document) {
+    let Some(h) = doc.hex.as_ref() else { return };
+    let Some(needle) = hex_needle(&doc.find_query, h.find_hex) else {
+        doc.find_status = "Invalid pattern".into();
+        return;
+    };
+    let from = h.last_match.map(|(o, _)| o + 1).unwrap_or(0);
+    let found = match doc.hex.as_ref().and_then(|h| h.edit.as_ref()) {
+        Some(e) => crate::hex::find_bytes(&e.bytes, &needle, from),
+        None => crate::hex::find_bytes(doc.source.as_bytes(), &needle, from),
+    };
+    // hex의 가변 대여와 doc의 다른 필드 대입이 겹치지 않게, hex 갱신을
+    // 블록으로 끝낸 뒤 doc 필드를 만진다.
+    match found {
+        Some(o) => {
+            {
+                let h = doc.hex.as_mut().unwrap();
+                h.last_match = Some((o, needle.len()));
+                h.caret = (o, true);
+                h.sel = None;
+            }
+            doc.pending_scroll_row = Some((o / crate::hex::BYTES_PER_ROW as u64) as usize);
+            doc.pending_scroll_align = egui::Align::Center;
+            doc.find_status = String::new();
+        }
+        None => {
+            doc.hex.as_mut().unwrap().last_match = None;
+            doc.find_status = "Not found".into();
+        }
+    }
+}
+
 /// 찾기/바꾸기 창의 기본 위치. 데이터 영역(특히 표의 오른쪽 위 헤더/스크롤
 /// 마커)을 덜 가리도록 화면 우상단 안쪽에 둔다. 첫 표시에만 적용되고(egui가
 /// 그 뒤로는 사용자가 드래그한 위치를 기억한다) 매 프레임 강제하지 않는다.
 fn find_window_default_pos(screen: egui::Rect) -> egui::Pos2 {
     egui::pos2((screen.right() - 340.0).max(screen.left()), screen.top() + 32.0)
+}
+
+/// 헥스 문서 전용 찾기 창. 바꾸기 입력란도, 대소문자/범위 옵션도 없다 —
+/// 헥스에는 그 개념이 없거나(바꾸기는 니블 단위 편집과 안 맞는다) 아직
+/// 범위가 없다(문서 전체 하나). 검색어 입력란은 텍스트 모드와 같은
+/// `doc.find_query`를 그대로 쓴다 — 필드를 따로 두면 탭을 오가며 두 값이
+/// 갈릴 수 있고, 애초에 헥스/텍스트 문서는 한 탭에 동시에 있을 수 없다.
+fn render_hex_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindAction> {
+    let mut action: Option<FindAction> = None;
+    let want_focus = std::mem::take(&mut doc.find_focus_pending);
+    let mut open = doc.show_find;
+    egui::Window::new("Find (Hex)")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(find_window_default_pos(ctx.screen_rect()))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(crate::theme::chrome_text("Find:"));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut doc.find_query)
+                        .id(find_query_id())
+                        .desired_width(260.0),
+                );
+                if want_focus {
+                    resp.request_focus();
+                }
+                // 텍스트 모드와 같은 관용: 입력란에서 Enter = Find Next.
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    action = Some(FindAction::HexNext);
+                    resp.request_focus();
+                }
+            });
+            // `doc.hex`는 이 함수에 들어온 시점에 `Some`임이 보장된다
+            // (`render_find_panel`이 `doc.hex.is_some()`일 때만 여기로 분기한다).
+            let h = doc.hex.as_mut().unwrap();
+            ui.checkbox(&mut h.find_hex, "Hex");
+            ui.separator();
+            if ui.button("Find Next").clicked() {
+                action = Some(FindAction::HexNext);
+            }
+            if !doc.find_status.is_empty() {
+                ui.label(crate::theme::chrome_text(doc.find_status.clone()));
+            }
+        });
+    if !open {
+        doc.show_find = false;
+    }
+    action
 }
 
 /// 찾기/바꾸기 창. 호출부는 `doc.show_find`가 참일 때만 부른다(`update()`).
@@ -4281,6 +4397,9 @@ fn find_window_default_pos(screen: egui::Rect) -> egui::Pos2 {
 /// 라벨은 `chrome_text`를 거친다. Body 텍스트 스타일이 데이터용 고정폭이라
 /// 그냥 `ui.label(s)`을 쓰면 UI 문구까지 데이터 폰트로 나온다.
 fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindAction> {
+    if doc.hex.is_some() {
+        return render_hex_find_panel(ctx, doc);
+    }
     let mut action: Option<FindAction> = None;
     // 바꾸기는 편집 버퍼가 있어야 가능하다. 뷰 모드에서는 찾기만.
     let editing = doc.edit.is_some();
@@ -16429,6 +16548,107 @@ mod tests {
         assert!(!doc_dirty(&text_doc));
         text_doc.edit.as_mut().unwrap().dirty = true;
         assert!(doc_dirty(&text_doc), "텍스트 dirty도 그대로 잡힌다");
+    }
+
+    // ---- 헥스 찾기 ----
+
+    /// 찾기 입력 해석: as_hex면 16진수(공백 무시), 아니면 UTF-8 바이트.
+    #[test]
+    fn hex_needle_interprets_by_mode() {
+        assert_eq!(hex_needle("4F 4B", true), Some(vec![0x4F, 0x4B]));
+        assert_eq!(hex_needle("XYZ", true), None);
+        assert_eq!(hex_needle("OK", false), Some(b"OK".to_vec()));
+        assert_eq!(hex_needle("한", false), Some("한".as_bytes().to_vec()));
+        assert_eq!(hex_needle("", false), None, "빈 텍스트도 무의미");
+    }
+
+    /// 다음 찾기: 매치 갱신 + 그 행으로 스크롤 요청, 랩어라운드.
+    #[test]
+    fn hex_find_next_advances_and_wraps() {
+        let mut data = vec![0u8; 100];
+        data[40] = 0x4F;
+        data[41] = 0x4B; // 행 1 (32..64)
+        data[70] = 0x4F;
+        data[71] = 0x4B; // 행 2
+        let mut app = hex_test_doc(&data);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "4F 4B".into();
+        hex_find_next(doc);
+        assert_eq!(doc.hex.as_ref().unwrap().last_match, Some((40, 2)));
+        assert_eq!(doc.pending_scroll_row, Some(1), "매치 오프셋의 행");
+        hex_find_next(doc);
+        assert_eq!(doc.hex.as_ref().unwrap().last_match, Some((70, 2)));
+        hex_find_next(doc);
+        assert_eq!(doc.hex.as_ref().unwrap().last_match, Some((40, 2)), "랩어라운드");
+    }
+
+    /// 편집 중이면 버퍼를 검색한다(mmap이 아니라).
+    #[test]
+    fn hex_find_searches_edit_buffer() {
+        let mut app = hex_test_doc(&[0u8; 4]);
+        let doc = app.doc_mut().unwrap();
+        doc.hex.as_mut().unwrap().edit =
+            Some(crate::hex::HexEditBuffer::new(vec![0x00, 0xCA, 0xFE, 0x00]));
+        doc.find_query = "CAFE".into();
+        hex_find_next(doc);
+        assert_eq!(doc.hex.as_ref().unwrap().last_match, Some((1, 2)));
+    }
+
+    /// 텍스트 해석 모드.
+    #[test]
+    fn hex_find_text_mode() {
+        let mut app = hex_test_doc(b"...SQLite...");
+        let doc = app.doc_mut().unwrap();
+        doc.hex.as_mut().unwrap().find_hex = false;
+        doc.find_query = "SQLite".into();
+        hex_find_next(doc);
+        assert_eq!(doc.hex.as_ref().unwrap().last_match, Some((3, 6)));
+    }
+
+    /// 헥스 문서에서 `render_find_panel`은 헥스 전용 패널을 그리고, 찾기
+    /// 입력란에서 Enter를 치면(텍스트 모드와 같은 관용) `FindAction::HexNext`를
+    /// 반환한다 — 호출부가 이걸 받아 `hex_find_next`를 부르는 게 계약이다.
+    #[test]
+    fn find_panel_returns_hex_next_for_hex_doc() {
+        let mut app = hex_test_doc(&[0x4F, 0x4B]);
+        let doc = app.doc_mut().unwrap();
+        doc.show_find = true;
+        doc.find_query = "4F 4B".into();
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            let doc = app.doc_mut().unwrap();
+            action = render_find_panel(ctx, doc);
+        });
+        // 아무 것도 누르지 않은 프레임은 인텐트가 없다 — 스모크 확인.
+        assert_eq!(action, None);
+        // 입력란에 포커스를 준다 — 이 프레임에서 실제로 포커스가 잡혀야
+        // 다음 프레임의 Enter가 `lost_focus()`를 발생시킨다.
+        {
+            let doc = app.doc_mut().unwrap();
+            doc.find_focus_pending = true;
+        }
+        let _ = ctx.run(Default::default(), |ctx| {
+            let doc = app.doc_mut().unwrap();
+            action = render_find_panel(ctx, doc);
+        });
+        assert_eq!(action, None, "포커스만 잡은 프레임은 아직 인텐트가 없다");
+        // 이미 포커스가 있는 입력란에 Enter를 쳐서 Find Next를 낸다.
+        let enter_input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(enter_input, |ctx| {
+            let doc = app.doc_mut().unwrap();
+            action = render_find_panel(ctx, doc);
+        });
+        assert_eq!(action, Some(FindAction::HexNext));
     }
 
     /// IME는 **편집 모드에서만** 캐럿을 따라간다. 뷰 모드에서 켜면 입력할 수
