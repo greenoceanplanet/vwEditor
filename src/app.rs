@@ -7876,14 +7876,23 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
     };
 
     let font = text_font_id();
-    let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
     let text_color = ui.visuals().text_color();
 
-    // 세 컬럼 폭은 전부 `char_w` 배수 — 오프셋 자릿수, 바이트당 3문자
-    // ("4F "), 문자 패널 1문자. 여기가 어긋나면 클릭 산술이 글자와 어긋난다.
-    let offset_px = char_w * (off_w as f32 + 2.0);
-    let hex_px = char_w * (BYTES_PER_ROW as f32 * 3.0);
-    let ascii_px = char_w * (BYTES_PER_ROW as f32 + 2.0);
+    // 컬럼 폭은 **대표 문자열을 실제로 배치해 재서** 잡는다. 예전에는
+    // `glyph_width('0') * 문자수`로 계산했는데, 그 값은 폰트가 알려주는
+    // 이상적 폭(실수)이고 실제 배치는 픽셀 격자에 반올림된다. 32바이트를
+    // 지나며 그 차이가 쌓여 마지막 바이트가 컬럼 밖으로 잘렸다(줌 배율에
+    // 따라 반올림 방향이 달라져 특정 배율에서만 드러났다).
+    let measure = |s: &str| -> f32 {
+        ui.fonts(|f| {
+            f.layout_no_wrap(s.to_owned(), font.clone(), text_color).size().x
+        })
+    };
+    // 오프셋: 자릿수 + 여백 두 칸. 헥스: "FF " × 32(마지막 공백 포함 —
+    // 갤리도 그렇게 그린다). 문자: 32칸 + 여백 두 칸.
+    let offset_px = measure(&"0".repeat(off_w + 2));
+    let hex_px = measure(&"FF ".repeat(BYTES_PER_ROW));
+    let ascii_px = measure(&"W".repeat(BYTES_PER_ROW + 2));
 
     // 클로저 → 바깥 인텐트 통로(표/텍스트 렌더와 같은 규율).
     let click: Cell<Option<HexClick>> = Cell::new(None);
@@ -7933,12 +7942,23 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
             let bytes = hex_row_bytes(doc, row as u64);
 
             // ---- 오프셋 ----
+            //
+            // `Label` 대신 다른 두 칸과 **같은 함수**로 그린다. `Label`은
+            // egui의 레이아웃(정렬·여백)을 타서 세로 기준선이 갤리 직접
+            // 그리기와 미묘하게 달랐고, 그래서 일련번호와 16진수 줄이
+            // 가지런히 맞지 않았다.
             table_row.col(|ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(crate::hex::format_offset(row as u64, off_w))
-                        .font(font.clone())
-                        .color(crate::theme::hex_offset_fg()),
-                ));
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    &crate::hex::format_offset(row as u64, off_w),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font.clone(),
+                        color: crate::theme::hex_offset_fg(),
+                        ..Default::default()
+                    },
+                );
+                paint_hex_cell(ui, job);
             });
 
             // ---- 16진수 — 바이트별 LayoutJob 섹션(선택/매치 배경) ----
@@ -7975,8 +7995,8 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
                         },
                     );
                 }
-                let resp = paint_hex_cell(ui, job, hex_px);
-                if let Some((col, extend)) = hex_cell_hit(&resp, char_w, shift_down) {
+                let cell = paint_hex_cell(ui, job);
+                if let Some((col, extend)) = hex_cell_hit(&cell, shift_down) {
                     if let Some((bi, high)) = hex_click_byte(col) {
                         click.set(Some(HexClick {
                             abs: (row_start + bi as u64).min(len),
@@ -7986,16 +8006,20 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
                         }));
                     }
                 }
-                // 캐럿 표시 — 두 자리 폭 테두리. 헥스 패널이 활성일 때만
-                // 실선, 아니면 흐린 테두리로 "여기 있다"만 알린다.
+                // 캐럿 표시 — 두 자리(16진수 한 바이트) 폭 테두리. 헥스 패널이
+                // 활성일 때만 실선, 아니면 흐린 테두리로 "여기 있다"만 알린다.
+                //
+                // 좌표는 **갤리에게 묻는다**. 바이트 i는 문자 3i("4F ")에서
+                // 시작하고 두 문자를 차지한다.
                 if caret.0 >= row_start && caret.0 < row_start + BYTES_PER_ROW as u64 {
-                    let bi = (caret.0 - row_start) as f32;
-                    let x = resp.rect.left() + char_w * bi * 3.0;
+                    let ch = (caret.0 - row_start) as usize * 3;
+                    let x = cell.char_x(ch);
+                    let w = cell.char_x(ch + 2) - x;
                     paint_hex_caret(
                         ui,
                         egui::Rect::from_min_size(
-                            egui::pos2(x, resp.rect.top()),
-                            egui::vec2(char_w * 2.0, resp.rect.height()),
+                            egui::pos2(x, cell.resp.rect.top()),
+                            egui::vec2(w.max(1.0), cell.resp.rect.height()),
                         ),
                         pane == crate::hex::HexPane::Hex,
                     );
@@ -8018,8 +8042,8 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
                         },
                     );
                 }
-                let resp = paint_hex_cell(ui, job, ascii_px);
-                if let Some((col, extend)) = hex_cell_hit(&resp, char_w, shift_down) {
+                let cell = paint_hex_cell(ui, job);
+                if let Some((col, extend)) = hex_cell_hit(&cell, shift_down) {
                     if let Some(bi) = ascii_click_byte(col) {
                         click.set(Some(HexClick {
                             abs: (row_start + bi as u64).min(len),
@@ -8032,13 +8056,15 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
                     }
                 }
                 if caret.0 >= row_start && caret.0 < row_start + BYTES_PER_ROW as u64 {
-                    let bi = (caret.0 - row_start) as f32;
-                    let x = resp.rect.left() + char_w * bi;
+                    // 문자 패널은 1바이트 = 1문자. 여기서도 폭을 갤리에서 잰다.
+                    let ch = (caret.0 - row_start) as usize;
+                    let x = cell.char_x(ch);
+                    let w = cell.char_span(ch);
                     paint_hex_caret(
                         ui,
                         egui::Rect::from_min_size(
-                            egui::pos2(x, resp.rect.top()),
-                            egui::vec2(char_w, resp.rect.height()),
+                            egui::pos2(x, cell.resp.rect.top()),
+                            egui::vec2(w, cell.resp.rect.height()),
                         ),
                         pane == crate::hex::HexPane::Ascii,
                     );
@@ -8103,37 +8129,73 @@ fn hex_byte_bg(
 /// `Label`의 응답 rect는 **글자가 실제로 찬 만큼**이라(마지막 행은 짧다)
 /// 그것으로 클릭을 받으면 짧은 행의 오른쪽 빈 자리가 죽는다. 대신 칸의
 /// 왼쪽 위에 글자를 그리고, 상호작용은 컬럼 폭 전체(`width`)로 따로 잡는다.
-fn paint_hex_cell(
-    ui: &mut egui::Ui,
-    job: egui::text::LayoutJob,
-    width: f32,
-) -> egui::Response {
+/// 그려진 한 칸 — 상호작용 응답과 **실제로 그린 갤리**.
+///
+/// 갤리를 돌려주는 이유가 이 모듈의 핵심 교훈이다. 예전에는 캐럿 위치와
+/// 클릭 역산을 `char_w * 문자수`로 **추정**했는데, `char_w`는 폰트가 알려주는
+/// 이상적 폭(실수)이고 갤리는 글리프를 픽셀 격자에 맞춰 배치한다. 둘의
+/// 소수점 이하 차이가 바이트마다 누적돼, 한 행 끝(32번째 바이트)에서는
+/// 캐럿이 글자 하나 이상 밀렸다. 줌 배율에 따라 반올림 방향이 달라져
+/// "어떤 배율에서만" 어긋나 보이기까지 했다.
+///
+/// 갤리는 자기가 어디에 무엇을 그렸는지 정확히 안다. 그래서 위치를 묻는다.
+struct HexCell {
+    resp: egui::Response,
+    galley: std::sync::Arc<egui::Galley>,
+    /// 갤리 원점(글자 왼쪽 위). 갤리 좌표는 여기서부터의 상대값이다.
+    origin: egui::Pos2,
+}
+
+impl HexCell {
+    /// `ch` 번째 문자의 화면 x. 갤리에게 직접 묻는다.
+    fn char_x(&self, ch: usize) -> f32 {
+        let cursor = self.galley.from_ccursor(egui::text::CCursor::new(ch));
+        self.origin.x + self.galley.pos_from_cursor(&cursor).min.x
+    }
+
+    /// 문자 하나의 실제 폭(그 자리에서 잰다 — 균등폭 폰트라도 반올림 때문에
+    /// 자리마다 1px 다를 수 있다).
+    fn char_span(&self, ch: usize) -> f32 {
+        (self.char_x(ch + 1) - self.char_x(ch)).max(1.0)
+    }
+}
+
+/// 셀 하나를 그리고 갤리째로 돌려준다. 세로 위치는 **행 높이 기준**으로
+/// 잡는다 — 갤리 높이로 중앙을 잡으면 셀마다 내용이 달라 기준선이 흔들려
+/// 오프셋 컬럼과 헥스 컬럼의 줄이 어긋난다.
+fn paint_hex_cell(ui: &mut egui::Ui, job: egui::text::LayoutJob) -> HexCell {
     let cell = ui.max_rect();
     let galley = ui.fonts(|f| f.layout_job(job));
-    let origin = egui::pos2(cell.left(), cell.center().y - galley.size().y * 0.5);
-    ui.painter().with_clip_rect(cell).galley(
-        origin,
-        galley,
-        ui.visuals().text_color(),
-    );
-    // 상호작용 rect는 글자 원점에서 시작해야 클릭 x → 문자 컬럼 산술이
-    // 맞는다(`hex_click_byte`는 글자 첫 칸을 0으로 본다).
+    // 모든 칸이 같은 규칙으로 세로 정렬되도록 행 높이 기준 중앙에 둔다.
+    let origin = egui::pos2(cell.left(), cell.top() + (ROW_HEIGHT - galley.size().y) * 0.5);
+    ui.painter()
+        .with_clip_rect(cell)
+        .galley(origin, galley.clone(), ui.visuals().text_color());
+    // 상호작용 rect는 글자 원점에서 시작한다. 폭은 갤리가 실제로 차지한
+    // 만큼(셀을 넘지 않게 클램프) — 추정 폭을 쓰면 마지막 바이트가 판정에서
+    // 빠진다.
     let hit = egui::Rect::from_min_size(
         egui::pos2(origin.x, cell.top()),
-        egui::vec2(width.min(cell.width()), cell.height()),
+        egui::vec2(galley.size().x.min(cell.width()), cell.height()),
     );
-    ui.interact(hit, ui.id().with("hexcell"), egui::Sense::click_and_drag())
+    let resp = ui.interact(hit, ui.id().with("hexcell"), egui::Sense::click_and_drag());
+    HexCell { resp, galley, origin }
 }
 
 /// 헥스/문자 칸의 포인터 상호작용 → (문자 컬럼, 선택 확장인가).
 /// 누름 시작·클릭·드래그 전부를 같은 통로로 받는다 — 드래그는 앵커를 유지해야
 /// 하므로 `extend`로 표시한다.
-fn hex_cell_hit(resp: &egui::Response, char_w: f32, shift_down: bool) -> Option<(usize, bool)> {
+///
+/// 문자 컬럼은 **갤리에게 묻는다**(`char_x`와 같은 좌표계). 나눗셈으로
+/// 추정하면 캐럿을 그린 자리와 클릭이 해석되는 자리가 어긋난다.
+fn hex_cell_hit(cell: &HexCell, shift_down: bool) -> Option<(usize, bool)> {
+    let resp = &cell.resp;
     let pos = resp.interact_pointer_pos()?;
     if !(resp.clicked() || resp.drag_started() || resp.dragged()) {
         return None;
     }
-    let col = ((pos.x - resp.rect.left()) / char_w).max(0.0) as usize;
+    let rel = pos - cell.origin;
+    let col = cell.galley.cursor_from_pos(rel).ccursor.index;
     // 새 누름(클릭/드래그 시작)은 앵커를 새로 잡고, 이어지는 드래그와
     // Shift는 확장이다.
     let extend = shift_down || (resp.dragged() && !resp.drag_started());
@@ -15109,6 +15171,106 @@ mod tests {
         );
         assert_eq!(h.pane, crate::hex::HexPane::Hex, "클릭한 패널이 활성이 된다");
         assert!(h.sel.is_none(), "Shift 없는 단순 클릭은 선택을 만들지 않는다");
+    }
+
+    /// 행 **끝** 바이트를 오차 없이 찍는다. 위 테스트는 세 번째 바이트를 ±1
+    /// 허용으로 보므로, 오차가 바이트마다 누적되는 결함을 놓친다.
+    ///
+    /// **한계를 분명히 해 둔다.** 이 테스트는 원래의 시각적 결함(사용자가 본
+    /// "오른쪽으로 갈수록 캐럿이 다른 글자 위에 있다")을 **재현하지 못한다**.
+    /// 확인해 봤다: 클릭 역산을 옛 `폭 ÷ 문자수` 나눗셈으로 되돌려도 이
+    /// 테스트는 통과한다. 헤드리스 egui의 기본 폰트가 완전한 균등폭이라 두
+    /// 방식이 같은 답을 내기 때문이다. 실제 화면에서는 폰트 힌팅·줌 배율에
+    /// 따른 픽셀 반올림이 누적돼 어긋났다.
+    ///
+    /// 그래도 남겨 두는 이유: 클릭 좌표계가 렌더 좌표계에 붙어 있다는 것
+    /// (셀 원점 기준, 마지막 바이트도 판정 범위 안)은 지켜지고, 폭 계산이
+    /// 갤리에서 떨어져 나가면 여기서 깨진다. **시각 정렬 자체는 사람이
+    /// 화면으로 확인해야 한다** — 이 코드베이스의 헤드리스 테스트로는
+    /// 도달할 수 없는 종류의 결함이다.
+    #[test]
+    fn hex_click_is_exact_at_the_end_of_a_row() {
+        use crate::hex::BYTES_PER_ROW;
+        let mut app = hex_test_doc(&vec![0x41u8; 256]);
+        let ctx = egui::Context::default();
+        let base = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        // 렌더가 그린 셀의 실제 좌표를 받아 온다 — 테스트가 폭 계산을
+        // 베껴 쓰면 렌더와 함께 틀려도 통과한다(이 결함이 그랬다).
+        let probe: std::cell::Cell<Option<(f32, f32, f32)>> = std::cell::Cell::new(None);
+        let draw = |app: &mut App, input: egui::RawInput| {
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_hex(ui, app.doc_mut().unwrap(), &mut String::new());
+                    // 첫 행 헥스 셀의 마지막 바이트 위치를 렌더와 같은
+                    // 방식(갤리)으로 계산해 둔다.
+                    if probe.get().is_none() {
+                        let font = text_font_id();
+                        let color = ui.visuals().text_color();
+                        let prefix = "FF ".repeat(BYTES_PER_ROW - 1);
+                        let g = ui.fonts(|f| {
+                            f.layout_no_wrap(prefix, font.clone(), color)
+                        });
+                        let one = ui.fonts(|f| {
+                            f.layout_no_wrap("FF".to_owned(), font.clone(), color)
+                        });
+                        probe.set(Some((g.size().x, one.size().x, 0.0)));
+                    }
+                });
+            });
+        };
+        draw(&mut app, base.clone());
+
+        // 마지막 바이트가 그려지는 x는 (앞 31바이트 폭) + (그 바이트 중앙).
+        let (prefix_w, byte_w, _) = probe.get().expect("첫 프레임에서 재어 둔다");
+        let hex_cell_left = {
+            // 헥스 셀은 오프셋 컬럼 다음이다. 오프셋 폭도 렌더와 같은
+            // 방식으로 잰다.
+            let off_w = crate::hex::offset_width(256);
+            let font = text_font_id();
+            ctx.fonts(|f| {
+                f.layout_no_wrap("0".repeat(off_w + 2), font, egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+        };
+        // CentralPanel 기본 마진(8) + 컬럼 사이 간격은 egui가 정하므로,
+        // 마지막 바이트의 **중앙**을 노려 한 칸 오차에 강건하게 만든다.
+        let x = 8.0 + hex_cell_left + ctx.style().spacing.item_spacing.x + prefix_w + byte_w * 0.5;
+        let y = 8.0 + ROW_HEIGHT * 0.5;
+        let pos = egui::pos2(x, y);
+        let click_input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..base.clone()
+        };
+        draw(&mut app, click_input);
+
+        let h = app.doc().unwrap().hex.as_ref().unwrap();
+        assert_eq!(
+            h.caret.0,
+            (BYTES_PER_ROW - 1) as u64,
+            "행 마지막 바이트를 눌렀으면 정확히 그 바이트여야 한다(got {:?})",
+            h.caret
+        );
     }
 
     /// 헥스도 `pending_scroll_row`를 소비하고 관측값을 기록해야 한다 —
