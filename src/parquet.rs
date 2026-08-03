@@ -8,7 +8,17 @@
 //! "수정분만 반영해 저장"이 가능한 것은 바이트 오프셋이 안정적이기
 //! 때문인데, Parquet에는 그 성질이 없다.
 
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashSet;
+use std::path::Path;
+
+/// 한 번에 캐시하는 row group 수. 위아래로 스크롤할 때 방금 지나온 그룹이
+/// 살아 있도록 넷을 둔다. row group은 보통 수십~수백 MB이므로 더 늘리면
+/// 메모리가 위험하다.
+const CACHE_GROUPS: usize = 4;
+
+/// 배치 크기. 한 번에 이만큼씩 디코드해 문자열로 만든다.
+const BATCH_ROWS: usize = 8192;
 
 /// 천 단위 쉼표를 넣는다. 셀 값은 인용 규칙을 타므로(`quote_cell`) 쉼표가
 /// 컬럼을 깨지 않는다.
@@ -222,6 +232,311 @@ pub fn geometry_columns(geo_json: Option<&str>) -> HashSet<String> {
         }
     }
     out
+}
+
+/// 디코드된 row group 하나.
+struct CachedGroup {
+    index: usize,
+    /// 이 캐시를 만든 컬럼 집합. **키의 일부다** — 넣지 않으면 가로 스크롤로
+    /// 보이는 컬럼이 바뀌었을 때 예전 집합으로 디코드된 캐시가 그대로 쓰여
+    /// 빈 셀이 나온다. None이면 전체 컬럼.
+    cols: Option<Vec<usize>>,
+    /// `rows[행][열]` 문자열.
+    rows: Vec<Vec<String>>,
+}
+
+/// 읽기 전용 Parquet 문서. **푸터만 읽어 즉시 열리고**, 셀은 row group 단위로
+/// 디코드해 LRU로 캐시한다.
+pub struct ParquetDoc {
+    path: std::path::PathBuf,
+    total_rows: u64,
+    columns: Vec<String>,
+    /// geometry로 표시할 컬럼(스키마 순서 기준 인덱스).
+    geometry_cols: HashSet<usize>,
+    /// 숫자 타입 컬럼. 정렬 키 판정에 쓴다 — Parquet은 타입이 확정적이라
+    /// 텍스트 경로처럼 "숫자로 보이는지" 추론할 필요가 없다.
+    numeric_cols: HashSet<usize>,
+    /// 각 row group의 시작 파일 행번호. 길이는 그룹 수 + 1이고 마지막은
+    /// `total_rows`다. 파일 행 → 그룹을 이진탐색으로 찾는다.
+    group_starts: Vec<u64>,
+    /// 화면에 보이는 컬럼(스키마 인덱스). None이면 전체.
+    visible: Option<Vec<usize>>,
+    /// 최근 쓴 것이 뒤에 오는 LRU.
+    cache: Vec<CachedGroup>,
+}
+
+/// Parquet 파일을 연다. **푸터만 읽으므로 파일 크기와 무관하게 즉시다** —
+/// CSV처럼 개행을 세러 전체를 훑지 않는다.
+pub fn open(path: &Path) -> Result<ParquetDoc, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("파일을 열 수 없습니다: {e}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("Parquet으로 읽을 수 없습니다: {e}"))?;
+
+    let meta = builder.metadata();
+    let total_rows = meta.file_metadata().num_rows().max(0) as u64;
+
+    // 각 row group의 시작 행번호를 누적한다.
+    let mut group_starts = Vec::with_capacity(meta.num_row_groups() + 1);
+    let mut acc = 0u64;
+    for i in 0..meta.num_row_groups() {
+        group_starts.push(acc);
+        acc += meta.row_group(i).num_rows().max(0) as u64;
+    }
+    group_starts.push(acc);
+
+    let schema = builder.schema();
+    let columns: Vec<String> = schema.fields().iter().map(|f| f.name().to_string()).collect();
+
+    let numeric_cols = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            use arrow_schema::DataType as D;
+            matches!(
+                f.data_type(),
+                D::Int8
+                    | D::Int16
+                    | D::Int32
+                    | D::Int64
+                    | D::UInt8
+                    | D::UInt16
+                    | D::UInt32
+                    | D::UInt64
+                    | D::Float16
+                    | D::Float32
+                    | D::Float64
+                    | D::Decimal128(_, _)
+                    | D::Decimal256(_, _)
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    // GeoParquet: `geo` 키-값 메타데이터에서 geometry 컬럼 이름을 뽑아
+    // 인덱스로 바꾼다. 없으면 빈 집합이고 바이너리는 길이 요약으로 나온다.
+    let geo_json = meta
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|e| e.key == "geo"))
+        .and_then(|e| e.value.clone());
+    let geo_names = geometry_columns(geo_json.as_deref());
+    let geometry_cols = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| geo_names.contains(*n))
+        .map(|(i, _)| i)
+        .collect();
+
+    Ok(ParquetDoc {
+        path: path.to_path_buf(),
+        total_rows,
+        columns,
+        geometry_cols,
+        numeric_cols,
+        group_starts,
+        visible: None,
+        cache: Vec::new(),
+    })
+}
+
+impl ParquetDoc {
+    /// 파일의 **데이터** 행 수. 화면의 논리 행 수는 여기에 헤더 1을 더한 값이다
+    /// (`app::doc_line_count` 참조).
+    pub fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    pub fn column_names(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// 이 컬럼이 숫자 타입인가. **Parquet은 타입이 확정적이라** 텍스트 경로의
+    /// "숫자로 보이는지" 추론이 필요 없다 — 스키마가 답을 갖고 있다.
+    pub fn column_is_numeric(&self, col: usize) -> bool {
+        self.numeric_cols.contains(&col)
+    }
+
+    /// 화면에 보이는 컬럼을 지정한다. 컬럼 지향 포맷의 핵심 이점 — 100개 중
+    /// 8개만 보이면 디코드 비용이 1/12이다. 집합이 바뀌면 캐시를 버린다.
+    ///
+    /// **찾기·정렬·내보내기는 이 값에 영향받으면 안 된다**(안 보이는 컬럼의
+    /// 매치를 놓친다). `app::widen_parquet_to_all_columns`가 그 전에 None으로
+    /// 되돌린다.
+    pub fn set_visible_columns(&mut self, cols: Option<Vec<usize>>) {
+        if self.visible != cols {
+            self.visible = cols;
+            self.cache.clear();
+        }
+    }
+
+    /// 논리 행 → 한 줄 문자열.
+    ///
+    /// **인덱스 규약**: 논리 행 0은 **헤더**(컬럼 이름)이고, 논리 행 k(≥1)는
+    /// 파일 행 k-1이다. 혼동하면 모든 행이 하나씩 밀린다.
+    pub fn row_line(&mut self, logical: usize, delim: u8) -> Option<String> {
+        if logical == 0 {
+            let names: Vec<String> = match &self.visible {
+                Some(v) => v
+                    .iter()
+                    .filter_map(|&i| self.columns.get(i))
+                    .map(|c| sanitize_cell(c))
+                    .collect(),
+                None => self.columns.iter().map(|c| sanitize_cell(c)).collect(),
+            };
+            return Some(join_row(&names, delim));
+        }
+        let file_row = (logical - 1) as u64;
+        if file_row >= self.total_rows {
+            return None;
+        }
+        let g = self.group_of(file_row)?;
+        self.ensure_group(g).ok()?;
+        let start = self.group_starts[g];
+        let cached = self.cache.iter().find(|c| c.index == g)?;
+        let cells = cached.rows.get((file_row - start) as usize)?;
+        Some(join_row(cells, delim))
+    }
+
+    /// 정렬 키용 — 한 컬럼의 **모든 행** 값. 다른 컬럼은 디코드하지 않는다.
+    /// `visible`과 무관하다(정렬은 보이는 것과 상관없이 동작해야 한다).
+    pub fn column_values(&mut self, col: usize) -> Result<Vec<String>, String> {
+        let mut out = Vec::with_capacity(self.total_rows as usize);
+        for g in 0..self.group_starts.len().saturating_sub(1) {
+            let rows = self.decode_group(g, Some(&[col]))?;
+            for r in rows {
+                out.push(r.into_iter().next().unwrap_or_default());
+            }
+        }
+        Ok(out)
+    }
+
+    /// 문자열 컬럼의 평균 길이 추정. **첫 row group만 재서** 전체를 추정한다 —
+    /// 푸터 통계가 아니라 실제 값을 재므로 대표성이 있고, 한 그룹이라 싸다.
+    /// 숫자 컬럼이면 0(정렬 키가 고정 폭이라 길이가 의미 없다).
+    pub fn estimated_avg_len(&mut self, col: usize) -> usize {
+        if self.column_is_numeric(col) || self.group_starts.len() < 2 {
+            return 0;
+        }
+        let Ok(rows) = self.decode_group(0, Some(&[col])) else {
+            return 0;
+        };
+        if rows.is_empty() {
+            return 0;
+        }
+        let total: usize = rows.iter().filter_map(|r| r.first()).map(|s| s.len()).sum();
+        total / rows.len()
+    }
+
+    /// 파일 행이 속한 row group. `group_starts`가 오름차순이라 이진탐색.
+    fn group_of(&self, file_row: u64) -> Option<usize> {
+        if self.group_starts.len() < 2 {
+            return None;
+        }
+        let last = self.group_starts.len() - 2;
+        match self.group_starts.binary_search(&file_row) {
+            Ok(i) => Some(i.min(last)),
+            Err(i) => Some(i.saturating_sub(1).min(last)),
+        }
+    }
+
+    /// 그룹이 캐시에 없으면 디코드해 넣는다. 가장 오래된 것을 앞에서 밀어낸다.
+    fn ensure_group(&mut self, g: usize) -> Result<(), String> {
+        if let Some(pos) = self
+            .cache
+            .iter()
+            .position(|c| c.index == g && c.cols == self.visible)
+        {
+            // 최근 사용으로 올린다.
+            let item = self.cache.remove(pos);
+            self.cache.push(item);
+            return Ok(());
+        }
+        // 컬럼 집합이 바뀐 같은 그룹의 낡은 캐시는 버린다.
+        self.cache.retain(|c| c.index != g);
+        let cols = self.visible.clone();
+        let rows = self.decode_group(g, cols.as_deref())?;
+        if self.cache.len() >= CACHE_GROUPS {
+            self.cache.remove(0);
+        }
+        self.cache.push(CachedGroup {
+            index: g,
+            cols,
+            rows,
+        });
+        Ok(())
+    }
+
+    /// row group 하나를 디코드해 행별 문자열 벡터로 만든다.
+    /// `cols`가 있으면 그 컬럼만 읽는다(컬럼 프로젝션).
+    fn decode_group(&self, g: usize, cols: Option<&[usize]>) -> Result<Vec<Vec<String>>, String> {
+        use arrow_cast::display::{ArrayFormatter, FormatOptions};
+        use parquet::arrow::ProjectionMask;
+
+        let file = std::fs::File::open(&self.path).map_err(|e| format!("파일 읽기 실패: {e}"))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| format!("Parquet 읽기 실패: {e}"))?;
+        let mask = match cols {
+            Some(c) => ProjectionMask::roots(builder.parquet_schema(), c.iter().copied()),
+            None => ProjectionMask::all(),
+        };
+        let reader = builder
+            .with_row_groups(vec![g])
+            .with_projection(mask)
+            .with_batch_size(BATCH_ROWS)
+            .build()
+            .map_err(|e| format!("row group {g} 디코드 실패: {e}"))?;
+
+        // **프로젝션을 쓰면 배치의 컬럼 순서가 원본 스키마와 달라진다.**
+        // geometry 판정은 반드시 원본 인덱스로 해야 한다.
+        let orig_idx: Vec<usize> = match cols {
+            Some(c) => c.to_vec(),
+            None => (0..self.columns.len()).collect(),
+        };
+
+        let mut out = Vec::new();
+        let opts = FormatOptions::default();
+        for batch in reader {
+            let b = batch.map_err(|e| format!("row group {g} 배치 실패: {e}"))?;
+            // 포매터는 컬럼마다 한 번만 만든다(행마다 만들면 비싸다).
+            let fmts: Vec<Option<ArrayFormatter>> = (0..b.num_columns())
+                .map(|c| ArrayFormatter::try_new(b.column(c).as_ref(), &opts).ok())
+                .collect();
+            for r in 0..b.num_rows() {
+                let mut cells = Vec::with_capacity(b.num_columns());
+                for c in 0..b.num_columns() {
+                    let col = b.column(c);
+                    let oi = orig_idx.get(c).copied().unwrap_or(c);
+                    // null은 ArrayFormatter가 `<null>`로 내므로 빈 문자열로 바꾼다 —
+                    // `NULL`이라 쓰면 실제 문자열 "NULL"과 구분되지 않고, CSV로
+                    // 내보낼 때도 빈 값이 관행이다.
+                    if col.is_null(r) {
+                        cells.push(String::new());
+                        continue;
+                    }
+                    // 바이너리는 16진수 덤프(21바이트가 42자) 대신 요약으로.
+                    let is_geo = self.geometry_cols.contains(&oi);
+                    if let Some(bin) = col.as_any().downcast_ref::<arrow_array::BinaryArray>() {
+                        cells.push(format_binary_cell(bin.value(r), is_geo));
+                        continue;
+                    }
+                    if let Some(bin) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>()
+                    {
+                        cells.push(format_binary_cell(bin.value(r), is_geo));
+                        continue;
+                    }
+                    match &fmts[c] {
+                        Some(f) => cells.push(sanitize_cell(&f.value(r).to_string())),
+                        // 포맷할 수 없는 타입은 그 셀만 포기하고 계속 간다 —
+                        // 한 컬럼 때문에 파일 전체를 못 보면 안 된다.
+                        None => cells.push("<unsupported>".to_string()),
+                    }
+                }
+                out.push(cells);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +816,244 @@ mod tests {
     #[test]
     fn geometry_columns_is_empty_without_geo_metadata() {
         assert!(super::geometry_columns(None).is_empty(), "geo 키 없음");
+    }
+
+    // ---- ParquetDoc: 열기와 행 조회 ----
+
+    #[test]
+    fn open_reads_row_count_and_columns_from_footer() {
+        let p = temp_path("open");
+        write_simple(&p, vec![1, 2, 3], vec![Some("가"), None, Some("다")]);
+        let d = super::open(&p).unwrap();
+        assert_eq!(d.total_rows(), 3);
+        assert_eq!(d.column_names(), &["id".to_string(), "name".to_string()]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn open_rejects_a_non_parquet_file() {
+        let p = temp_path("bad");
+        std::fs::write(&p, b"this is not parquet at all").unwrap();
+        assert!(super::open(&p).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn row_line_zero_is_the_header_row() {
+        let p = temp_path("hdr");
+        write_simple(&p, vec![7], vec![Some("x")]);
+        let mut d = super::open(&p).unwrap();
+        assert_eq!(d.row_line(0, b',').as_deref(), Some("id,name"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn row_line_k_returns_file_row_k_minus_one() {
+        // 인덱스 규약: 논리 행 k는 파일 행 k-1이다.
+        let p = temp_path("rows");
+        write_simple(&p, vec![10, 20], vec![Some("가"), Some("나")]);
+        let mut d = super::open(&p).unwrap();
+        assert_eq!(d.row_line(1, b',').as_deref(), Some("10,가"));
+        assert_eq!(d.row_line(2, b',').as_deref(), Some("20,나"));
+        assert_eq!(d.row_line(3, b','), None, "범위 밖");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn null_cells_render_as_empty_string() {
+        let p = temp_path("null");
+        write_simple(&p, vec![1], vec![None]);
+        let mut d = super::open(&p).unwrap();
+        // ArrayFormatter는 null을 <null>로 내므로 직접 빈 문자열로 바꾼다.
+        assert_eq!(d.row_line(1, b',').as_deref(), Some("1,"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn cells_needing_quotes_round_trip_from_a_real_file() {
+        let p = temp_path("quote");
+        write_simple(&p, vec![1], vec![Some("a,b\"c")]);
+        let mut d = super::open(&p).unwrap();
+        let line = d.row_line(1, b',').unwrap();
+        let back = crate::parse::split_fields(&line, b',');
+        assert_eq!(back, vec!["1".to_string(), "a,b\"c".to_string()]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn cells_containing_newlines_are_flattened_to_one_line() {
+        let p = temp_path("nl");
+        write_simple(&p, vec![1], vec![Some("첫줄\n둘째줄")]);
+        let mut d = super::open(&p).unwrap();
+        let line = d.row_line(1, b',').unwrap();
+        assert!(!line.contains('\n'), "개행이 남으면 행 정렬이 깨진다: {line}");
+        assert_eq!(line, "1,첫줄 둘째줄");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn geometry_column_shows_wkb_summary() {
+        let p = temp_path("geo");
+        let pt = wkb_point(127.024, 37.512);
+        let j = r#"{"columns":{"geometry":{"encoding":"WKB"}}}"#;
+        write_with_geo(&p, vec![pt.as_slice()], Some(j));
+        let mut d = super::open(&p).unwrap();
+        let line = d.row_line(1, b',').unwrap();
+        // POINT 요약에는 쉼표가 없어 인용되지 않는다. 중요한 것은 인용 여부가
+        // 아니라 **왕복**이다 — 표가 이 줄을 되잘라 원래 셀을 얻어야 한다.
+        assert_eq!(
+            crate::parse::split_fields(&line, b','),
+            vec!["POINT(127.024 37.512)".to_string(), "r0".to_string()]
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn polygon_summary_with_thousands_separator_round_trips() {
+        // `POLYGON(1,204 pts)`에는 쉼표가 있어 인용이 필요하다. 인용이 없으면
+        // 이 한 셀이 두 컬럼으로 갈려 표 전체가 밀린다.
+        let p = temp_path("geopoly");
+        // 링 1개에 좌표 1,204개.
+        let mut poly = vec![1u8, 3, 0, 0, 0];
+        poly.extend_from_slice(&1u32.to_le_bytes());
+        poly.extend_from_slice(&1204u32.to_le_bytes());
+        for i in 0..1204u32 {
+            poly.extend_from_slice(&(i as f64).to_le_bytes());
+            poly.extend_from_slice(&(i as f64).to_le_bytes());
+        }
+        let j = r#"{"columns":{"geometry":{"encoding":"WKB"}}}"#;
+        write_with_geo(&p, vec![poly.as_slice()], Some(j));
+        let mut d = super::open(&p).unwrap();
+        let line = d.row_line(1, b',').unwrap();
+        assert!(line.starts_with("\"POLYGON(1,204 pts)\""), "인용 필요: {line}");
+        assert_eq!(
+            crate::parse::split_fields(&line, b','),
+            vec!["POLYGON(1,204 pts)".to_string(), "r0".to_string()],
+            "쉼표가 든 요약이 한 셀로 유지돼야 한다"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn binary_column_without_geo_metadata_shows_length() {
+        let p = temp_path("nogeo");
+        let pt = wkb_point(1.0, 2.0);
+        write_with_geo(&p, vec![pt.as_slice()], None);
+        let mut d = super::open(&p).unwrap();
+        let line = d.row_line(1, b',').unwrap();
+        assert!(line.starts_with("<binary 21 B>"), "실제: {line}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn empty_parquet_has_header_but_no_data_rows() {
+        let p = temp_path("empty");
+        write_simple(&p, vec![], vec![]);
+        let mut d = super::open(&p).unwrap();
+        assert_eq!(d.total_rows(), 0);
+        assert_eq!(d.row_line(0, b',').as_deref(), Some("id,name"), "헤더는 있다");
+        assert_eq!(d.row_line(1, b','), None);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn column_values_returns_every_row_for_sorting() {
+        let p = temp_path("colvals");
+        write_simple(&p, vec![3, 1, 2], vec![Some("c"), Some("a"), Some("b")]);
+        let mut d = super::open(&p).unwrap();
+        assert_eq!(d.column_values(0).unwrap(), vec!["3", "1", "2"]);
+        assert_eq!(d.column_values(1).unwrap(), vec!["c", "a", "b"]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn numeric_columns_are_known_from_the_schema() {
+        // Parquet은 타입이 확정적이라 "숫자로 보이는지" 추론이 필요 없다.
+        let p = temp_path("numeric");
+        write_simple(&p, vec![1], vec![Some("가")]);
+        let d = super::open(&p).unwrap();
+        assert!(d.column_is_numeric(0), "id는 int64");
+        assert!(!d.column_is_numeric(1), "name은 utf8");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- 컬럼 프로젝션 ----
+
+    #[test]
+    fn changing_visible_columns_invalidates_the_cache() {
+        // 컬럼 집합을 캐시 키에 넣지 않으면 가로 스크롤 후 예전 집합으로
+        // 디코드된 캐시가 그대로 쓰여 빈 셀이 나온다.
+        let p = temp_path("proj");
+        write_simple(&p, vec![7], vec![Some("가")]);
+        let mut d = super::open(&p).unwrap();
+
+        d.set_visible_columns(Some(vec![0]));
+        assert_eq!(d.row_line(1, b',').as_deref(), Some("7"), "첫 컬럼만");
+
+        d.set_visible_columns(Some(vec![1]));
+        assert_eq!(
+            d.row_line(1, b',').as_deref(),
+            Some("가"),
+            "두 번째 컬럼만 — 캐시가 무효화됐다"
+        );
+
+        d.set_visible_columns(None);
+        assert_eq!(d.row_line(1, b',').as_deref(), Some("7,가"), "전체");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn header_row_follows_visible_columns() {
+        let p = temp_path("projhdr");
+        write_simple(&p, vec![1], vec![Some("x")]);
+        let mut d = super::open(&p).unwrap();
+        d.set_visible_columns(Some(vec![1]));
+        assert_eq!(d.row_line(0, b',').as_deref(), Some("name"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn column_values_ignores_the_visible_set() {
+        // 정렬은 보이는 컬럼과 무관하게 지정 컬럼 전체를 읽어야 한다.
+        let p = temp_path("projsort");
+        write_simple(&p, vec![2, 1], vec![Some("b"), Some("a")]);
+        let mut d = super::open(&p).unwrap();
+        d.set_visible_columns(Some(vec![0]));
+        assert_eq!(
+            d.column_values(1).unwrap(),
+            vec!["b", "a"],
+            "안 보여도 읽는다"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn geometry_summary_survives_projection_reordering() {
+        // 프로젝션을 쓰면 배치의 컬럼 순서가 원본과 달라진다. geometry
+        // 판정을 배치 인덱스로 하면 엉뚱한 컬럼을 요약하게 된다.
+        let p = temp_path("projgeo");
+        let pt = wkb_point(1.0, 2.0);
+        let j = r#"{"columns":{"geometry":{"encoding":"WKB"}}}"#;
+        write_with_geo(&p, vec![pt.as_slice()], Some(j));
+        let mut d = super::open(&p).unwrap();
+        // geometry(0)만 보이게 하면 배치 인덱스도 0이라 우연히 맞는다.
+        // name(1)만 보이게 하면 배치 인덱스 0이 name이므로, 원본 인덱스로
+        // 판정하지 않으면 name을 geometry로 오인한다.
+        d.set_visible_columns(Some(vec![1]));
+        assert_eq!(d.row_line(1, b',').as_deref(), Some("r0"), "name은 그대로");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn geometry_summary_still_works_when_projected_alone() {
+        let p = temp_path("projgeo2");
+        let pt = wkb_point(1.0, 2.0);
+        let j = r#"{"columns":{"geometry":{"encoding":"WKB"}}}"#;
+        write_with_geo(&p, vec![pt.as_slice()], Some(j));
+        let mut d = super::open(&p).unwrap();
+        d.set_visible_columns(Some(vec![0]));
+        assert_eq!(d.row_line(1, b',').as_deref(), Some("POINT(1 2)"));
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
