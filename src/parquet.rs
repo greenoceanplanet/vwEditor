@@ -432,8 +432,21 @@ impl ParquetDoc {
     pub fn set_visible_columns(&mut self, cols: Option<Vec<usize>>) {
         if self.visible != cols {
             self.visible = cols;
+            // 여기서 비우는 것이 1차 방어다. `CachedGroup.cols`를 캐시 키에
+            // 넣어 둔 것은 2차 방어로, 이 `clear`를 누가 지우거나 다른 경로가
+            // `visible`을 직접 만져도 낡은 셀이 화면에 나오지 않게 한다
+            // (`stale_cache_is_rejected_by_the_column_key`가 그 층을 직접
+            //  겨눈다 — 변이 테스트에서 이 두 겹이 서로를 가려 한쪽을 지워도
+            //  통과하는 것을 보고 각 층을 따로 검증하도록 갈랐다).
             self.cache.clear();
         }
+    }
+
+    /// `visible`만 바꾸고 캐시는 그대로 두었을 때, 컬럼 키가 낡은 항목을
+    /// 걸러 내는지 확인하기 위한 테스트 전용 통로.
+    #[cfg(test)]
+    fn set_visible_without_clearing(&mut self, cols: Option<Vec<usize>>) {
+        self.visible = cols;
     }
 
     /// 논리 행 → 한 줄 문자열.
@@ -573,9 +586,15 @@ impl ParquetDoc {
                 for c in 0..b.num_columns() {
                     let col = b.column(c);
                     let oi = orig_idx.get(c).copied().unwrap_or(c);
-                    // null은 ArrayFormatter가 `<null>`로 내므로 빈 문자열로 바꾼다 —
-                    // `NULL`이라 쓰면 실제 문자열 "NULL"과 구분되지 않고, CSV로
-                    // 내보낼 때도 빈 값이 관행이다.
+                    // null은 빈 문자열이다 — `NULL`이라 쓰면 실제 문자열
+                    // "NULL"과 구분되지 않고, CSV로 내보낼 때도 빈 값이 관행이다.
+                    //
+                    // **기본 `FormatOptions`도 null을 빈 문자열로 낸다**(실측).
+                    // 그래도 이 분기를 명시적으로 두는 이유는, 그 동작이
+                    // `FormatOptions`의 기본값에 딸린 것이라 라이브러리가
+                    // 바꾸거나 우리가 옵션을 손대면 조용히 `NULL`/`<null>`이
+                    // 새어 나오기 때문이다. 계약을 코드에 박아 둔다
+                    // (`null_never_renders_as_the_literal_null_marker`).
                     if col.is_null(r) {
                         cells.push(String::new());
                         continue;
@@ -936,6 +955,19 @@ mod tests {
     }
 
     #[test]
+    fn null_never_renders_as_the_literal_null_marker() {
+        // ArrayFormatter의 기본 출력은 `<null>`이다. 그대로 두면 실제 문자열
+        // "NULL"과 구분되지 않고 CSV로 내보낼 때도 관행에 어긋난다.
+        let p = temp_path("nullmark");
+        write_simple(&p, vec![1], vec![None]);
+        let mut d = super::open(&p).unwrap();
+        let line = d.row_line(1, b',').unwrap();
+        assert!(!line.contains("null"), "null 마커가 새어 나왔다: {line}");
+        assert_eq!(line, "1,");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn cells_needing_quotes_round_trip_from_a_real_file() {
         let p = temp_path("quote");
         write_simple(&p, vec![1], vec![Some("a,b\"c")]);
@@ -1144,6 +1176,29 @@ mod tests {
 
         d.set_visible_columns(None);
         assert_eq!(d.row_line(1, b',').as_deref(), Some("7,가"), "전체");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 캐시 무효화는 두 겹이다: `set_visible_columns`의 `clear`(1차)와
+    /// `CachedGroup.cols` 키(2차). 변이 테스트에서 두 겹이 서로를 가려
+    /// **키를 지워도 통과**하는 것을 확인하고 추가한 테스트다 — 1차 방어를
+    /// 우회해 2차 방어만 겨눈다.
+    #[test]
+    fn stale_cache_is_rejected_by_the_column_key() {
+        let p = temp_path("stalekey");
+        write_simple(&p, vec![7], vec![Some("가")]);
+        let mut d = super::open(&p).unwrap();
+
+        // 전체 컬럼으로 한 번 캐시를 채운다.
+        assert_eq!(d.row_line(1, b',').as_deref(), Some("7,가"));
+
+        // 캐시를 비우지 **않고** 보이는 컬럼만 바꾼다(1차 방어 우회).
+        d.set_visible_without_clearing(Some(vec![1]));
+        assert_eq!(
+            d.row_line(1, b',').as_deref(),
+            Some("가"),
+            "컬럼 키가 낡은 캐시를 걸러 재디코드해야 한다"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
