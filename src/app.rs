@@ -4301,8 +4301,19 @@ fn hex_needle(query: &str, as_hex: bool) -> Option<Vec<u8>> {
 }
 
 /// 다음 매치를 찾아 last_match와 스크롤 요청을 갱신한다.
+///
+/// 빈 검색어는 "Invalid pattern"이 아니라 텍스트 모드(`apply_find_action`)와
+/// 같은 문구 "Enter text to find"를 쓴다 — 갓 연 빈 패널에서 Find Next를
+/// 누르는 가장 기본적인 조작을 "입력이 잘못됐다"고 나무라면 안 된다.
+/// 이 경우는 검색을 아예 실행하지 않는 no-op이므로 `last_match`(있다면
+/// 이전 매치 하이라이트)를 건드리지 않는다 — 텍스트 쪽의 같은 조기 반환이
+/// `last_match`를 그대로 두는 것과 같은 규율이다.
 fn hex_find_next(doc: &mut Document) {
     let Some(h) = doc.hex.as_ref() else { return };
+    if doc.find_query.is_empty() {
+        doc.find_status = "Enter text to find".into();
+        return;
+    }
     let Some(needle) = hex_needle(&doc.find_query, h.find_hex) else {
         doc.find_status = "Invalid pattern".into();
         return;
@@ -16603,6 +16614,38 @@ mod tests {
         doc.find_query = "SQLite".into();
         hex_find_next(doc);
         assert_eq!(doc.hex.as_ref().unwrap().last_match, Some((3, 6)));
+    }
+
+    /// 빈 검색어와 해석 불가 검색어는 서로 다른 안내를 내야 한다 — 빈 검색어를
+    /// "Invalid pattern"으로 부르면 갓 연 빈 패널에서 Find Next를 누르는 가장
+    /// 기본적인 조작조차 사용자 잘못처럼 보인다(리뷰 지적). 빈 검색어는
+    /// 텍스트 모드(`apply_find_action`)와 같은 문구 "Enter text to find"를
+    /// 쓰고, 검색을 아예 실행하지 않는 no-op이므로 기존 `last_match`를 그대로
+    /// 둔다. 진짜 해석 불가(홀수 자리·16진수 아닌 문자)만 "Invalid pattern".
+    #[test]
+    fn hex_find_next_distinguishes_empty_query_from_invalid_pattern() {
+        let mut app = hex_test_doc(&[0x4F, 0x4B, 0x00, 0x4F, 0x4B]);
+        let doc = app.doc_mut().unwrap();
+        // 먼저 매치를 하나 만들어 last_match를 채워 둔다.
+        doc.find_query = "4F 4B".into();
+        hex_find_next(doc);
+        let prior_match = doc.hex.as_ref().unwrap().last_match;
+        assert_eq!(prior_match, Some((0, 2)), "사전 조건: 매치가 있어야 한다");
+
+        // 빈 검색어 — "Enter text to find"이고, no-op이라 last_match는 그대로다.
+        doc.find_query = String::new();
+        hex_find_next(doc);
+        assert_eq!(doc.find_status, "Enter text to find");
+        assert_eq!(
+            doc.hex.as_ref().unwrap().last_match,
+            prior_match,
+            "빈 검색어는 no-op — 기존 매치 하이라이트를 지우면 안 된다"
+        );
+
+        // 해석 불가한 16진수 — "Invalid pattern"(진짜 잘못된 입력).
+        doc.find_query = "XYZ".into();
+        hex_find_next(doc);
+        assert_eq!(doc.find_status, "Invalid pattern");
     }
 
     /// 헥스 문서에서 `render_find_panel`은 헥스 전용 패널을 그리고, 찾기
