@@ -267,8 +267,15 @@ fn tab_bar_locked(
     show_save_dialog: bool,
     pending_binary_open: bool,
     hex_confirm_load: bool,
+    parquet_sort_confirm: bool,
 ) -> bool {
-    pending_action.is_some() || show_save_dialog || pending_binary_open || hex_confirm_load
+    pending_action.is_some()
+        || show_save_dialog
+        || pending_binary_open
+        || hex_confirm_load
+        // Parquet 정렬 확인도 "지금 활성인 문서"를 대상으로 하므로 같은 이유로
+        // 잠근다 — 탭이 바뀌면 엉뚱한 문서를 정렬하거나 플래그가 영영 남는다.
+        || parquet_sort_confirm
 }
 
 /// 열기 방식 선택이 보류 중이라 새 열기를 거절했을 때의 안내.
@@ -284,6 +291,7 @@ fn tab_bar_locked_for(app: &App) -> bool {
         app.show_save_dialog,
         app.pending_binary_open.is_some(),
         app.doc().is_some_and(|d| d.hex.as_ref().is_some_and(|h| h.confirm_load)),
+        app.doc().is_some_and(|d| d.pending_parquet_sort.is_some()),
     )
 }
 
@@ -1521,8 +1529,11 @@ impl eframe::App for App {
                     // 생긴다 — 헥스 편집은 첫 타이핑에 저절로 승격되므로
                     // (`ensure_hex_edit`) 이 토글은 헥스에서 의미가 없고
                     // 해로울 뿐이다.
+                    // Parquet도 여기서 함께 잠긴다 — 읽기 전용이라 편집 버퍼가
+                    // 존재할 수 없다. 실제 방어는 `enter_edit_mode`의 가드이고
+                    // 이 회색 처리는 왜 안 되는지 보여주는 표시다.
                     let text_edit_toggle =
-                        has_doc && self.doc().is_some_and(text_tools_enabled);
+                        has_doc && self.doc().is_some_and(text_edit_allowed);
                     ui.add_enabled_ui(text_edit_toggle, |ui| {
                         // 편집 모드 토글. 켜면 파일 전체를 인메모리 버퍼로 읽고,
                         // 끄면 버퍼를 버린다(dirty면 확인 후).
@@ -1673,8 +1684,12 @@ impl eframe::App for App {
                     // `add_enabled`로 회색 처리하면 "지금은 안 되지만 언젠가는
                     // 되는 것"처럼 보인다 — 헥스 문서에서는 영영 아니므로 아예
                     // 그리지 않고 무엇을 보고 있는지만 한 줄로 알린다.
-                    if !text_tools_enabled(doc) {
-                        ui.label(crate::theme::chrome_text("Binary"));
+                    if !text_layout_tools_enabled(doc) {
+                        // 구분자 드롭다운을 그리지 않는다. 헥스는 구분자 개념이
+                        // 없고, Parquet은 콤마 고정이다(원본 구분자라는 것이
+                        // 존재하지 않아 사용자가 바꿀 대상이 아니다).
+                        let kind = if doc.parquet.is_some() { "Parquet" } else { "Binary" };
+                        ui.label(crate::theme::chrome_text(kind));
                         ui.separator();
                         ui.label(crate::theme::chrome_text(doc.path_label.clone()));
                         return;
@@ -1814,8 +1829,16 @@ impl eframe::App for App {
                     // 대신 크기와 캐럿 오프셋을 알린다.
                     //
                     // 오류 행 요약도 건너뛴다(필드 수 검사가 헥스에 없다).
-                    if !text_tools_enabled(doc) {
-                        ui.label(crate::theme::chrome_text(hex_status_text(doc)));
+                    if !text_layout_tools_enabled(doc) {
+                        // 인덱서를 띄우지 않는 문서들(헥스·Parquet)은 LineIndex가
+                        // Priming에서 영영 멈춰 있어 "Indexing… 0%"가 무한히
+                        // 뜬다. 각자의 문구로 대신한다.
+                        let text = if doc.parquet.is_some() {
+                            parquet_status_text(doc)
+                        } else {
+                            hex_status_text(doc)
+                        };
+                        ui.label(crate::theme::chrome_text(text));
                         // 변경 표시는 텍스트 쪽과 같은 문구·같은 색이다.
                         if doc_dirty(doc) {
                             ui.label(
@@ -2083,6 +2106,11 @@ impl eframe::App for App {
         // 대형 바이너리의 편집 진입 확인.
         if self.doc().is_some_and(|d| d.hex.as_ref().is_some_and(|h| h.confirm_load)) {
             render_confirm_hex_load_dialog(ctx, self);
+        }
+
+        // 메모리를 크게 쓰는 Parquet 정렬 확인.
+        if self.doc().is_some_and(|d| d.pending_parquet_sort.is_some()) {
+            render_confirm_parquet_sort_dialog(ctx, self);
         }
 
         // 대상 행이 아주 많은 컬럼 연산 확인 다이얼로그.
@@ -2670,10 +2698,10 @@ fn doc_font_id(d: &Document) -> egui::FontId {
 /// 기준(`selected_col`처럼 매치와 무관한 UI 상태)을 새로 만들지 않고 이
 /// 함수 하나로 `render_table`과 `focus_match`가 값을 공유한다.
 fn table_col_count(doc: &Document, delim: u8) -> usize {
-    let total_lines = match &doc.edit {
-        Some(e) => e.lines.len(),
-        None => doc.index.line_count(),
-    };
+    // `doc_line_count`를 쓴다 — Parquet 문서는 `LineIndex`가 비어
+    // `index.line_count()`가 0이라, 그대로 두면 헤더를 못 읽어 컬럼 수가
+    // 1로 무너진다(표가 한 칸만 나온다). 텍스트 경로에서는 같은 값이다.
+    let total_lines = doc_line_count(doc);
     let header_len = if doc.has_header && total_lines > 0 {
         parse_logical_line_edit(doc, 0, delim).map_or(0, |f| f.len())
     } else {
@@ -5337,8 +5365,20 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
 
     let opts = save_options(app);
     let result = {
-        let Some(e) = app.doc().and_then(|d| d.edit.as_ref()) else { return };
-        crate::save::write_file(&target, &e.lines, &opts, None)
+        // Parquet은 편집 버퍼가 없다(읽기 전용). "다른 이름으로 저장"이
+        // **CSV/TSV 내보내기**가 되므로 행을 모아 같은 저장 경로로 보낸다 —
+        // 인코딩·개행·BOM 선택이 그대로 따라온다.
+        if let Some(doc) = app.doc() {
+            if doc.parquet.is_some() {
+                let lines = collect_export_lines(doc);
+                crate::save::write_file(&target, &lines, &opts, None)
+            } else {
+                let Some(e) = doc.edit.as_ref() else { return };
+                crate::save::write_file(&target, &e.lines, &opts, None)
+            }
+        } else {
+            return;
+        }
     };
 
     match result {
@@ -6473,11 +6513,10 @@ fn render_table(
     let scroll_to = doc.pending_scroll_row.take();
     let scroll_align = doc.pending_scroll_align;
 
-    // 헤더 행 데이터(있으면 첫 줄)와 데이터 시작 행 결정
-    let total_lines = match &doc.edit {
-        Some(e) => e.lines.len(),
-        None => doc.index.line_count(),
-    };
+    // 헤더 행 데이터(있으면 첫 줄)와 데이터 시작 행 결정.
+    // `doc_line_count`를 쓴다 — Parquet은 `LineIndex`가 비어 있어
+    // `index.line_count()`면 0이 되고 표가 통째로 비어 보인다.
+    let total_lines = doc_line_count(doc);
     let header_fields: Option<Vec<String>> = if doc.has_header && total_lines > 0 {
         parse_logical_line_edit(doc, 0, delim)
     } else {
@@ -7697,10 +7736,9 @@ fn render_text(
     let scroll_align = doc.pending_scroll_align;
 
     let editing = doc.edit.is_some();
-    let total_lines = match &doc.edit {
-        Some(e) => e.lines.len(),
-        None => doc.index.line_count(),
-    };
+    // Parquet은 표 모드로만 그리므로 여기 오지 않지만, 행 수를 얻는 방법은
+    // 한 가지로 통일해 둔다(`doc_line_count`가 세 출처를 모두 안다).
+    let total_lines = doc_line_count(doc);
     let avail_height = ui.available_height();
     // 행 높이는 배율을 탄다 — 상수 ROW_HEIGHT를 직접 쓰면 확대 시 글자가 잘린다.
     let row_h = doc_row_height(doc);
@@ -8677,6 +8715,44 @@ fn text_tools_enabled(doc: &Document) -> bool {
     doc.hex.is_none()
 }
 
+/// 이 문서가 **행과 필드를 가진 표/텍스트**인가. 툴바의 구분자 드롭다운과
+/// 상태줄의 인덱싱 진행 문구가 이 개념을 쓴다.
+///
+/// `text_tools_enabled`(헥스만 제외)와 갈라 둔 이유: **Parquet은 정렬과 찾기가
+/// 되어야 하므로 Tools 메뉴를 잠그면 안 되지만**, 구분자 선택(콤마 고정)과
+/// 인덱싱 진행 문구(인덱서를 안 띄운다)는 의미가 없다. 하나로 묶으면 둘 중
+/// 하나가 반드시 틀린다.
+fn text_layout_tools_enabled(doc: &Document) -> bool {
+    doc.hex.is_none() && doc.parquet.is_none()
+}
+
+/// 이 문서를 편집할 수 있는가. 헥스는 자체 편집 경로가 있고(`ensure_hex_edit`),
+/// Parquet은 읽기 전용이라 편집 버퍼가 존재할 수 없다.
+fn text_edit_allowed(doc: &Document) -> bool {
+    doc.hex.is_none() && doc.parquet.is_none()
+}
+
+/// Parquet 문서의 상태줄 문구 — 행/열 수와 **읽기 전용임**.
+///
+/// **왜 인덱싱 문구를 대신하는가(헥스와 같은 이유).** Parquet은 줄 인덱서를
+/// 띄우지 않으므로(`parquet_document`가 `indexer: None`) `LineIndex`가
+/// `Priming`에서 영영 움직이지 않는다. 그대로 두면 상태줄이 "Indexing… 0%"를
+/// 무한히 띄운다 — 진행 중이 아닌데 진행 중이라고 말하는 셈이다.
+///
+/// 읽기 전용임을 여기 적는 이유는, 사용자가 편집을 시도하기 **전에** 알아야
+/// 하기 때문이다. 버튼이 회색인 것만으로는 왜인지 알 수 없다.
+fn parquet_status_text(doc: &Document) -> String {
+    let Some(pq) = &doc.parquet else {
+        return String::new();
+    };
+    let p = pq.borrow();
+    format!(
+        "Parquet · {} rows · {} cols · read-only",
+        crate::parquet::group_digits(p.total_rows()),
+        p.column_names().len()
+    )
+}
+
 /// 헥스 문서의 상태줄 문구 — 크기와 캐럿 오프셋.
 ///
 /// **왜 인덱싱 문구를 대신하는가.** 헥스 문서는 줄 인덱서를 아예 띄우지
@@ -9062,6 +9138,59 @@ fn collect_hex_intents(
         }
     }
     out
+}
+
+/// Parquet 정렬이 큰 메모리를 쓸 것 같을 때의 확인. "Sort"면 그 자리에서
+/// 정렬한다. `render_confirm_hex_load_dialog`와 같은 규율이다 — 이 창이 떠
+/// 있는 동안 `tab_bar_locked`가 참이라 플래그를 세운 문서가 활성 문서로
+/// 고정되므로 `app.doc()`으로 읽어도 안전하다.
+///
+/// 창 X와 Escape는 Cancel과 같다. 없으면 플래그가 켜진 채 잠금이 안 풀린다.
+fn render_confirm_parquet_sort_dialog(ctx: &egui::Context, app: &mut App) {
+    let Some((col, dir)) = app.doc().and_then(|d| d.pending_parquet_sort) else {
+        return;
+    };
+    let bytes = app.doc().map_or(0, |d| {
+        d.parquet.as_ref().map_or(0, |pq| {
+            let mut p = pq.borrow_mut();
+            let numeric = p.column_is_numeric(col);
+            let rows = p.total_rows();
+            let avg = p.estimated_avg_len(col);
+            crate::parquet::estimate_sort_bytes(rows, numeric, avg)
+        })
+    });
+    let mut open = true;
+    let mut go = false;
+    let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    egui::Window::new("Sort this column?")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(crate::theme::chrome_text(format!(
+                "Sorting loads the key column into memory (about {:.1} MB). Continue?",
+                bytes as f64 / 1e6
+            )));
+            ui.horizontal(|ui| {
+                if ui.button("Sort").clicked() {
+                    go = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    if !open {
+        cancel = true;
+    }
+    if let Some(doc) = app.doc_mut() {
+        if go {
+            doc.pending_parquet_sort = None;
+            sort_parquet_column(doc, col, dir);
+        } else if cancel {
+            doc.pending_parquet_sort = None;
+        }
+    }
 }
 
 /// 512MB 초과 파일의 메모리 로드 확인. "Load"면 그 자리에서 로드한다.
@@ -9852,6 +9981,73 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
+    #[test]
+    fn parquet_disables_editing_but_keeps_tools_available() {
+        // **이 셋이 갈리는 것이 핵심이다.** 하나로 묶으면 반드시 하나가 틀린다:
+        // Parquet은 편집이 안 되지만 정렬·찾기는 되어야 하고, 구분자 선택과
+        // 인덱싱 문구는 의미가 없다.
+        let p = crate::parquet::testutil::temp_path("gates");
+        crate::parquet::testutil::write_simple(&p, vec![1], vec![Some("x")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().unwrap();
+        assert!(!text_edit_allowed(doc), "편집은 막힌다");
+        assert!(
+            text_tools_enabled(doc),
+            "Tools 메뉴(정렬)는 열려 있어야 한다 — Parquet 정렬이 기능이다"
+        );
+        assert!(
+            !text_layout_tools_enabled(doc),
+            "구분자 선택·인덱싱 문구는 의미가 없다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn parquet_status_shows_rows_columns_and_read_only() {
+        let p = crate::parquet::testutil::temp_path("status");
+        crate::parquet::testutil::write_simple(&p, vec![1, 2, 3], vec![None, None, None]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let s = parquet_status_text(app.doc().unwrap());
+        assert!(s.contains('3'), "행 수: {s}");
+        assert!(s.contains('2'), "컬럼 수: {s}");
+        assert!(s.contains("read-only"), "읽기 전용임을 알려야 한다: {s}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn parquet_table_reports_every_column_and_data_row() {
+        // `table_col_count`/`render_table`이 `index.line_count()`(Parquet은 0)를
+        // 쓰면 컬럼이 1로 무너지고 표가 통째로 비어 보인다.
+        let p = crate::parquet::testutil::temp_path("cols");
+        crate::parquet::testutil::write_simple(&p, vec![1, 2], vec![Some("가"), Some("나")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().unwrap();
+        assert_eq!(table_col_count(doc, b','), 2, "id + name");
+        assert_eq!(doc_line_count(doc), 3, "헤더 + 데이터 2행");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn parquet_sort_confirmation_locks_the_tab_bar() {
+        // 확인 창이 떠 있는 동안 탭이 바뀌면 엉뚱한 문서를 정렬하거나
+        // 플래그가 영영 남는다(hex confirm_load와 같은 이유).
+        let p = crate::parquet::testutil::temp_path("locktab");
+        crate::parquet::testutil::write_simple(&p, vec![1], vec![Some("x")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert!(!tab_bar_locked_for(&app), "평소엔 안 잠긴다");
+        app.doc_mut().unwrap().pending_parquet_sort = Some((0, SortDir::Asc));
+        assert!(tab_bar_locked_for(&app), "확인 대기 중엔 잠긴다");
+        std::fs::remove_file(&p).ok();
+    }
+
     /// "텍스트로 열기"는 감지를 건너뛰고 지정 인코딩으로 기존 경로를 탄다.
     #[test]
     fn open_path_as_text_forces_encoding() {
@@ -10180,20 +10376,24 @@ mod tests {
     fn tab_switch_blocked_while_save_dialog_open() {
         let pending: Option<PendingAction> = None;
         assert!(
-            !tab_bar_locked(&pending, false, false, false),
+            !tab_bar_locked(&pending, false, false, false, false),
             "평상시에는 탭 바가 잠기지 않아야 한다"
         );
         assert!(
-            tab_bar_locked(&pending, true, false, false),
+            tab_bar_locked(&pending, true, false, false, false),
             "저장 다이얼로그가 떠 있으면 탭 바가 잠겨야 한다"
         );
         assert!(
-            tab_bar_locked(&pending, false, true, false),
+            tab_bar_locked(&pending, false, true, false, false),
             "열기 방식 선택이 보류 중이면 탭 바가 잠겨야 한다(C1)"
         );
         assert!(
-            tab_bar_locked(&pending, false, false, true),
+            tab_bar_locked(&pending, false, false, true, false),
             "대형 바이너리 로드 확인 중이면 탭 바가 잠겨야 한다(I4)"
+        );
+        assert!(
+            tab_bar_locked(&pending, false, false, false, true),
+            "Parquet 정렬 확인 중이면 탭 바가 잠겨야 한다(같은 이유)"
         );
     }
 
