@@ -17,6 +17,22 @@ memchr = "2"
 # 전체 바꾸기 시간의 61%가 할당자였다(측정). main.rs의 #[global_allocator] 참조.
 mimalloc = "0.1"
 
+# ---- Parquet(GeoParquet) 읽기 전용 뷰어 ----
+# `arrow`를 별도 의존성으로 적지 않는다 — parquet의 `arrow` feature가 맞는
+# 버전의 arrow-* 크레이트를 끌어온다. 따로 적으면 버전이 어긋난다.
+# 이 feature는 뺄 수 없다: `parquet::arrow` 모듈 전체(ProjectionMask,
+# ParquetRecordBatchReaderBuilder)가 그 게이트 뒤에 있다.
+# default-features=false로 brotli/lz4/flate2/simdutf8을 뺀다 — snappy와
+# zstd가 실무 Parquet의 대부분이고, 빠진 압축은 열 때 오류로 안내한다.
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
+# 셀 값 문자열화(timestamp/decimal/date를 손으로 포맷하지 않는다).
+arrow-array = "59"
+arrow-cast = "59"
+arrow-schema = "59"
+# GeoParquet의 `geo` 키-값 메타데이터(JSON) 파싱 전용. 손으로 파싱하면
+# 이스케이프된 따옴표 하나에 멀쩡한 컬럼을 geometry로 오인한다.
+serde_json = "1"
+
 [profile.release]
 opt-level = 3
 lto = true

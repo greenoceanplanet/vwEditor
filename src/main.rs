@@ -33,6 +33,7 @@ mod find;
 mod hex;
 mod index;
 mod indexer;
+mod parquet;
 mod parse;
 mod save;
 mod sort;

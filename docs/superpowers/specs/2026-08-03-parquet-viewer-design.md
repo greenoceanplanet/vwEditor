@@ -318,21 +318,39 @@ Parquet 정렬이 순열을 만들 때: 파일 행 `f`(0-based)의 논리 행번
 
 ## 타입별 표시
 
-| Parquet 타입 | 표시 |
+**손으로 포맷하지 않는다. `arrow_cast::display::ArrayFormatter`를 쓴다.**
+
+처음에는 타입별 포맷 규칙을 직접 표로 정하고 구현할 생각이었으나, 프로브로
+확인해 보니 `ArrayFormatter`가 이미 원하던 결과를 정확히 낸다:
+
+| 타입 | ArrayFormatter 출력 (실측) |
 |---|---|
-| null | 빈 문자열 |
+| int64 | `1`, `-42` |
 | bool | `true` / `false` |
-| 정수 (int8~int64, uint) | 십진수 |
-| 실수 (float, double) | Rust 기본 `{}` 포맷 |
-| decimal | 스케일 적용한 십진 문자열 |
-| string / large_string | 값 그대로 |
-| binary | `<binary N B>` (geometry 컬럼은 예외) |
-| date32 / date64 | `2026-08-03` |
-| timestamp | ISO 8601 — `2026-08-03T14:23:11Z` (UTC), 타임존 있으면 오프셋 표기 |
-| time | `14:23:11` |
-| list / large_list | `[N items]` |
-| struct | `{N fields}` |
-| map | `{N entries}` |
+| float64 | `1.5`, `0.30000000000000004`, `1e20` |
+| utf8 | `강남역` |
+| timestamp(ms) | `2026-03-31T23:33:20` |
+| timestamp+tz | `2026-04-01T08:33:20+09:00` |
+| date32 | `2024-10-04` |
+| decimal(10,2) | `1234.56`, `-0.05` |
+| list&lt;utf8&gt; | `[a, b]` |
+
+날짜·시각·decimal·타임존이 전부 스펙이 원한 형태다. 직접 구현하면 이것을
+재현하려다 틀릴 뿐이다.
+
+### 다만 두 가지는 덮어쓴다
+
+**1. null → 빈 문자열.** `ArrayFormatter`는 null을 `<null>`로 낸다. `is_null(i)`을
+먼저 확인해 빈 문자열로 바꾼다. `NULL`이라 쓰면 실제 문자열 "NULL"과 구분되지
+않고, CSV로 내보낼 때도 빈 값이 관행이다.
+
+**2. binary → `<binary N B>`.** `ArrayFormatter`는 바이너리를 전체 16진수 덤프로
+낸다(실측: 21바이트 WKB가 42자). 큰 값이면 셀이 감당하지 못한다. 바이너리
+컬럼은 길이 요약으로 바꾸고, geometry 컬럼이면 WKB 요약으로 바꾼다.
+
+중첩 타입(list/struct/map)은 `ArrayFormatter` 출력을 그대로 쓴다 — 원래
+`[N items]`로 요약하려 했으나, 실제 내용을 보여주는 편이 뷰어로서 유용하고
+셀 폭은 표가 이미 잘라낸다.
 
 **null은 빈 문자열이다.** `NULL`이라 쓰면 실제 문자열 "NULL"과 구분되지 않고,
 CSV로 내보낼 때도 빈 값이 관행이다.
