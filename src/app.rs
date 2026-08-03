@@ -213,6 +213,15 @@ pub struct Document {
     /// 관련 필드(sep, index, edit, …)는 헥스 문서에서 쓰이지 않는다.
     /// CentralPanel 분기가 이 필드로 `render_hex` 경로를 고른다.
     pub hex: Option<crate::hex::HexState>,
+    /// Some이면 이 문서는 **읽기 전용 Parquet**이다. 표 모드로 그리되 행은
+    /// mmap이 아니라 여기서 나온다(`logical_line` 참조). `edit`/`hex`와
+    /// 배타적이고 `index`(LineIndex)는 비어 있다 — 개행을 셀 필요가 없다.
+    ///
+    /// **`RefCell`인 이유**: 행 조회가 row group 캐시를 갱신하므로 `&mut`가
+    /// 필요한데 `logical_line`은 `&Document`를 받고 호출부가 25곳이다.
+    /// 시그니처를 바꾸면 전부 깨지므로 내부 가변성으로 감춘다. 단일 스레드
+    /// UI에서만 쓰므로 `RefCell`이면 충분하다.
+    pub parquet: Option<std::cell::RefCell<crate::parquet::ParquetDoc>>,
 }
 
 /// 확인 없이 바로 수행할 컬럼 연산의 최대 행 수. 이보다 크면 사용자에게 묻는다.
@@ -548,6 +557,16 @@ impl App {
                 return;
             }
         };
+        // Parquet은 `PAR1` 매직으로 시작한다. **확장자가 아니라 내용으로**
+        // 판단하므로 `.pq` 같은 다른 확장자도 열리고, 반대로 `.parquet`인데
+        // 내용이 텍스트면 아래 텍스트/바이너리 경로로 간다.
+        //
+        // 이 한 곳이 드래그앤드롭과 File▸Open을 **둘 다** 처리한다 — 두 경로가
+        // 모두 `open_path`로 모이기 때문이다.
+        if head.starts_with(b"PAR1") {
+            self.open_path_parquet(path);
+            return;
+        }
         match parse::detect_text(&head) {
             parse::TextDetection::Binary => {
                 self.pending_binary_open = Some(PendingBinaryOpen {
@@ -663,6 +682,7 @@ impl App {
             row_errors_revision: 0,
             show_errors_window: false,
             hex: None,
+            parquet: None,
         });
 
         // 작은 파일은 곧바로 편집 모드로. 뷰 모드로 열었다가 사용자가 메뉴에서
@@ -681,6 +701,35 @@ impl App {
                 enter_edit_mode(doc);
             }
         }
+    }
+
+    /// Parquet 문서로 연다(읽기 전용). 새 탭으로 추가하고 활성화한다.
+    /// 실패하면 `self.error`를 채우고 **탭은 추가하지 않는다**(기존 탭은
+    /// 그대로) — `open_path_as_text`와 같은 규율이다.
+    ///
+    /// 인덱서를 돌리지 않고 `auto_edit_on_open`도 타지 않는다. 개행을 셀
+    /// 필요가 없고(푸터가 행 수를 안다), 읽기 전용이라 편집 모드가 없다.
+    pub fn open_path_parquet(&mut self, path: &Path) {
+        self.error = None;
+        let pq = match crate::parquet::open(path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        // `doc.source`는 행 조회에 쓰이지 않지만 그대로 mmap한다 — 상태바의
+        // 파일 크기 표시가 맞고, mmap은 지연이라 10GB에서도 비용이 없다.
+        // `Option`으로 바꾸지 않는 이유: 참조가 20곳이 넘어 무관한 코드를
+        // 전부 고쳐야 한다.
+        let src = match source::open(path) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                self.error = Some(format!("Failed to open file: {e}"));
+                return;
+            }
+        };
+        self.add_document(parquet_document(src, path, pq));
     }
 
     /// 헥스 모드로 연다. 줄 개념이 없으므로 인덱서를 돌리지 않는다.
@@ -1149,6 +1198,13 @@ pub fn enter_edit_mode(doc: &mut Document) {
     if doc.edit.is_some() {
         return;
     }
+    // **Parquet은 읽기 전용이다. 여기서 막는 것이 핵심.** 호출부가 셋이고
+    // (자동 진입/메뉴/단축키) 새로 생길 수 있어 UI 비활성화만으로는 샌다.
+    // 이 가드가 없으면 아래 `load_edit_buffer`가 Parquet 바이너리를 깨진
+    // 문자열로 편집 버퍼에 올린다.
+    if doc.parquet.is_some() {
+        return;
+    }
     let buf = crate::edit::load_edit_buffer(&doc.source, doc.enc);
     doc.edit = Some(buf);
     // 편집 모드에선 뷰 permutation 정렬을 폐기(이제 lines가 진실).
@@ -1236,6 +1292,11 @@ pub fn exit_edit_mode(doc: &mut Document) {
 pub fn logical_line(doc: &Document, logical: usize) -> Option<String> {
     if let Some(e) = &doc.edit {
         e.lines.get(logical).cloned()
+    } else if let Some(p) = &doc.parquet {
+        // Parquet은 표 문서의 **세 번째 데이터 출처**다. 여기 갈래 하나로
+        // 표 렌더링·찾기·내보내기가 전부 따라온다.
+        // 구분자는 콤마 고정이다(`parquet_document` 주석 참조).
+        p.borrow_mut().row_line(logical, b',')
     } else {
         decode_logical_line(doc, logical)
     }
@@ -1417,6 +1478,7 @@ impl eframe::App for App {
                         // 항목에 모아 보여 주고 그다음 개별 형식을 둔다.
                         let dlg = rfd::FileDialog::new()
                             .add_filter("Text/CSV/TSV", &["txt", "csv", "tsv", "tab", "log"])
+                            .add_filter("Parquet", &["parquet"])
                             .add_filter("CSV", &["csv"])
                             .add_filter("TSV", &["tsv", "tab"])
                             .add_filter("Text", &["txt"])
@@ -2324,10 +2386,15 @@ enum FindAction {
 /// 지금까지 찾아낸 행 수 — 인덱싱 중이면 아직 자라는 중이고, 그래서
 /// `find_next`의 `get_line`이 None을 돌려줄 수 있다.
 fn doc_line_count(doc: &Document) -> usize {
-    match &doc.edit {
-        Some(e) => e.lines.len(),
-        None => doc.index.line_count(),
+    if let Some(e) = &doc.edit {
+        return e.lines.len();
     }
+    if let Some(p) = &doc.parquet {
+        // 헤더 한 줄을 더한다(인덱스 규약: 논리 행 0 = 헤더).
+        // Parquet 문서는 `LineIndex`가 비어 있어 `line_count()`는 0이다.
+        return p.borrow().total_rows() as usize + 1;
+    }
+    doc.index.line_count()
 }
 
 /// 찾기의 Whole cell 판정에 넘길 구분자. 표 모드면 `Some(delim)`, 텍스트
@@ -4127,6 +4194,7 @@ fn build_extracted_doc(
         row_errors_revision: 0,
         show_errors_window: false,
         hex: None,
+        parquet: None,
     }
 }
 
@@ -4182,6 +4250,77 @@ fn hex_document(source: Arc<Source>, path: &Path) -> Document {
         row_errors_revision: 0,
         show_errors_window: false,
         hex: Some(crate::hex::HexState::new()),
+        parquet: None,
+    }
+}
+
+/// Parquet 문서를 만든다. **표 모드로 그리되 행은 `ParquetDoc`에서 나온다.**
+/// `hex_document`와 같은 규율의 리터럴이되 세 가지가 다르다:
+/// `indexer: None`(개행을 셀 필요가 없다), `sep`/`has_header`(표 모드),
+/// `parquet: Some(..)`.
+///
+/// **구분자는 콤마 고정이다.** Parquet에는 원본 구분자라는 개념이 없다.
+/// 사용자가 툴바에서 바꿀 수 있게 하면 값에 그 문자가 들어갈 때 재인용이
+/// 필요해진다. 내보내기에서만 대상 구분자를 고른다.
+///
+/// **`has_header: true`** — 첫 논리 행이 컬럼 이름 행이다. 이렇게 하면
+/// `render_table`의 `data_start` 계산이 텍스트 경로와 동일하게 동작한다.
+fn parquet_document(
+    source: Arc<Source>,
+    path: &Path,
+    pq: crate::parquet::ParquetDoc,
+) -> Document {
+    Document {
+        // 빈 LineIndex — Parquet은 개행을 세지 않는다. 행 수는 `ParquetDoc`이
+        // 답한다(`doc_line_count` 참조).
+        index: LineIndex::new(source.len()),
+        source,
+        enc: Encoding::Utf8, // 표시 전용 — Parquet 셀은 이미 문자열로 나온다
+        sep: SeparatorMode::Char(b','),
+        has_header: true,
+        indexer: None,
+        path: path.to_path_buf(),
+        path_label: path.display().to_string(),
+        is_extracted: false,
+        custom_sep_input: ",".to_string(),
+        selected_col: None,
+        sort: None,
+        sort_job: None,
+        show_sort_dialog: false,
+        show_convert_dialog: false,
+        convert_target: None,
+        convert_custom_input: String::new(),
+        sort_specs: Vec::new(),
+        edit: None,
+        editing_cell: None,
+        cell_edit_text: String::new(),
+        cell_sel: None,
+        cell_drag_active: false,
+        text_sel: None,
+        text_caret: crate::edit::TextPos { line: 0, col: 0 },
+        text_drag_active: false,
+        ime_preview: String::new(),
+        pending_column_op: None,
+        show_find: false,
+        find_query: String::new(),
+        replace_text: String::new(),
+        find_opts: crate::find::FindOptions::default(),
+        find_escapes: false,
+        last_match: None,
+        find_status: String::new(),
+        find_focus_pending: false,
+        highlight: None,
+        pending_scroll_row: None,
+        pending_scroll_align: egui::Align::Center,
+        first_visible_row: 0,
+        visible_rows: 0,
+        view_scale: 1.0,
+        row_errors: None,
+        error_scan: None,
+        row_errors_revision: 0,
+        show_errors_window: false,
+        hex: None,
+        parquet: Some(std::cell::RefCell::new(pq)),
     }
 }
 
@@ -9363,6 +9502,113 @@ mod tests {
         assert!(doc.indexer.is_none(), "헥스 문서는 줄 인덱서를 돌리지 않는다");
         assert!(matches!(doc.sep, SeparatorMode::None));
         assert_eq!(doc.source.len(), 6);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ---- Parquet 배선 ----
+
+    #[test]
+    fn parquet_file_opens_as_a_parquet_document() {
+        let p = crate::parquet::testutil::temp_path("openpath");
+        crate::parquet::testutil::write_simple(&p, vec![1, 2], vec![Some("가"), Some("나")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().expect("탭이 열려야 한다");
+        assert!(doc.parquet.is_some(), "Parquet 문서로 열려야 한다");
+        assert!(doc.edit.is_none(), "편집 모드로 들어가면 안 된다");
+        assert!(doc.hex.is_none(), "헥스 모드가 아니다");
+        assert!(doc.indexer.is_none(), "개행을 셀 필요가 없다");
+        assert_eq!(doc.sep, SeparatorMode::Char(b','), "구분자는 콤마 고정");
+        assert!(doc.has_header, "첫 논리 행이 컬럼 이름이다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn small_parquet_does_not_auto_enter_edit_mode() {
+        // `auto_edit_on_open`은 크기 기준이라 작은 Parquet은 그냥 두면 편집
+        // 모드로 들어간다. `load_edit_buffer`가 바이너리를 깨진 문자열로
+        // 올리게 되므로 반드시 막아야 한다.
+        let p = crate::parquet::testutil::temp_path("small");
+        crate::parquet::testutil::write_simple(&p, vec![1], vec![Some("x")]);
+        assert!(
+            auto_edit_on_open(std::fs::metadata(&p).unwrap().len()),
+            "이 파일은 크기만 보면 자동 편집 대상이다(테스트 전제)"
+        );
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert!(
+            app.doc().unwrap().edit.is_none(),
+            "그래도 편집 모드가 아니어야 한다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn enter_edit_mode_refuses_a_parquet_document() {
+        // UI 비활성화가 아니라 함수 자체가 막아야 한다 — 호출부가 셋이고
+        // 새로 생길 수 있다.
+        let p = crate::parquet::testutil::temp_path("gate");
+        crate::parquet::testutil::write_simple(&p, vec![1], vec![Some("x")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        enter_edit_mode(doc);
+        assert!(doc.edit.is_none(), "Parquet은 편집 모드에 들어갈 수 없다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn parquet_extension_with_text_content_opens_as_text() {
+        // 확장자가 아니라 매직으로 판단한다.
+        let p = temp_ext(b"a,b\n1,2\n", "parquet");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert!(
+            app.doc().unwrap().parquet.is_none(),
+            "텍스트로 열려야 한다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn broken_parquet_reports_an_error_without_opening_a_tab() {
+        // PAR1로 시작하지만 내용이 깨진 파일.
+        let p = temp_ext(b"PAR1\x00\x00\x00garbage", "parquet");
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let before = app.docs.len();
+        app.open_path(&p, &ctx);
+        assert_eq!(app.docs.len(), before, "탭이 추가되면 안 된다");
+        assert!(app.error.is_some(), "오류 메시지가 있어야 한다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn parquet_line_count_includes_the_header_row() {
+        let p = crate::parquet::testutil::temp_path("count");
+        crate::parquet::testutil::write_simple(&p, vec![1, 2, 3], vec![None, None, None]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert_eq!(doc_line_count(app.doc().unwrap()), 4, "데이터 3 + 헤더 1");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn parquet_logical_line_returns_header_then_rows() {
+        let p = crate::parquet::testutil::temp_path("ll");
+        crate::parquet::testutil::write_simple(&p, vec![10], vec![Some("가")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().unwrap();
+        assert_eq!(logical_line(doc, 0).as_deref(), Some("id,name"));
+        assert_eq!(logical_line(doc, 1).as_deref(), Some("10,가"));
+        assert_eq!(logical_line(doc, 2), None);
         std::fs::remove_file(&p).ok();
     }
 
