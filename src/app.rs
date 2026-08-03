@@ -10048,6 +10048,74 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
+    /// 실제 GeoParquet 파일(5000행, 8열, ZSTD, row group 5개)로 전 경로를
+    /// 한 번에 확인한다. `sample_geo.parquet`이 없으면 건너뛴다 — 이 파일은
+    /// 저장소에 넣지 않는다(바이너리).
+    #[test]
+    fn real_geoparquet_file_reads_end_to_end() {
+        let p = std::path::Path::new("sample_geo.parquet");
+        if !p.exists() {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(p, &ctx);
+        let doc = app.doc().expect("열려야 한다");
+        assert!(doc.parquet.is_some());
+        assert_eq!(doc_line_count(doc), 5001, "5000행 + 헤더");
+        assert_eq!(table_col_count(doc, b','), 8, "8개 컬럼");
+
+        // 헤더
+        let hdr = logical_line(doc, 0).unwrap();
+        assert!(hdr.starts_with("id,name,pop,active,surveyed,updated,note,geometry"), "{hdr}");
+
+        // 여러 row group에 걸친 행들(그룹 크기 1000)
+        for logical in [1usize, 1500, 3001, 5000] {
+            let line = logical_line(doc, logical).expect("행이 있어야 한다");
+            let f = crate::parse::split_fields(&line, b',');
+            assert_eq!(f.len(), 8, "논리행 {logical}: 컬럼 8개여야 한다 -> {f:?}");
+            assert!(!line.contains('\n'), "개행이 남으면 안 된다: {logical}");
+        }
+
+        // 마지막 행 다음은 없다
+        assert_eq!(logical_line(doc, 5001), None);
+
+        // geometry 요약 - POINT와 POLYGON 둘 다 나온다
+        let r1 = crate::parse::split_fields(&logical_line(doc, 1).unwrap(), b',');
+        assert!(r1[7].starts_with("POINT("), "행1 geometry: {}", r1[7]);
+        let r2 = crate::parse::split_fields(&logical_line(doc, 2).unwrap(), b',');
+        assert_eq!(r2[7], "POLYGON(1,204 pts)", "쉼표 든 요약이 한 셀로 유지");
+
+        // null - 논리행 1이 파일행 0이고 0 % 7 == 0이라 name이 null
+        assert_eq!(r1[1], "", "null은 빈 문자열");
+
+        // 타입 포맷
+        assert!(r1[4].contains('-'), "date32는 날짜 형식: {}", r1[4]);
+        assert!(r1[5].contains('T'), "timestamp는 ISO: {}", r1[5]);
+        assert_eq!(r1[3], "true", "bool");
+
+        // 찾기 - 화면 밖 컬럼도 잡는다
+        let d = app.doc_mut().unwrap();
+        d.find_query = "지역-4999".to_string();
+        let rows = scan_all_matches(d);
+        assert_eq!(rows, vec![5000u32], "마지막 행을 찾아야 한다");
+
+        // 정렬 - pop 내림차순이면 첫 행이 가장 큰 값
+        let d = app.doc_mut().unwrap();
+        sort_parquet_column(d, 2, SortDir::Desc);
+        let perm = d.sort.as_ref().unwrap().permutation.clone();
+        assert_eq!(perm.len(), 5000);
+        assert_eq!(perm[0], 5000, "pop 최대는 마지막 파일행 -> 논리행 5000");
+
+        // 내보내기 - 정렬 순서 + 전체 행
+        let d = app.doc().unwrap();
+        let lines = collect_export_lines(d);
+        assert_eq!(lines.len(), 5001, "헤더 + 5000행");
+        assert!(lines[0].starts_with("id,name"), "헤더가 먼저");
+        let first = crate::parse::split_fields(&lines[1], b',');
+        assert_eq!(first[0], "4999", "정렬 순서를 따른다");
+    }
+
     /// "텍스트로 열기"는 감지를 건너뛰고 지정 인코딩으로 기존 경로를 탄다.
     #[test]
     fn open_path_as_text_forces_encoding() {

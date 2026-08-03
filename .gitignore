@@ -8,6 +8,9 @@
 big_test.csv
 big_2gb.csv
 sample.csv
+# 손 검증용 GeoParquet 표본. `real_geoparquet_file_reads_end_to_end`가
+# 있으면 쓰고 없으면 건너뛴다 — 바이너리라 저장소에 넣지 않는다.
+sample_geo.parquet
 sample.txt
 sample.json
 sample_tilde.txt
