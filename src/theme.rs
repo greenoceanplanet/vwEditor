@@ -24,6 +24,38 @@ use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Str
 /// 글꼴이 15px→13px로 작아졌으므로 같은 22에서도 이전보다 촘촘해 보인다.
 pub const ROW_HEIGHT: f32 = 22.0;
 
+/// 데이터 영역 확대 배율의 허용 범위. Ctrl+휠이 이 범위 안에서만 움직인다.
+///
+/// 아래를 0.5로 막는 이유: 13px의 절반인 6.5px은 이미 판독 한계이고, 그 아래는
+/// 행 높이가 글자보다 작아져 줄이 겹친다. 위를 4.0으로 막는 이유: 52px 글자에
+/// 88px 행이면 화면에 열 줄이 안 들어와 "대용량 파일 뷰어"의 쓸모가 사라진다.
+pub const MIN_VIEW_SCALE: f32 = 0.5;
+pub const MAX_VIEW_SCALE: f32 = 4.0;
+
+/// 배율을 적용한 데이터 영역 행 높이.
+///
+/// **폰트와 반드시 같은 배율이어야 한다.** 행 높이를 고정한 채 글자만 키우면
+/// 큰 배율에서 글자가 행 밖으로 삐져나가 위아래가 잘리고, 반대로 글자만 줄이면
+/// 행 사이가 허옇게 뜬다. 두 값이 한 배율에서 나와야 화면 비율이 유지된다.
+pub fn row_height(scale: f32) -> f32 {
+    ROW_HEIGHT * clamp_view_scale(scale)
+}
+
+/// 배율을 적용한 데이터 영역 고정폭 글자 크기.
+pub fn mono_size(scale: f32) -> f32 {
+    MONO_SIZE * clamp_view_scale(scale)
+}
+
+/// 배율을 허용 범위로 자른다. 저장된 설정이 깨졌거나(0, 음수, NaN) 범위를 벗어난
+/// 값이 들어와도 화면이 무너지지 않게 하는 마지막 방어선이다 — NaN은 비교가 전부
+/// 거짓이라 `clamp`가 그대로 통과시키므로 따로 걸러 1.0으로 돌린다.
+pub fn clamp_view_scale(scale: f32) -> f32 {
+    if !scale.is_finite() {
+        return 1.0;
+    }
+    scale.clamp(MIN_VIEW_SCALE, MAX_VIEW_SCALE)
+}
+
 /// 데이터 영역 고정폭 폰트 크기. `TextStyle::Body`/`Monospace`와
 /// `app.rs`의 텍스트 모드 galley 레이아웃이 같은 값을 써야 캐럿이 글자와
 /// 어긋나지 않는다.
@@ -202,14 +234,16 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// `egui::Label`로 그려지고 `Label`은 `TextStyle::Body`를 쓴다
 /// (`egui-0.28.1/src/widgets/label.rs`). 이 한 줄이 데이터 영역의 폰트를
 /// 결정한다. 버튼/메뉴/체크박스는 `Button` 스타일이라 가변폭으로 남는다.
-pub fn install_text_styles(ctx: &egui::Context) {
+/// **`scale`은 데이터 영역에만 적용된다.** `Body`/`Monospace`만 배율을 타고
+/// `Button`/`Heading`/`Small`은 고정이다 — 메뉴·툴바·상태바는 Ctrl+휠로 확대해도
+/// 그대로여야 한다는 것이 이 분리의 전부다. 배율이 바뀔 때마다 다시 부른다.
+pub fn install_text_styles(ctx: &egui::Context, scale: f32) {
+    let mono = mono_size(scale);
     ctx.style_mut(|s| {
         s.text_styles
-            .insert(TextStyle::Body, FontId::new(MONO_SIZE, FontFamily::Monospace));
-        s.text_styles.insert(
-            TextStyle::Monospace,
-            FontId::new(MONO_SIZE, FontFamily::Monospace),
-        );
+            .insert(TextStyle::Body, FontId::new(mono, FontFamily::Monospace));
+        s.text_styles
+            .insert(TextStyle::Monospace, FontId::new(mono, FontFamily::Monospace));
         s.text_styles
             .insert(TextStyle::Button, FontId::new(13.0, FontFamily::Proportional));
         s.text_styles
@@ -256,7 +290,7 @@ pub fn install_visuals(ctx: &egui::Context) {
 /// 앱 시작 시 한 번 호출 — 폰트·스타일·Visuals를 모두 설치한다.
 pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
-    install_text_styles(ctx);
+    install_text_styles(ctx, 1.0);
     install_visuals(ctx);
 }
 

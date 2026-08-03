@@ -176,10 +176,21 @@ pub struct Document {
     /// 자리에서 한 화면 위/아래"라 화면 행끼리 더하고 빼면 되고, 논리 행으로
     /// 변환할 이유가 없다.
     pub first_visible_row: usize,
-    /// 한 화면에 들어가는 행 수(`available_height / ROW_HEIGHT`). 렌더가
+    /// 한 화면에 들어가는 행 수(`available_height / row_height()`). 렌더가
     /// 기록한다 — Page 키 처리 시점(`update()` 끝)에는 본문 `Ui`가 없어
     /// `available_height`를 다시 구할 수 없기 때문이다.
     pub visible_rows: usize,
+    /// 이 문서를 그릴 때 쓸 데이터 영역 확대 배율. 매 프레임 `App::view_scale`
+    /// 에서 복사해 넣는다(`sync_view_scale`).
+    ///
+    /// **왜 App이 아니라 Document에 두는가.** `render_table`/`render_text`/
+    /// `render_hex`는 `&mut Document`만 받고 `&App`은 받지 않는다(빌림 충돌).
+    /// 배율을 인자로 더하면 세 함수와 그 호출부·테스트가 전부 시그니처를
+    /// 바꿔야 하는데, 문서는 이미 `visible_rows`처럼 "그리기에 필요한 프레임
+    /// 상태"를 담는 자리다. 배율도 같은 성격이라 여기 둔다. 소유권은 여전히
+    /// `App::view_scale`에 있고 이 필드는 그 사본이다 — 여기에 쓰면 다음
+    /// 프레임에 덮인다.
+    pub view_scale: f32,
     /// 파싱 오류 행 검사 결과. `None`이면 아직 검사한 적이 없다(진행 중이거나
     /// 시작 전). `Some`이면 그 시점 기준으로 검사가 **끝났다**.
     ///
@@ -353,6 +364,17 @@ pub struct App {
     pub window_title: String,
     /// 바이너리로 판정돼 사용자의 열기 방식 선택을 기다리는 파일.
     pub pending_binary_open: Option<PendingBinaryOpen>,
+    /// 데이터 영역(표·텍스트·헥스 본문) 확대 배율. Ctrl+휠이 조절한다.
+    ///
+    /// **UI 크롬은 이 값을 타지 않는다.** 예전에는 `ctx.set_zoom_factor`로
+    /// 창 전체를 확대해서 본문 글자를 키우면 메뉴·툴바·상태바까지 같이 커졌다.
+    /// EMEditor를 비롯한 에디터의 Ctrl+휠은 "지금 보는 글자"만 키우는 동작이고,
+    /// 크롬이 함께 커지면 큰 배율에서 정작 본문에 남는 자리가 줄어든다.
+    /// 그래서 배율을 앱 상태로 들고, 데이터 영역의 폰트·행 높이에만 곱한다.
+    ///
+    /// 모든 탭이 하나의 값을 공유한다(문서별이 아니다) — 탭을 옮길 때마다 글자
+    /// 크기가 바뀌면 산만하고, 사용자가 기대하는 것은 "앱의 보기 배율"이다.
+    pub view_scale: f32,
 }
 
 /// 바이너리 열기 다이얼로그의 보류 상태.
@@ -394,6 +416,7 @@ impl Default for App {
             // eframe이 창을 만들 때 쓴 제목과 같은 값으로 시작한다(main.rs).
             window_title: "textViewer".to_owned(),
             pending_binary_open: None,
+            view_scale: 1.0,
         }
     }
 }
@@ -461,6 +484,37 @@ impl App {
         // 바꿔 버리면 diff가 전 줄로 번진다.
         if let Some(nl) = self.doc().and_then(|d| d.edit.as_ref()).map(|e| e.newline) {
             self.save_newline = nl;
+        }
+    }
+
+    /// Ctrl+휠을 읽어 **데이터 영역만** 확대/축소한다.
+    ///
+    /// 예전에는 `ctx.set_zoom_factor`로 창 전체를 확대했다. 그러면 본문 글자를
+    /// 키울 때 메뉴·툴바·상태바까지 같이 커져, 큰 배율에서 정작 본문에 남는
+    /// 자리가 줄어든다. 지금은 배율을 앱 상태(`view_scale`)로 들고 데이터
+    /// 영역의 폰트·행 높이에만 곱한다. `zoom_factor`는 손대지 않으므로 OS DPI
+    /// 스케일링은 egui가 알아서 하고, 크롬은 그 배율에만 반응한다.
+    ///
+    /// `update()`가 `eframe::Frame`을 요구해 테스트에서 직접 못 부르므로
+    /// 별도 메서드로 뺀다(`apply_page_scroll`과 같은 규율).
+    pub fn apply_ctrl_wheel_zoom(&mut self, ctx: &egui::Context) {
+        let scroll_y = ctx.input(|i| {
+            if i.modifiers.ctrl || i.modifiers.command {
+                i.raw_scroll_delta.y
+            } else {
+                0.0
+            }
+        });
+        if scroll_y == 0.0 {
+            return;
+        }
+        let new_scale = zoomed_scale(self.view_scale, scroll_y);
+        if new_scale != self.view_scale {
+            self.view_scale = new_scale;
+            // `TextStyle::Body`가 곧 표·텍스트 셀의 글꼴이므로(theme.rs 참고)
+            // 배율이 바뀐 프레임에 스타일을 다시 깔아야 `Label`로 그리는
+            // 경로까지 새 크기를 탄다.
+            crate::theme::install_text_styles(ctx, new_scale);
         }
     }
 
@@ -603,6 +657,7 @@ impl App {
             pending_scroll_align: egui::Align::Center,
             first_visible_row: 0,
             visible_rows: 0,
+            view_scale: 1.0,
             row_errors: None,
             error_scan: None,
             row_errors_revision: 0,
@@ -747,9 +802,25 @@ impl App {
 use crate::index::Phase;
 use egui_extras::{Column, TableBuilder};
 
-/// 표/텍스트 모드 한 행의 높이. 고정폭 13px에 맞춘 값은 `theme.rs`에 있다
-/// (격자선 간격과 직결되므로 폰트 크기와 같은 곳에서 관리한다).
+/// 표/텍스트 모드 한 행의 **기준** 높이(배율 1.0). 고정폭 13px에 맞춘 값은
+/// `theme.rs`에 있다(격자선 간격과 직결되므로 폰트 크기와 같은 곳에서 관리한다).
+///
+/// **렌더는 이 상수를 직접 쓰면 안 된다.** Ctrl+휠 확대는 데이터 영역에만
+/// 적용되므로 실제 행 높이는 배율에 따라 달라진다 — 그리는 쪽은 `Document`가
+/// 들고 있는 `row_height`(= `theme::row_height(view_scale)`)를 써야 한다.
+/// 이 상수는 그 계산의 출발점이다. 지금은 배율 1.0을 전제하는 테스트만
+/// 직접 참조한다(프로덕션 경로는 전부 `doc_row_height`를 거친다).
+#[cfg(test)]
 const ROW_HEIGHT: f32 = crate::theme::ROW_HEIGHT;
+
+/// Ctrl+휠 한 번이 만드는 새 배율. 곱셈으로 조절해 어느 배율에서든 체감
+/// 변화폭이 같게 하고(덧셈이면 작은 배율에서 껑충 뛴다), 허용 범위로 자른다.
+///
+/// 순수 함수로 빼 두는 이유: 경계(0.5·4.0에서 더 밀어도 넘지 않는가)와 방향
+/// (위로 굴리면 커지는가)은 GUI 없이 확인해야 하는 성질이다.
+fn zoomed_scale(scale: f32, scroll_y: f32) -> f32 {
+    crate::theme::clamp_view_scale(scale * (1.0 + scroll_y * 0.001))
+}
 
 /// 선택 음영(컬럼 선택·셀 사각 선택 공통). 밝은 배경 위에 덧그리는 반투명
 /// Windows 파랑 — 글자가 그대로 읽히도록 알파를 낮게 유지한다.
@@ -1192,21 +1263,14 @@ impl eframe::App for App {
         // 다이얼로그가 떠 있을 때는 Tab이 평범한 포커스 순회여야 한다.
         let tab_for_body = self.wants_tab_character(ctx);
 
-        // Ctrl + 휠로 전역 확대/축소. zoom_factor를 조절하면 폰트뿐 아니라
-        // UI 전체가 배율에 맞춰 커지고 작아진다. (0.5배 ~ 4.0배로 제한)
-        let scroll_y = ctx.input(|i| {
-            if i.modifiers.ctrl || i.modifiers.command {
-                i.raw_scroll_delta.y
-            } else {
-                0.0
-            }
-        });
-        if scroll_y != 0.0 {
-            let factor = ctx.zoom_factor();
-            // 휠 한 칸(대략 ±? px)마다 배율을 곱셈으로 조절해 부드럽게.
-            let new_factor = (factor * (1.0 + scroll_y * 0.001)).clamp(0.5, 4.0);
-            ctx.set_zoom_factor(new_factor);
-        }
+        // Ctrl + 휠로 **데이터 영역만** 확대/축소.
+        //
+        // 예전에는 `ctx.set_zoom_factor`로 창 전체를 확대했다. 그러면 본문 글자를
+        // 키울 때 메뉴·툴바·상태바까지 같이 커져, 큰 배율에서 정작 본문에 남는
+        // 자리가 줄어든다. 지금은 배율을 앱 상태(`view_scale`)로 들고 데이터
+        // 영역의 폰트·행 높이에만 곱한다. `zoom_factor`는 1.0 그대로 두므로
+        // OS DPI 스케일링은 egui가 알아서 처리한다.
+        self.apply_ctrl_wheel_zoom(ctx);
 
         // 창 제목 = "<파일명> — textViewer". 바뀔 때만 보낸다(매 프레임 보내면
         // 창 시스템 왕복이 낭비다). "다른 이름으로 저장"으로 path가 바뀌어도
@@ -1864,12 +1928,17 @@ impl eframe::App for App {
         // 클립보드 캐시는 render_table이 복사/붙여넣기에 쓰므로 가변 대여를
         // doc과 분리해 넘긴다(App 전체를 넘기면 doc과 동시 대여가 불가능).
         let clipboard = &mut self.clipboard_cache;
+        let view_scale = self.view_scale;
         let doc_opt = self.docs.get_mut(self.active);
         // 데이터 영역은 순백. 기본 CentralPanel은 panel_fill(옅은 회색)을 쓰므로
         // 프레임을 지정해 덮는다 — 메뉴/툴바/상태바만 회색으로 남아 데이터와 갈린다.
         let data_frame = egui::Frame::central_panel(&ctx.style()).fill(crate::theme::data_bg());
         egui::CentralPanel::default().frame(data_frame).show(ctx, |ui| {
             let Some(doc) = doc_opt else { return };
+            // 배율은 App이 소유하고 문서는 사본을 든다 — 렌더 함수들이 `&App`을
+            // 받지 못하기 때문이다(Document 필드 주석 참조). 그리기 직전에
+            // 넣어야 이 프레임의 Ctrl+휠 결과가 곧바로 반영된다.
+            doc.view_scale = view_scale;
             // 헥스 문서는 표/텍스트와 배타적인 **세 번째 렌더 경로**다. `sep`는
             // 헥스 문서에서 의미가 없으므로(`hex_document`가 None으로 둔다)
             // 구분자 분기보다 먼저 가른다.
@@ -2499,12 +2568,24 @@ fn scroll_offset_for_row(
 ///
 /// 표/텍스트 두 렌더가 같은 규칙을 써야 하므로(둘 다 `TableBuilder` +
 /// `ROW_HEIGHT` 헤더 하나) 계산을 한 함수로 묶는다.
-fn visible_row_count(avail_height: f32) -> usize {
-    let body = avail_height - ROW_HEIGHT;
+fn visible_row_count(avail_height: f32, row_h: f32) -> usize {
+    let body = avail_height - row_h;
     if body <= 0.0 {
         return 0;
     }
-    (body / ROW_HEIGHT) as usize
+    (body / row_h) as usize
+}
+
+/// 이 문서를 그릴 행 높이. 렌더는 `ROW_HEIGHT` 상수 대신 **반드시** 이걸 쓴다 —
+/// 그러지 않으면 Ctrl+휠로 글자만 커지고 행 높이는 그대로라 글자가 잘린다.
+fn doc_row_height(d: &Document) -> f32 {
+    crate::theme::row_height(d.view_scale)
+}
+
+/// 이 문서의 데이터 영역 고정폭 폰트. 캐럿/선택 x 매핑과 렌더가 같은 FontId를
+/// 써야 하므로(`text_font_id`의 이유와 같다) 배율까지 한 곳에서 얹는다.
+fn doc_font_id(d: &Document) -> egui::FontId {
+    egui::FontId::monospace(crate::theme::mono_size(d.view_scale))
 }
 
 /// 표 모드가 실제로 그리는 컬럼 수. `render_table`의 col_count 계산
@@ -4040,6 +4121,7 @@ fn build_extracted_doc(
         pending_scroll_align: egui::Align::Center,
         first_visible_row: 0,
         visible_rows: 0,
+        view_scale: 1.0,
         row_errors: None,
         error_scan: None,
         row_errors_revision: 0,
@@ -4094,6 +4176,7 @@ fn hex_document(source: Arc<Source>, path: &Path) -> Document {
         pending_scroll_align: egui::Align::Center,
         first_visible_row: 0,
         visible_rows: 0,
+        view_scale: 1.0,
         row_errors: None,
         error_scan: None,
         row_errors_revision: 0,
@@ -6188,7 +6271,7 @@ fn render_table(
     // 으로 강조하는 것과 일관되게, current 매치가 있는 **논리 행의 모든 셀**을
     // 진한 보라 배경으로 칠한다. 이 값은 그 논리 행 번호다.
     let current_match_row = doc.last_match.map(|m| m.line);
-    let font_id = text_font_id();
+    let font_id = doc_font_id(doc);
     let cell_text_color = ui.visuals().text_color();
     let cell_find = CellFind {
         searching,
@@ -6262,6 +6345,8 @@ fn render_table(
     //   ~35행에서 멈추므로, 사용 가능한 높이로 올린다.
     // - auto_shrink의 y축을 false로 두어 내용이 적어도 테이블이 창을 채운다.
     let avail_height = ui.available_height();
+    // 행 높이는 배율을 탄다 — 상수 ROW_HEIGHT를 직접 쓰면 확대 시 글자가 잘린다.
+    let row_h = doc_row_height(doc);
     // 행 간격은 `TableBody::rows`가 행 높이에 더하는 값과 **같아야** 한다
     // (`scroll_offset_for_row` 주석) — 여기서 한 번 읽어 그대로 넘긴다.
     let spacing_y = ui.spacing().item_spacing.y;
@@ -6283,10 +6368,10 @@ fn render_table(
         table = table.vertical_scroll_offset(scroll_offset_for_row(
             row,
             scroll_align,
-            ROW_HEIGHT,
+            row_h,
             spacing_y,
             // 본문 높이 = 전체 - 헤더 한 줄(`visible_row_count`와 같은 규율).
-            (avail_height - ROW_HEIGHT).max(0.0),
+            (avail_height - row_h).max(0.0),
         ));
     }
 
@@ -6297,7 +6382,7 @@ fn render_table(
     let min_drawn_row: Cell<Option<usize>> = Cell::new(None);
 
     table
-        .header(ROW_HEIGHT, |mut header| {
+        .header(row_h, |mut header| {
             header.col(|ui| {
                 let rect = ui.max_rect();
                 paint_header_cell(ui, rect, crate::theme::header_bg());
@@ -6346,7 +6431,7 @@ fn render_table(
             }
         })
         .body(|body| {
-            body.rows(ROW_HEIGHT, data_rows, |mut row| {
+            body.rows(row_h, data_rows, |mut row| {
                 let view_row = row.index();
                 min_drawn_row.set(Some(
                     min_drawn_row.get().map_or(view_row, |m: usize| m.min(view_row)),
@@ -6567,7 +6652,7 @@ fn render_table(
     if let Some(first) = min_drawn_row.get() {
         doc.first_visible_row = first;
     }
-    doc.visible_rows = visible_row_count(avail_height);
+    doc.visible_rows = visible_row_count(avail_height, row_h);
 
     // 클로저 종료 후 헤더 클릭 결과를 반영(같은 컬럼 재클릭이면 선택 해제 토글).
     // 셀 사각 선택도 함께 지운다 — 컬럼을 고른 순간 사용자의 대상은 그 컬럼이고,
@@ -6970,12 +7055,13 @@ enum CaretMove {
     End,
 }
 
-/// 텍스트 모드에서 쓰는 고정폭 폰트. 캐럿/선택 x 좌표 매핑을 위해 줄 텍스트를
-/// 직접 레이아웃하므로, 렌더와 매핑이 같은 FontId를 써야 한다.
+/// 배율 1.0에서의 데이터 영역 고정폭 폰트.
+///
+/// 프로덕션 렌더는 이걸 쓰지 않는다 — 배율이 걸린 `doc_font_id`를 쓴다. 남겨 둔
+/// 이유는 배율을 건드리지 않는 테스트가 렌더와 같은 폰트로 좌표를 재기 위해서다
+/// (그 문서들의 `view_scale`이 1.0이므로 두 값이 같다).
+#[cfg(test)]
 fn text_font_id() -> egui::FontId {
-    // 뷰 전용 모드는 `Label`(= `TextStyle::Body`)로 그리고 편집 모드는 이 galley로
-    // 그린다. 두 경로가 같은 폰트여야 편집 모드 On/Off에 글자가 흔들리지 않으므로
-    // `theme::MONO_SIZE`(= Body에 넣는 크기)를 그대로 쓴다.
     egui::FontId::monospace(crate::theme::MONO_SIZE)
 }
 
@@ -7322,6 +7408,8 @@ fn render_text(
         None => doc.index.line_count(),
     };
     let avail_height = ui.available_height();
+    // 행 높이는 배율을 탄다 — 상수 ROW_HEIGHT를 직접 쓰면 확대 시 글자가 잘린다.
+    let row_h = doc_row_height(doc);
 
     // ---- 편집 모드 상태 스냅샷 + 클로저 → 바깥 인텐트 통로 ----
     // 표 모드와 같은 규율: 테이블 클로저는 doc을 불변으로만 빌리고, 상호작용
@@ -7334,7 +7422,7 @@ fn render_text(
         .text_sel
         .map(|(a, b)| crate::edit::normalize(a, b))
         .filter(|(a, b)| a != b);
-    let font_id = text_font_id();
+    let font_id = doc_font_id(doc);
     let text_color = ui.visuals().text_color();
     let caret_color = ui.visuals().strong_text_color();
 
@@ -7409,9 +7497,9 @@ fn render_text(
         table = table.vertical_scroll_offset(scroll_offset_for_row(
             row,
             scroll_align,
-            ROW_HEIGHT,
+            row_h,
             spacing_y,
-            (avail_height - ROW_HEIGHT).max(0.0),
+            (avail_height - row_h).max(0.0),
         ));
     }
 
@@ -7420,7 +7508,7 @@ fn render_text(
     let min_drawn_row: Cell<Option<usize>> = Cell::new(None);
 
     table
-        .header(ROW_HEIGHT, |mut header| {
+        .header(row_h, |mut header| {
             header.col(|ui| {
                 let rect = ui.max_rect();
                 paint_header_cell(ui, rect, crate::theme::header_bg());
@@ -7436,7 +7524,7 @@ fn render_text(
             });
         })
         .body(|body| {
-            body.rows(ROW_HEIGHT, total_lines, |mut row| {
+            body.rows(row_h, total_lines, |mut row| {
                 let logical = row.index();
                 min_drawn_row.set(Some(
                     min_drawn_row.get().map_or(logical, |m: usize| m.min(logical)),
@@ -7710,7 +7798,7 @@ fn render_text(
     if let Some(first) = min_drawn_row.get() {
         doc.first_visible_row = first;
     }
-    doc.visible_rows = visible_row_count(avail_height);
+    doc.visible_rows = visible_row_count(avail_height, row_h);
 
     if !editing {
         return;
@@ -7866,6 +7954,8 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
     let total_rows = crate::hex::row_count(len);
     let off_w = crate::hex::offset_width(len);
     let avail_height = ui.available_height();
+    // 행 높이는 배율을 탄다 — 상수 ROW_HEIGHT를 직접 쓰면 확대 시 글자가 잘린다.
+    let row_h = doc_row_height(doc);
 
     // ---- 상태 스냅샷 ----
     // 클로저 안에서 `doc`을 불변으로 빌려 바이트를 읽으므로, 캐럿/선택 같은
@@ -7875,7 +7965,7 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
         (h.caret, h.sel, h.last_match, h.pane)
     };
 
-    let font = text_font_id();
+    let font = doc_font_id(doc);
     let text_color = ui.visuals().text_color();
 
     // 컬럼 폭은 **대표 문자열을 실제로 배치해 재서** 잡는다. 예전에는
@@ -7910,7 +8000,7 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
     let keyboard_free = ui.ctx().memory(|m| m.focused().is_none());
     let intents: Vec<HexIntent> = if keyboard_free && !dialog_open {
         let pane_now = pane;
-        let rows = hex_visible_row_count(avail_height);
+        let rows = hex_visible_row_count(avail_height, row_h);
         ui.input(|i| collect_hex_intents(i, pane_now, rows))
     } else {
         Vec::new()
@@ -7928,14 +8018,14 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
         table = table.vertical_scroll_offset(scroll_offset_for_row(
             row,
             scroll_align,
-            ROW_HEIGHT,
+            row_h,
             spacing_y,
             avail_height,
         ));
     }
 
     table.body(|body| {
-        body.rows(ROW_HEIGHT, total_rows as usize, |mut table_row| {
+        body.rows(row_h, total_rows as usize, |mut table_row| {
             let row = table_row.index();
             min_drawn_row.set(Some(min_drawn_row.get().map_or(row, |m: usize| m.min(row))));
             let row_start = row as u64 * BYTES_PER_ROW as u64;
@@ -7958,7 +8048,7 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
                         ..Default::default()
                     },
                 );
-                paint_hex_cell(ui, job);
+                paint_hex_cell(ui, job, row_h);
             });
 
             // ---- 16진수 — 바이트별 LayoutJob 섹션(선택/매치 배경) ----
@@ -7995,7 +8085,7 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
                         },
                     );
                 }
-                let cell = paint_hex_cell(ui, job);
+                let cell = paint_hex_cell(ui, job, row_h);
                 if let Some((col, extend)) = hex_cell_hit(&cell, shift_down) {
                     if let Some((bi, high)) = hex_click_byte(col) {
                         click.set(Some(HexClick {
@@ -8042,7 +8132,7 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
                         },
                     );
                 }
-                let cell = paint_hex_cell(ui, job);
+                let cell = paint_hex_cell(ui, job, row_h);
                 if let Some((col, extend)) = hex_cell_hit(&cell, shift_down) {
                     if let Some(bi) = ascii_click_byte(col) {
                         click.set(Some(HexClick {
@@ -8079,7 +8169,7 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
     if let Some(first) = min_drawn_row.get() {
         doc.first_visible_row = first;
     }
-    doc.visible_rows = hex_visible_row_count(avail_height);
+    doc.visible_rows = hex_visible_row_count(avail_height, row_h);
 
     // 클릭 한 번을 캐럿/선택에 반영. `extend`면 앵커를 유지하고 캐럿만 옮긴다.
     if let Some(c) = click.get() {
@@ -8163,11 +8253,13 @@ impl HexCell {
 /// 셀 하나를 그리고 갤리째로 돌려준다. 세로 위치는 **행 높이 기준**으로
 /// 잡는다 — 갤리 높이로 중앙을 잡으면 셀마다 내용이 달라 기준선이 흔들려
 /// 오프셋 컬럼과 헥스 컬럼의 줄이 어긋난다.
-fn paint_hex_cell(ui: &mut egui::Ui, job: egui::text::LayoutJob) -> HexCell {
+fn paint_hex_cell(ui: &mut egui::Ui, job: egui::text::LayoutJob, row_h: f32) -> HexCell {
     let cell = ui.max_rect();
     let galley = ui.fonts(|f| f.layout_job(job));
     // 모든 칸이 같은 규칙으로 세로 정렬되도록 행 높이 기준 중앙에 둔다.
-    let origin = egui::pos2(cell.left(), cell.top() + (ROW_HEIGHT - galley.size().y) * 0.5);
+    // 배율이 걸린 행 높이를 **받아서** 쓴다 — 상수를 쓰면 확대했을 때
+    // 갤리가 커진 만큼 중앙이 위로 밀려 세 칸의 줄이 다시 어긋난다.
+    let origin = egui::pos2(cell.left(), cell.top() + (row_h - galley.size().y) * 0.5);
     ui.painter()
         .with_clip_rect(cell)
         .galley(origin, galley.clone(), ui.visuals().text_color());
@@ -8217,11 +8309,11 @@ fn paint_hex_caret(ui: &egui::Ui, rect: egui::Rect, active: bool) {
 /// 헥스 본문의 한 화면 행 수. 표/텍스트와 달리 **헤더가 없으므로**
 /// `visible_row_count`처럼 한 줄을 빼지 않는다(빼면 Page Down이 한 행씩
 /// 덜 움직인다).
-fn hex_visible_row_count(avail_height: f32) -> usize {
+fn hex_visible_row_count(avail_height: f32, row_h: f32) -> usize {
     if avail_height <= 0.0 {
         return 0;
     }
-    (avail_height / ROW_HEIGHT) as usize
+    (avail_height / row_h) as usize
 }
 
 /// 전역 Ctrl+Z(텍스트 되돌리기)가 이 문서에서 발동해도 되는가.
@@ -15800,12 +15892,177 @@ mod tests {
     #[test]
     fn visible_row_count_excludes_the_header_row() {
         // 헤더 1줄 + 본문 10줄.
-        assert_eq!(visible_row_count(ROW_HEIGHT * 11.0), 10);
+        assert_eq!(visible_row_count(ROW_HEIGHT * 11.0, ROW_HEIGHT), 10);
         // 헤더만 들어가는 높이면 본문 0행.
-        assert_eq!(visible_row_count(ROW_HEIGHT), 0);
-        assert_eq!(visible_row_count(0.0), 0);
+        assert_eq!(visible_row_count(ROW_HEIGHT, ROW_HEIGHT), 0);
+        assert_eq!(visible_row_count(0.0, ROW_HEIGHT), 0);
         // 음수(창이 접힌 극단)에서도 패닉하지 않는다.
-        assert_eq!(visible_row_count(-100.0), 0);
+        assert_eq!(visible_row_count(-100.0, ROW_HEIGHT), 0);
+    }
+
+    /// 확대하면 **같은 창 높이에 더 적은 행**이 들어간다. 행 높이가 배율을 타지
+    /// 않으면(상수를 그대로 쓰면) 이 값이 변하지 않아, 확대 상태의 Page Down이
+    /// 화면보다 많이 건너뛰어 행을 조용히 건너뛴다.
+    #[test]
+    fn visible_row_count_shrinks_when_zoomed_in() {
+        let h = ROW_HEIGHT * 11.0;
+        let at_1x = visible_row_count(h, crate::theme::row_height(1.0));
+        let at_2x = visible_row_count(h, crate::theme::row_height(2.0));
+        assert_eq!(at_1x, 10);
+        assert!(
+            at_2x < at_1x,
+            "2배 확대면 들어가는 행이 줄어야 한다 (1x={at_1x}, 2x={at_2x})"
+        );
+    }
+
+    /// **행 높이와 글자 크기는 같은 배율에서 나와야 한다.** 문서의 배율을
+    /// 올렸을 때 `doc_row_height`와 `doc_font_id`가 함께 커지지 않으면, 글자만
+    /// 커지고 행은 그대로라 위아래가 잘린다(반대면 행 사이가 허옇게 뜬다).
+    ///
+    /// 렌더가 실제로 부르는 **그 두 함수**를 태운다 — `theme::row_height`를
+    /// 직접 부르면 배선이 끊겨도(상수를 돌려주도록 바뀌어도) 통과한다.
+    #[test]
+    fn doc_row_height_and_font_scale_together() {
+        let mut app = find_test_doc(&["a", "b", "c"]);
+        let doc = app.doc_mut().unwrap();
+
+        doc.view_scale = 1.0;
+        let h1 = doc_row_height(doc);
+        let f1 = doc_font_id(doc).size;
+
+        doc.view_scale = 2.0;
+        let h2 = doc_row_height(doc);
+        let f2 = doc_font_id(doc).size;
+
+        assert!(h2 > h1, "배율을 올리면 행 높이도 커져야 한다 ({h1} → {h2})");
+        assert!(f2 > f1, "배율을 올리면 글자도 커져야 한다 ({f1} → {f2})");
+        // 비율이 같아야 글자가 행 안에 그대로 담긴다.
+        assert!(
+            ((h2 / h1) - (f2 / f1)).abs() < 1e-3,
+            "행 높이와 글자가 같은 비율로 커져야 한다 (행 {:.3}배, 글자 {:.3}배)",
+            h2 / h1,
+            f2 / f1
+        );
+    }
+
+    /// Ctrl+휠 방향: 위로 굴리면(양수) 커지고 아래로 굴리면 작아진다.
+    #[test]
+    fn wheel_up_zooms_in_and_down_zooms_out() {
+        assert!(zoomed_scale(1.0, 100.0) > 1.0);
+        assert!(zoomed_scale(1.0, -100.0) < 1.0);
+        // 굴리지 않으면 그대로.
+        assert_eq!(zoomed_scale(1.0, 0.0), 1.0);
+    }
+
+    /// 경계에서 더 밀어도 범위를 넘지 않는다. 넘으면 글자가 0px이 되거나
+    /// (아래) 한 행이 화면을 덮는다(위).
+    #[test]
+    fn zoom_saturates_at_both_limits() {
+        let mut s = 1.0;
+        for _ in 0..500 {
+            s = zoomed_scale(s, 500.0);
+        }
+        assert_eq!(s, crate::theme::MAX_VIEW_SCALE);
+        for _ in 0..1000 {
+            s = zoomed_scale(s, -500.0);
+        }
+        assert_eq!(s, crate::theme::MIN_VIEW_SCALE);
+    }
+
+    /// 깨진 배율(NaN·0·음수)이 들어와도 화면이 무너지지 않는다. NaN은 비교가
+    /// 전부 거짓이라 `clamp`만으로는 그대로 통과한다 — 따로 걸러야 한다.
+    #[test]
+    fn broken_scale_falls_back_to_sane_values() {
+        assert_eq!(crate::theme::clamp_view_scale(f32::NAN), 1.0);
+        assert_eq!(crate::theme::clamp_view_scale(0.0), crate::theme::MIN_VIEW_SCALE);
+        assert_eq!(crate::theme::clamp_view_scale(-5.0), crate::theme::MIN_VIEW_SCALE);
+        assert_eq!(crate::theme::clamp_view_scale(1e9), crate::theme::MAX_VIEW_SCALE);
+        // 어떤 배율에서도 행 높이·글자 크기는 양수다(0이면 나눗셈이 무한대가 된다).
+        for s in [f32::NAN, 0.0, -1.0, 1e9, 1.0] {
+            assert!(crate::theme::row_height(s) > 0.0);
+            assert!(crate::theme::mono_size(s) > 0.0);
+        }
+    }
+
+    /// **이 기능의 핵심 요구.** 데이터 영역만 배율을 타고 UI 크롬은 고정이다.
+    ///
+    /// 확대 후 `Body`(= 표·텍스트 셀의 글꼴)는 커지지만 `Button`(= 메뉴·툴바·
+    /// 상태바가 `chrome_text`로 쓰는 스타일)은 그대로여야 한다. 예전처럼
+    /// `ctx.set_zoom_factor`로 전역 확대하면 둘 다 커져 이 테스트가 깨진다.
+    #[test]
+    fn zoom_grows_data_font_but_not_chrome_font() {
+        let ctx = egui::Context::default();
+        let size = |ctx: &egui::Context, style: egui::TextStyle| {
+            ctx.style().text_styles[&style].size
+        };
+
+        crate::theme::install_text_styles(&ctx, 1.0);
+        let body_1x = size(&ctx, egui::TextStyle::Body);
+        let mono_1x = size(&ctx, egui::TextStyle::Monospace);
+        let button_1x = size(&ctx, egui::TextStyle::Button);
+        let heading_1x = size(&ctx, egui::TextStyle::Heading);
+        let small_1x = size(&ctx, egui::TextStyle::Small);
+
+        crate::theme::install_text_styles(&ctx, 2.0);
+        assert!(
+            size(&ctx, egui::TextStyle::Body) > body_1x,
+            "데이터 영역(Body)은 확대되어야 한다"
+        );
+        assert!(size(&ctx, egui::TextStyle::Monospace) > mono_1x);
+        assert_eq!(
+            size(&ctx, egui::TextStyle::Button),
+            button_1x,
+            "메뉴·툴바·상태바(Button)는 그대로여야 한다"
+        );
+        assert_eq!(size(&ctx, egui::TextStyle::Heading), heading_1x);
+        assert_eq!(size(&ctx, egui::TextStyle::Small), small_1x);
+    }
+
+    /// Ctrl+휠 배선: 실제 입력이 `view_scale`을 움직이고, **전역
+    /// `zoom_factor`는 건드리지 않는다**(그걸 쓰면 크롬까지 커진다 — 예전
+    /// 구현으로 되돌아가면 이 테스트가 잡는다). 순수 함수 테스트만으로는
+    /// 배선이 끊겨도 다 통과하므로 실제 이벤트를 태운다.
+    ///
+    /// Ctrl 없이 굴리는 것은 평범한 스크롤이어야 한다 — 확대되면 안 된다.
+    #[test]
+    fn ctrl_wheel_zooms_data_area_only_and_plain_wheel_does_not() {
+        let wheel = |modifiers: egui::Modifiers| egui::RawInput {
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 300.0),
+                modifiers,
+            }],
+            modifiers,
+            ..Default::default()
+        };
+
+        let mut app = App::default();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(wheel(egui::Modifiers::CTRL), |ctx| {
+            app.apply_ctrl_wheel_zoom(ctx);
+        });
+        assert!(app.view_scale > 1.0, "Ctrl+휠은 데이터 영역을 확대한다");
+        assert_eq!(ctx.zoom_factor(), 1.0, "전역 배율은 손대지 않는다");
+        // 배율 값만 바뀌고 스타일을 다시 깔지 않으면, `Label`로 그리는 표·텍스트
+        // 셀(= `TextStyle::Body`)은 옛 크기 그대로 남는다 — 행 높이만 커지고
+        // 글자는 그대로인 화면이 된다. 그 재적용까지가 이 동작의 일부다.
+        assert!(
+            ctx.style().text_styles[&egui::TextStyle::Body].size > crate::theme::MONO_SIZE,
+            "확대가 Body 스타일에 반영되어야 셀 글자가 실제로 커진다"
+        );
+        assert_eq!(
+            ctx.style().text_styles[&egui::TextStyle::Button].size,
+            13.0,
+            "크롬(Button)은 그대로"
+        );
+
+        // Ctrl 없이 굴리면 배율은 그대로(그냥 스크롤이다).
+        let mut plain = App::default();
+        let ctx2 = egui::Context::default();
+        let _ = ctx2.run(wheel(egui::Modifiers::NONE), |ctx| {
+            plain.apply_ctrl_wheel_zoom(ctx);
+        });
+        assert_eq!(plain.view_scale, 1.0, "Ctrl 없는 휠은 평범한 스크롤이다");
     }
 
     /// **뷰 전용**(편집 모드 진입 없이) 텍스트 문서에서 Page Down 두 번이
