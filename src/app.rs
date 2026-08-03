@@ -1513,7 +1513,19 @@ impl eframe::App for App {
                             self.init_save_defaults();
                             ui.close_menu();
                         }
-                        if ui.button("Save As…").clicked() {
+                    });
+                    // "다른 이름으로"는 Parquet에서도 열린다 — 읽기 전용이라
+                    // 제자리 저장(Save)은 막되 **CSV/TSV 내보내기**는 되어야
+                    // 한다. 항목 이름도 그때는 무엇을 하는지 밝힌다.
+                    let exportable = self.doc().map_or(false, doc_exportable);
+                    let is_parquet = self.doc().is_some_and(|d| d.parquet.is_some());
+                    ui.add_enabled_ui(exportable, |ui| {
+                        let label = if is_parquet {
+                            "Export as CSV/TSV…"
+                        } else {
+                            "Save As…"
+                        };
+                        if ui.button(label).clicked() {
                             self.show_save_dialog = true;
                             self.save_as = true;
                             self.init_save_defaults();
@@ -1582,12 +1594,14 @@ impl eframe::App for App {
                     ui.add_enabled_ui(tools_enabled, |ui| {
                         if ui.button("Sort by Columns…").clicked() {
                             if let Some(doc) = self.doc_mut() {
-                                // 표 모드 + 인덱싱 완료일 때만 실제로 연다.
-                                // 편집 모드는 버퍼가 파일 전체를 이미 담고 있으므로
-                                // 인덱싱 진행 상태와 무관하게 정렬할 수 있다.
-                                let complete = doc.edit.is_some()
-                                    || doc.index.status().phase == crate::index::Phase::Complete;
-                                if matches!(doc.sep, SeparatorMode::Char(_)) && complete {
+                                // 표 모드 + 전체 행 접근 가능일 때만 실제로 연다.
+                                // 편집 버퍼와 Parquet은 인덱싱 진행 상태와 무관
+                                // 하게 정렬할 수 있다(`doc_rows_ready` 참조) —
+                                // 특히 Parquet은 인덱서를 안 띄워 Phase가 영영
+                                // Priming이라, 그 값을 보면 메뉴가 안 열린다.
+                                if matches!(doc.sep, SeparatorMode::Char(_))
+                                    && doc_rows_ready(doc)
+                                {
                                     if doc.sort_specs.is_empty() {
                                         let col = doc.selected_col.unwrap_or(0);
                                         doc.sort_specs.push(SortSpec {
@@ -5181,14 +5195,22 @@ fn apply_save_newline(doc: &mut Document, nl: crate::edit::Newline) {
 /// 저장 다이얼로그. 인코딩/BOM/개행을 고르고 저장하거나 취소한다.
 /// `app.save_as`가 참이면 rfd 파일 선택 창으로 경로를 새로 고른다.
 fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
-    // 저장할 편집 버퍼(텍스트/헥스)가 없으면(편집 모드 이탈 등) 다이얼로그를
-    // 닫는다.
-    if app.doc().map_or(true, |d| !doc_savable(d)) {
+    // 저장할 것이 없으면(편집 모드 이탈 등) 다이얼로그를 닫는다.
+    // `doc_exportable`이라 Parquet(편집 버퍼가 없다)도 통과한다 — 그 경우는
+    // 제자리 저장이 아니라 CSV/TSV 내보내기다.
+    if app.doc().map_or(true, |d| !doc_exportable(d)) {
         app.show_save_dialog = false;
         return;
     }
     let is_hex = app.doc().is_some_and(|d| d.hex.is_some());
-    let title = if app.save_as { "Save As" } else { "Save" };
+    let is_parquet = app.doc().is_some_and(|d| d.parquet.is_some());
+    let title = if is_parquet {
+        "Export as CSV/TSV"
+    } else if app.save_as {
+        "Save As"
+    } else {
+        "Save"
+    };
     let cur_label = app
         .doc()
         .map(|d| d.path_label.clone())
@@ -6248,10 +6270,11 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
         return;
     }
 
-    // 편집 모드는 버퍼가 파일 전체를 이미 담고 있으므로 인덱싱 진행 상태와
-    // 무관하게 정렬할 수 있다.
+    // 편집 버퍼와 Parquet은 인덱싱 진행 상태와 무관하게 정렬할 수 있다
+    // (`doc_rows_ready` 참조). Parquet은 인덱서를 아예 안 띄우므로 Phase가
+    // 영영 Priming이라, 그 값을 그대로 보면 정렬 버튼이 끝내 안 켜진다.
     let editing = doc.edit.is_some();
-    let complete = editing || doc.index.status().phase == Phase::Complete;
+    let complete = doc_rows_ready(doc);
     let selected = doc.selected_col;
 
     match selected {
@@ -8689,6 +8712,32 @@ fn doc_savable(doc: &Document) -> bool {
     doc.edit.is_some() || doc.hex.as_ref().is_some_and(|h| h.edit.is_some())
 }
 
+/// **다른 이름으로** 내보낼 수 있는가. `doc_savable`(제자리 저장)과 갈라 둔
+/// 이유: Parquet은 읽기 전용이라 덮어쓸 수 없지만 **CSV/TSV로 내보내는 것은
+/// 되어야 한다**. 편집 버퍼가 없다는 이유로 `doc_savable`에 얹으면 "Save"까지
+/// 열려, 읽기 전용 파일을 제자리에서 덮어쓰겠다는 뜻이 된다.
+///
+/// 내보내기 실체는 `collect_export_lines` → `save::write_file`이고, 정렬이
+/// 걸려 있으면 화면 순서를 따른다.
+fn doc_exportable(doc: &Document) -> bool {
+    doc_savable(doc) || doc.parquet.is_some()
+}
+
+/// 문서의 **모든 행에 지금 접근할 수 있는가**. 정렬처럼 전체를 훑는 조작이
+/// 이것을 전제한다.
+///
+/// 세 출처가 각자 다른 이유로 참이다:
+/// - 편집 버퍼: 파일 전체가 이미 RAM에 있다.
+/// - Parquet: 푸터가 행 수를 알고 row group을 임의 접근할 수 있다.
+///   **인덱서를 띄우지 않으므로 `Phase`는 영영 `Priming`이다** — 그 값을
+///   조건에 쓰면 정렬 메뉴가 열리지 않는다(실제로 그랬다).
+/// - 텍스트 뷰: 줄 인덱싱이 끝나야 한다.
+fn doc_rows_ready(doc: &Document) -> bool {
+    doc.edit.is_some()
+        || doc.parquet.is_some()
+        || doc.index.status().phase == crate::index::Phase::Complete
+}
+
 /// 저장하지 않은 변경이 있는가 — 텍스트/헥스 어느 쪽 편집 버퍼든 dirty면 참.
 /// 닫기 확인(탭 닫기·앱 종료)과 탭 라벨의 ●/* 표시가 함께 이 함수를 본다 —
 /// 텍스트만 보던 시절엔 헥스를 수정하고 저장하지 않은 채 탭/앱을 닫아도
@@ -10004,6 +10053,52 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
+    /// **메뉴에서 실제로 닿는지**를 본다. 이 테스트가 없어서 내보내기 코드가
+    /// 죽어 있었다 — `collect_export_lines`와 저장 경로는 완성됐는데
+    /// `doc_savable`(편집 버퍼 필수)이 메뉴를 잠가 도달할 수 없었다.
+    #[test]
+    fn parquet_can_be_exported_but_not_saved_in_place() {
+        let p = crate::parquet::testutil::temp_path("exportgate");
+        crate::parquet::testutil::write_simple(&p, vec![1], vec![Some("x")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().unwrap();
+        assert!(
+            !doc_savable(doc),
+            "제자리 저장은 막힌다 — 읽기 전용 파일을 덮어쓸 수 없다"
+        );
+        assert!(
+            doc_exportable(doc),
+            "CSV/TSV 내보내기는 되어야 한다 — 이게 false면 메뉴가 잠겨 \
+             collect_export_lines가 영영 안 불린다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 정렬 메뉴/툴바가 `Phase::Complete`를 보면 Parquet에서 영영 안 열린다 —
+    /// 인덱서를 띄우지 않아 Phase가 `Priming`에 멈춰 있기 때문이다.
+    #[test]
+    fn parquet_rows_are_ready_without_the_indexer() {
+        let p = crate::parquet::testutil::temp_path("rowsready");
+        crate::parquet::testutil::write_simple(&p, vec![1], vec![Some("x")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().unwrap();
+        assert_ne!(
+            doc.index.status().phase,
+            crate::index::Phase::Complete,
+            "사전 조건: 인덱서를 안 띄우므로 Complete가 아니다"
+        );
+        assert!(
+            doc_rows_ready(doc),
+            "그래도 전체 행에 접근할 수 있다 — 푸터가 행 수를 알고 row group을 \
+             임의 접근할 수 있다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
     #[test]
     fn parquet_status_shows_rows_columns_and_read_only() {
         let p = crate::parquet::testutil::temp_path("status");
@@ -10114,6 +10209,42 @@ mod tests {
         assert!(lines[0].starts_with("id,name"), "헤더가 먼저");
         let first = crate::parse::split_fields(&lines[1], b',');
         assert_eq!(first[0], "4999", "정렬 순서를 따른다");
+
+        // **UI가 그 기능에 닿는가.** 위의 함수들이 다 맞아도 메뉴가 잠겨
+        // 있으면 사용자에게는 없는 기능이다(실제로 둘 다 잠겨 있었다).
+        assert!(doc_exportable(d), "내보내기 메뉴가 열려 있어야 한다");
+        assert!(!doc_savable(d), "제자리 저장은 막혀 있어야 한다");
+        assert!(doc_rows_ready(d), "정렬 메뉴·툴바가 열려 있어야 한다");
+        assert!(text_tools_enabled(d), "Tools 메뉴(정렬)가 열려 있어야 한다");
+        assert!(!text_edit_allowed(d), "편집은 막혀 있어야 한다");
+
+        // 내보낸 CSV를 실제로 써서 다시 읽는다 — 왕복이 파일 단위로도
+        // 성립하는지(인용·개행 치환 포함).
+        let out = std::env::temp_dir().join(format!("tv_pq_export_{}.csv", std::process::id()));
+        crate::save::write_file(
+            &out,
+            &lines,
+            &crate::save::SaveOptions {
+                enc: Encoding::Utf8,
+                bom: false,
+                newline: crate::edit::Newline::Lf,
+            },
+            None,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        let written: Vec<&str> = text.lines().collect();
+        assert_eq!(written.len(), 5001, "파일에도 5001줄");
+        assert_eq!(written[0], lines[0], "헤더가 그대로");
+        // 개행이 든 셀이 한 줄로 눌렸으므로 줄 수가 행 수와 정확히 같다.
+        for (i, w) in written.iter().enumerate().take(50) {
+            assert_eq!(
+                crate::parse::split_fields(w, b',').len(),
+                8,
+                "쓴 파일 {i}번째 줄의 컬럼 수"
+            );
+        }
+        std::fs::remove_file(&out).ok();
     }
 
     /// "텍스트로 열기"는 감지를 건너뛰고 지정 인코딩으로 기존 경로를 탄다.
