@@ -7226,6 +7226,47 @@ fn sel_span_on_line(
 /// `matches`는 이 줄에서 찾은 (col, len) 목록(char 인덱스). `current`가 Some이면
 /// 그 (col, len)에 해당하는 매치는 `find_current_bg`(진한 보라)로, 나머지는
 /// `find_match_bg`(옅은 보라)로 그린다 — current를 나중에(위에) 덮어 더 진하게.
+/// 줄에서 탭 문자가 있는 char 위치들. `paint_tab_shades`가 칠할 칸을 고른다.
+///
+/// **char 인덱스여야 한다**(바이트가 아니라) — `x_of`가 `CCursor`를 받으므로
+/// 한글이 섞이면 바이트 오프셋은 엉뚱한 자리를 가리킨다.
+fn tab_positions(line: &str) -> Vec<usize> {
+    line.chars()
+        .enumerate()
+        .filter(|&(_, c)| c == '\t')
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// 탭이 차지하는 칸에 옅은 배경을 깐다. 스페이스와 탭이 둘 다 빈 칸으로 보여
+/// 구분되지 않는 문제를 푼다.
+///
+/// **탭 한 칸의 폭을 산술로 구하지 않는다.** epaint는 탭을 "다음 탭스톱까지"가
+/// 아니라 **고정폭 빈 글자**로 그린다(`TAB_SIZE(4) × 스페이스 advance`,
+/// `epaint-0.28.1/src/text/font.rs:187-190`). 그래서 갤리 안에서 탭은 평범한
+/// 한 글자이고, 그 칸은 `x_of(i)`부터 `x_of(i+1)`까지다. 갤리에게 물으므로
+/// 배율이 바뀌어도, 폰트가 폴백으로 넘어가도 어긋나지 않는다
+/// (헥스 정렬을 고칠 때 배운 것과 같은 규율).
+fn paint_tab_shades(
+    painter: &egui::Painter,
+    cell_rect: egui::Rect,
+    x_of: &dyn Fn(usize) -> f32,
+    tabs: &[usize],
+) {
+    for &i in tabs {
+        let x0 = x_of(i);
+        let x1 = x_of(i + 1);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, cell_rect.top()),
+                egui::pos2(x1, cell_rect.bottom()),
+            ),
+            0.0,
+            crate::theme::tab_bg(),
+        );
+    }
+}
+
 fn paint_match_shades(
     painter: &egui::Painter,
     cell_rect: egui::Rect,
@@ -7542,11 +7583,31 @@ fn render_text(
                         // 방지). 검색 중일 때만 galley로 바꿔 부분 음영을 그린다 —
                         // 음영·글자만, 캐럿/선택/상호작용은 없다(뷰 모드엔 없으므로).
                         if !searching {
-                            // 개행 기호를 그리려면 글자 끝 x를 알아야 하므로
-                            // `Label`이 그린 실제 폭(`response.rect`)을 쓴다 —
-                            // 여기서 galley를 따로 만들어 재면 Label의 레이아웃과
-                            // 어긋날 수 있다.
-                            let resp = ui.add(egui::Label::new(line).truncate());
+                            // `Label`을 쓰되 **그 자신의 galley**를 받아 쓴다
+                            // (`layout_in_ui`는 레이아웃·자리 확보만 하고 그리지는
+                            // 않는다). 여기서 galley를 새로 만들어 재면 `Label`의
+                            // 레이아웃(wrap·truncate·Body 스타일)과 어긋날 수 있는데,
+                            // 그 위험 없이 탭 칸 좌표를 정확히 얻는 유일한 방법이다.
+                            let tabs = tab_positions(&line);
+                            let (pos, galley, resp) =
+                                egui::Label::new(line).truncate().layout_in_ui(ui);
+                            // 탭 배경 → 글자 순서로 그려야 배경이 글자를 덮지 않는다.
+                            if !tabs.is_empty() {
+                                let x_of = |c: usize| -> f32 {
+                                    pos.x
+                                        + galley
+                                            .pos_from_ccursor(egui::text::CCursor::new(c))
+                                            .min
+                                            .x
+                                };
+                                paint_tab_shades(
+                                    &ui.painter().with_clip_rect(resp.rect),
+                                    resp.rect,
+                                    &x_of,
+                                    &tabs,
+                                );
+                            }
+                            ui.painter().galley(pos, galley, text_color);
                             let ending = line_ending_for_row(doc, logical);
                             paint_line_ending(
                                 ui.painter(),
@@ -7574,6 +7635,9 @@ fn render_text(
                                     .x
                         };
                         let painter = ui.painter().with_clip_rect(cell_rect);
+                        // 탭 칸 배경을 매치 음영 **아래**에 먼저 깐다 — 탭 위에
+                        // 매치가 겹치면 매치가 이겨야 한다(찾은 자리가 우선).
+                        paint_tab_shades(&painter, cell_rect, &x_of, &tab_positions(&line));
                         // 텍스트 모드는 delim=None. current는 이 논리 행의 last_match.
                         let matches =
                             crate::find::find_in_line_scoped(&line, &find_query, &find_opts, None);
@@ -7616,6 +7680,9 @@ fn render_text(
                     };
 
                     let painter = ui.painter().with_clip_rect(cell_rect);
+                    // 0) 탭 칸 배경을 가장 아래에. 선택·매치가 그 위에 겹치면
+                    //    그쪽이 이겨야 한다(지금 무엇을 하고 있는지가 우선).
+                    paint_tab_shades(&painter, cell_rect, &x_of, &tab_positions(&line));
                     // 1) 선택 음영을 글자 아래에 먼저.
                     if let Some((a, b)) = sel_norm {
                         if let Some((c0, c1)) = sel_span_on_line(a, b, logical, len) {
@@ -15885,6 +15952,232 @@ mod tests {
              (first_visible_row={}, target={target})",
             doc.first_visible_row
         );
+    }
+
+    /// 탭 자리 찾기는 **char 인덱스**여야 한다 — `x_of`가 `CCursor`를 받으므로
+    /// 바이트 오프셋이면 한글이 섞인 줄에서 엉뚱한 칸을 칠한다.
+    #[test]
+    fn tab_positions_are_char_indices_not_bytes() {
+        assert_eq!(tab_positions("a\tb"), vec![1]);
+        assert_eq!(tab_positions("\t\t"), vec![0, 1]);
+        assert_eq!(tab_positions("no tabs here"), Vec::<usize>::new());
+        assert_eq!(tab_positions(""), Vec::<usize>::new());
+        // 한글은 UTF-8에서 3바이트다. 바이트로 세면 탭이 3이 아니라 9로 잡힌다.
+        assert_eq!(tab_positions("한글자\t뒤"), vec![3]);
+        // 스페이스는 탭이 아니다(이 기능의 존재 이유 — 둘을 갈라야 한다).
+        assert_eq!(tab_positions("   "), Vec::<usize>::new());
+    }
+
+    /// **탭 칸의 폭을 갤리에게 묻는다.** epaint는 탭을 "다음 탭스톱까지"가 아니라
+    /// 고정폭 빈 글자로 그리므로(`TAB_SIZE × 스페이스 폭`), 갤리 안에서 탭은
+    /// 평범한 한 글자다. 그 성질에 기대는 코드이므로 여기서 못박는다 —
+    /// epaint가 진짜 탭스톱으로 바뀌면 이 테스트가 먼저 깨져야 한다.
+    #[test]
+    fn tab_occupies_one_galley_char_wider_than_a_space() {
+        let ctx = egui::Context::default();
+        // 폰트는 `Context::run` 안에서만 쓸 수 있다.
+        let _ = ctx.run(Default::default(), |ctx| {
+            let font = egui::FontId::monospace(crate::theme::MONO_SIZE);
+            let x_at = |text: &str, ch: usize| -> f32 {
+                let g = ctx.fonts(|f| {
+                    f.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::BLACK)
+                });
+                g.pos_from_ccursor(egui::text::CCursor::new(ch)).min.x
+            };
+            // "a\tb"에서 탭 칸은 char 1 → 2 사이다.
+            let tab_w = x_at("a\tb", 2) - x_at("a\tb", 1);
+            let space_w = x_at("a b", 2) - x_at("a b", 1);
+            assert!(tab_w > 0.0, "탭 칸은 폭이 있어야 칠할 자리가 생긴다");
+            assert!(
+                tab_w > space_w * 1.5,
+                "탭은 스페이스보다 확실히 넓어야 한다 (탭 {tab_w}, 스페이스 {space_w})"
+            );
+            // 탭 **뒤** 글자도 그만큼 밀린다 — 즉 탭이 자리를 실제로 차지한다.
+            assert!(x_at("a\tb", 2) > x_at("ab", 1));
+        });
+    }
+
+    /// 탭 음영이 **탭 위에** 그려지는가. 좌표를 갤리에서 얻으므로, 칠하는 구간이
+    /// 그 줄의 탭 칸과 정확히 겹쳐야 한다(옆 글자를 덮으면 안 된다).
+    #[test]
+    fn tab_shade_covers_exactly_the_tab_cell() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            let font = egui::FontId::monospace(crate::theme::MONO_SIZE);
+            let line = "ab\tcd";
+            let galley = ctx.fonts(|f| {
+                f.layout_no_wrap(line.to_owned(), font.clone(), egui::Color32::BLACK)
+            });
+            let x_of =
+                |c: usize| -> f32 { galley.pos_from_ccursor(egui::text::CCursor::new(c)).min.x };
+
+            let tabs = tab_positions(line);
+            assert_eq!(tabs, vec![2]);
+
+            // 칠할 구간 = x_of(2)..x_of(3): 앞 글자('b')가 끝나는 자리에서
+            // 시작해 뒷 글자('c')가 시작하는 자리에서 끝난다.
+            let (x0, x1) = (x_of(tabs[0]), x_of(tabs[0] + 1));
+            assert!(x1 > x0, "구간이 비어 있으면 아무것도 안 보인다");
+            // 그 폭이 곧 탭 한 칸이다 — 글자 한 칸보다 확실히 넓다.
+            let char_w = x_of(1) - x_of(0);
+            assert!(
+                (x1 - x0) > char_w * 1.5,
+                "탭 칸이 글자 한 칸 수준이면 좌표를 잘못 잡은 것이다"
+            );
+            // 뒷 글자는 음영 바깥에서 시작한다(덮이지 않는다).
+            assert!(x_of(4) > x1, "탭 다음 글자는 음영 오른쪽에 있어야 한다");
+        });
+    }
+
+    /// **`paint_tab_shades`가 실제로 그리는 사각형**을 검사한다. 좌표 산술을
+    /// 테스트에서 다시 계산하면 그 함수가 엉뚱한 칸을 칠하도록 바뀌어도
+    /// (`x_of(i+1)..x_of(i+2)` 같은 off-by-one) 아무도 못 잡는다 — 변이로
+    /// 확인한 실제 구멍이라 함수를 직접 태운다.
+    #[test]
+    fn paint_tab_shades_emits_a_rect_over_each_tab() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            // char 하나 = 10px인 가짜 좌표계. 탭이든 아니든 인덱스 → x가
+            // 선형이므로 어떤 칸이 칠해졌는지 인덱스로 되읽을 수 있다.
+            let x_of = |c: usize| -> f32 { c as f32 * 10.0 };
+            let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 20.0));
+            let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("tabtest"));
+            let painter = egui::Painter::new(ctx.clone(), layer, rect);
+
+            // "ab\tc\td" → 탭은 char 2와 4.
+            paint_tab_shades(&painter, rect, &x_of, &[2, 4]);
+
+            let shapes = ctx.graphics(|g| {
+                g.get(layer).map(|l| l.all_entries().count()).unwrap_or(0)
+            });
+            assert_eq!(shapes, 2, "탭 개수만큼 사각형이 나와야 한다");
+
+            let painted: Vec<(f32, f32)> = ctx.graphics(|g| {
+                g.get(layer)
+                    .map(|l| {
+                        l.all_entries()
+                            .filter_map(|e| match &e.shape {
+                                egui::Shape::Rect(r) => Some((r.rect.left(), r.rect.right())),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+            assert_eq!(
+                painted,
+                vec![(20.0, 30.0), (40.0, 50.0)],
+                "각 탭의 **그 칸**(i..i+1)이 칠해져야 한다"
+            );
+        });
+    }
+
+    /// **배선 확인.** `paint_tab_shades`를 아무리 잘 테스트해도 렌더가 그걸
+    /// 부르지 않으면 화면에는 아무 일도 일어나지 않는다 — 실제로 호출을 지워도
+    /// 전부 통과하는 것을 변이로 확인했다. 그래서 진짜 문서를 그려서 탭 색
+    /// (`theme::tab_bg`)으로 칠해진 사각형이 나오는지 센다.
+    ///
+    /// `render_text`에는 줄을 그리는 경로가 **셋** 있고(뷰, 뷰+검색중, 편집),
+    /// 각각 따로 칠해야 한다. 셋을 모두 태운다 — 하나만 확인하면 나머지 둘에서
+    /// 호출이 사라져도 통과한다(실제로 변이로 확인했다).
+    #[test]
+    fn render_text_actually_paints_tab_shades_in_all_three_paths() {
+        /// 그 프레임에 그려진 탭 배경색 사각형 수.
+        fn count_tab_rects(app: &mut App) -> usize {
+            let ctx = egui::Context::default();
+            let mut clip = String::new();
+            let out = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_text(ui, app.doc_mut().unwrap(), 0, &mut clip, false);
+                });
+            });
+            let want = crate::theme::tab_bg();
+            out.shapes
+                .iter()
+                .filter(|c| match &c.shape {
+                    egui::Shape::Rect(r) => r.fill == want,
+                    _ => false,
+                })
+                .count()
+        }
+
+        // ---- (1) 편집 모드 ----
+        let mut edit = find_test_doc(&["a\tb", "c\td\te"]);
+        assert_eq!(count_tab_rects(&mut edit), 3, "편집 모드에서 탭 3개");
+
+        // 탭이 없으면 탭 음영도 없다(다른 음영을 잘못 세지 않는다는 확인).
+        let mut no_tabs = find_test_doc(&["no tabs", "here either"]);
+        assert_eq!(count_tab_rects(&mut no_tabs), 0);
+
+        // 뷰 경로는 편집 버퍼가 아니라 **파일**에서 줄을 읽으므로, 탭이 든
+        // 파일을 실제로 열어야 한다(`find_test_doc`은 편집 버퍼에만 넣는다).
+        // 확장자를 .txt로 두어 텍스트 모드(SeparatorMode::None)로 열린다.
+        fn view_doc_with_tabs() -> App {
+            let p = temp_ext(b"a\tb\r\nc\td\te\r\n", "txt");
+            let ctx = egui::Context::default();
+            let mut app = App::default();
+            app.open_path(&p, &ctx);
+            let doc = app.doc_mut().unwrap();
+            doc.indexer.take().unwrap().join().unwrap();
+            // 작은 파일은 열 때 자동으로 편집 모드로 들어가므로(`auto_edit_on_open`)
+            // 뷰 경로를 태우려면 편집 버퍼를 명시적으로 걷어낸다. 그러면 줄을
+            // 파일(mmap)에서 디코딩해 읽는 경로가 된다.
+            doc.edit = None;
+            app
+        }
+
+        // ---- (2) 뷰 + 검색 중 ----
+        // `highlight`가 있으면 galley 경로로 간다(`searching = true`).
+        let mut searching = view_doc_with_tabs();
+        searching.doc_mut().unwrap().highlight = Some(Highlight {
+            rows: Vec::new(),
+            query: "zzz".to_owned(),
+            opts: Default::default(),
+        });
+        assert_eq!(
+            count_tab_rects(&mut searching),
+            3,
+            "검색 중 뷰 경로에서도 탭이 칠해져야 한다"
+        );
+
+        // ---- (3) 뷰 전용(Label 경로) ----
+        let mut view = view_doc_with_tabs();
+        assert_eq!(
+            count_tab_rects(&mut view),
+            3,
+            "평범한 뷰 모드(Label 경로)에서도 탭이 칠해져야 한다"
+        );
+    }
+
+    /// 탭이 없으면 아무것도 그리지 않는다(빈 사각형이 쌓이면 낭비다).
+    #[test]
+    fn paint_tab_shades_draws_nothing_without_tabs() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            let x_of = |c: usize| -> f32 { c as f32 * 10.0 };
+            let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 20.0));
+            let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("notabs"));
+            let painter = egui::Painter::new(ctx.clone(), layer, rect);
+            paint_tab_shades(&painter, rect, &x_of, &[]);
+            let shapes = ctx.graphics(|g| {
+                g.get(layer).map(|l| l.all_entries().count()).unwrap_or(0)
+            });
+            assert_eq!(shapes, 0);
+        });
+    }
+
+    /// 탭 배경색은 찾기 음영보다 **옅어야** 한다 — 탭 위에 매치가 겹치면
+    /// 매치가 이겨야 한다(찾은 자리가 우선). 알파를 뒤집으면 탭 줄무늬가
+    /// 검색 결과를 덮는다.
+    #[test]
+    fn tab_bg_is_fainter_than_find_shades() {
+        let tab_a = crate::theme::tab_bg().a();
+        assert!(
+            tab_a < crate::theme::find_match_bg().a(),
+            "탭 배경이 매치 음영보다 진하면 검색 결과를 덮는다"
+        );
+        assert!(tab_a < crate::theme::find_current_bg().a());
+        assert!(tab_a > 0, "완전 투명이면 보이지 않는다");
     }
 
     /// 한 화면 행 수는 **헤더 한 줄을 뺀** 본문 높이로 구한다 — 안 빼면
