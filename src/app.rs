@@ -222,14 +222,45 @@ pub struct PendingColumnOp {
     rows: usize,
 }
 
-/// 탭 바(전환/닫기)를 잠가야 하는가. `pending_action`(닫기 확인 대기) 또는
-/// 저장 다이얼로그가 떠 있으면 잠근다 — 둘 다 egui 0.28 `Window`라 모달이
+/// 탭 바(전환/닫기)를 잠가야 하는가. `pending_action`(닫기 확인 대기),
+/// 저장 다이얼로그, 바이너리 열기 방식 선택, 대형 바이너리 로드 확인 중
+/// 하나라도 떠 있으면 잠근다 — 전부 egui 0.28 `Window`라 모달이
 /// 아니므로(`.modal()`은 0.30부터), 잠그지 않으면 그 아래에서 탭 집합이나
 /// 활성 탭이 움직여 대기 중인 인덱스(`CloseTab(i)`)나 저장 다이얼로그의
 /// 인코딩/BOM 선택이 엉뚱한 문서를 가리키게 된다. GUI 클로저(`update()`)
 /// 안에 인라인으로 두면 순수 로직으로 테스트할 수 없으므로 별도 함수로 뺀다.
-fn tab_bar_locked(pending_action: &Option<PendingAction>, show_save_dialog: bool) -> bool {
-    pending_action.is_some() || show_save_dialog
+///
+/// - `pending_binary_open`: 열기 방식(헥스/텍스트+인코딩) 선택 대기. 이게
+///   떠 있는 동안 새 `open_path`가 들어오면 그 보류를 조용히 덮어써서
+///   사용자가 고른 인코딩과 앞선 파일이 함께 사라진다(C1). `open_path`가
+///   스스로 거절하는 것과 짝을 이뤄, 드롭/탭 조작 자체를 여기서 막는다.
+/// - `hex_confirm_load`: 활성 문서의 `HexState::confirm_load`(512MB 초과
+///   로드 확인). 이 다이얼로그는 "지금 활성인 문서"를 대상으로 읽고 쓰므로
+///   잠금 없이 탭이 바뀌면 엉뚱한 문서를 로드하거나 플래그가 영영 켜진 채
+///   남는다(I4).
+fn tab_bar_locked(
+    pending_action: &Option<PendingAction>,
+    show_save_dialog: bool,
+    pending_binary_open: bool,
+    hex_confirm_load: bool,
+) -> bool {
+    pending_action.is_some() || show_save_dialog || pending_binary_open || hex_confirm_load
+}
+
+/// 열기 방식 선택이 보류 중이라 새 열기를 거절했을 때의 안내.
+/// `EXTRACT_LOCKED_STATUS`와 같은 결이다.
+const BINARY_OPEN_PENDING_STATUS: &str = "Close the open dialog first";
+
+/// `tab_bar_locked`에 `App`의 실제 상태를 먹이는 어댑터. 인자 조립을
+/// 호출부마다 따로 적으면(특히 새로 늘어난 두 조건) 한 곳만 빠뜨려도
+/// 티가 나지 않으므로 조립을 한 곳에 둔다(`page_keys_live_for`와 같은 규율).
+fn tab_bar_locked_for(app: &App) -> bool {
+    tab_bar_locked(
+        &app.pending_action,
+        app.show_save_dialog,
+        app.pending_binary_open.is_some(),
+        app.doc().is_some_and(|d| d.hex.as_ref().is_some_and(|h| h.confirm_load)),
+    )
 }
 
 /// 드롭된 경로 중 실제로 열 것만 골라낸다. 디렉터리는 건너뛴다 — `open_path`가
@@ -435,7 +466,20 @@ impl App {
 
     /// 파일을 연다. 텍스트면 곧바로, 바이너리로 판정되면 열기 방식 선택
     /// 다이얼로그를 보류한다(`render_binary_open_dialog`).
+    ///
+    /// **이미 보류 중인 열기 방식 선택이 있으면 아무 것도 하지 않는다.**
+    /// 예전에는 `pending_binary_open`을 무조건 덮어썼는데, 그러면 .gpkg 셋을
+    /// 한 번에 드롭했을 때 앞의 둘이 소리 없이 사라지고 마지막 하나만 창을
+    /// 띄웠다. File▸Open…을 다이얼로그가 떠 있는 동안 또 쓰면 사용자가 이미
+    /// 고른 인코딩까지 초기화됐다. `pending_action`을 덮어쓰지 않는 규율
+    /// (창 닫기 확인)과 같은 이유다. 큐를 만들지 않는 것은 의도적이다 —
+    /// 여기에 더해 `tab_bar_locked`가 드롭/탭 조작 자체를 막으므로, 이
+    /// 거절은 그 잠금을 우회하는 경로(메뉴 열기 등)에 대한 이중 안전망이다.
     pub fn open_path(&mut self, path: &Path, ctx: &egui::Context) {
+        if self.pending_binary_open.is_some() {
+            self.error = Some(BINARY_OPEN_PENDING_STATUS.to_owned());
+            return;
+        }
         self.error = None;
         let head = match std::fs::File::open(path) {
             Ok(mut f) => {
@@ -636,10 +680,7 @@ impl App {
         // 벗어나는 평범한 포커스 순회여야 한다 — 본문이 가로채면 입력란에
         // 갇힌다.
         let keyboard_free = ctx.memory(|m| m.focused().is_none());
-        if !body_takes_tab
-            || !keyboard_free
-            || tab_bar_locked(&self.pending_action, self.show_save_dialog)
-        {
+        if !body_takes_tab || !keyboard_free || tab_bar_locked_for(self) {
             return false;
         }
         let took = consume_tab_key(ctx);
@@ -1204,7 +1245,7 @@ impl eframe::App for App {
         // 뒤에 추가되는 것 자체는 인덱스 i를 흔들지 않지만(push는 앞쪽을
         // 건드리지 않는다) 대기 중인 다이얼로그 아래서 탭 집합이 바뀌는 것은
         // Task A가 막은 것과 같은 종류의 위험이라 함께 잠근다.
-        let locked = tab_bar_locked(&self.pending_action, self.show_save_dialog);
+        let locked = tab_bar_locked_for(self);
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -1464,7 +1505,7 @@ impl eframe::App for App {
         // 저장 다이얼로그가 다른 문서의 인코딩/BOM으로 저장해 버리는 사고로
         // 이어진다. 인덱스/설정이 대기하는 동안 탭 집합이 움직일 수 없게
         // 만드는 것이 곧 안전을 보장하는 방법이다.
-        let tab_bar_locked = tab_bar_locked(&self.pending_action, self.show_save_dialog);
+        let tab_bar_locked = tab_bar_locked_for(self);
         if self.docs.len() > 1 {
             egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
                 ui.add_enabled_ui(!tab_bar_locked, |ui| {
@@ -2366,7 +2407,18 @@ fn page_keys_live_for(app: &App, ctx: &egui::Context) -> bool {
 /// `render_table`의 `data_rows`와 같아지고, 그래야 페이지 이동의 마지막 행
 /// 클램프가 실제로 존재하는 마지막 행과 맞는다. 텍스트 모드는 논리 행이 곧
 /// 화면 행이다.
+///
+/// **헥스 문서는 줄 인덱서를 아예 띄우지 않는다**(`hex_document`가
+/// `indexer: None` — `hex_status_text` 주석 참조). 그래서
+/// `doc.index.line_count()`는 영영 0이고, 그대로 두면 `page_target_row`가
+/// `total == 0`으로 보고 `None`을 돌려 Page Up/Down이 **캐럿만 옮기고 화면은
+/// 그대로**였다(I3). 헥스의 화면 행은 32바이트 한 줄이므로
+/// `hex::row_count`가 곧 답이다 — 이러면 `render_hex`가 이미 기록하던
+/// `first_visible_row`/`visible_rows` 관측값이 비로소 쓰인다.
 fn doc_screen_row_count(doc: &Document) -> usize {
+    if doc.hex.is_some() {
+        return crate::hex::row_count(hex_doc_len(doc)) as usize;
+    }
     match doc.sep {
         SeparatorMode::None => doc_line_count(doc),
         SeparatorMode::Char(_) => {
@@ -3848,7 +3900,7 @@ fn extract_plan(has_header: bool, sep: SeparatorMode) -> ExtractPlan {
 /// 드롭 처리가 `plan_dropped_files`로 하는 것과 같은 규율로, 실제 가드와
 /// 테스트가 **이 함수 하나**를 공유한다.
 fn extract_allowed(app: &App) -> bool {
-    !tab_bar_locked(&app.pending_action, app.show_save_dialog)
+    !tab_bar_locked_for(app)
 }
 
 /// 잠겨 있어 추출을 막았을 때 상태 문구. `plan_dropped_files`의 안내와 같은 결.
@@ -4423,6 +4475,23 @@ fn find_window_default_pos(screen: egui::Rect) -> egui::Pos2 {
     egui::pos2((screen.right() - 340.0).max(screen.left()), screen.top() + 32.0)
 }
 
+/// 헥스 찾기의 기준이 바뀌었을 때 커서를 버린다(Minor 6).
+///
+/// 해석 방식(`find_hex`)을 토글하면 같은 검색어의 의미가 통째로 달라진다 —
+/// `"4F4B"`가 두 바이트에서 네 글자로. 그 전 기준으로 잡은 `last_match`는
+/// 더 이상 이 검색어의 매치가 아니므로, 남겨 두면 하이라이트가 거짓이 되고
+/// 다음 `hex_find_next`가 그 자리에서 이어 찾는다. 텍스트 패널이
+/// `find_inputs_changed`로 하는 것과 같은 처리다.
+///
+/// 렌더 클로저 안에 인라인으로 두면 체크박스 클릭을 흉내내야만 테스트할 수
+/// 있으므로(창 안 위젯 좌표에 의존하는 취약한 테스트) 순수 함수로 뺀다.
+fn reset_hex_find_cursor(doc: &mut Document) {
+    if let Some(h) = doc.hex.as_mut() {
+        h.last_match = None;
+    }
+    doc.find_status = String::new();
+}
+
 /// 헥스 문서 전용 찾기 창. 바꾸기 입력란도, 대소문자/범위 옵션도 없다 —
 /// 헥스에는 그 개념이 없거나(바꾸기는 니블 단위 편집과 안 맞는다) 아직
 /// 범위가 없다(문서 전체 하나). 검색어 입력란은 텍스트 모드와 같은
@@ -4456,8 +4525,13 @@ fn render_hex_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<Find
             });
             // `doc.hex`는 이 함수에 들어온 시점에 `Some`임이 보장된다
             // (`render_find_panel`이 `doc.hex.is_some()`일 때만 여기로 분기한다).
-            let h = doc.hex.as_mut().unwrap();
-            ui.checkbox(&mut h.find_hex, "Hex");
+            let mode_changed = {
+                let h = doc.hex.as_mut().unwrap();
+                ui.checkbox(&mut h.find_hex, "Hex").changed()
+            };
+            if mode_changed {
+                reset_hex_find_cursor(doc);
+            }
             ui.separator();
             if ui.button("Find Next").clicked() {
                 action = Some(FindAction::HexNext);
@@ -8139,10 +8213,16 @@ fn text_tools_enabled(doc: &Document) -> bool {
 /// 크기는 편집 버퍼가 있으면 그쪽이 진실이다(`hex_doc_len`이 그 분기를 안다).
 /// 오프셋은 10진/16진 둘 다 적는다 — 헥스 뷰의 오프셋 컬럼과 맞춰 보려면
 /// 16진이, 크기와 견주려면 10진이 필요하다.
+///
+/// **삽입/덮어쓰기 모드도 적는다(M7).** Insert 키 한 번으로 토글되는데
+/// 아무 피드백이 없으면 지금 어느 쪽인지 알 길이 없다. 두 모드는 결과가
+/// 구조적으로 다르다 — 덮어쓰기는 파일 길이를 보존하고, 삽입은 뒤를 전부
+/// 밀어 길이를 바꾼다(바이너리에서는 대개 포맷이 깨진다).
 fn hex_status_text(doc: &Document) -> String {
     let len = hex_doc_len(doc);
     let caret = doc.hex.as_ref().map(|h| h.caret.0).unwrap_or(0);
-    format!("Binary — {len} bytes | 0x{caret:X} ({caret})")
+    let mode = if doc.hex.as_ref().is_some_and(|h| h.insert_mode) { "INS" } else { "OVR" };
+    format!("Binary — {len} bytes | 0x{caret:X} ({caret}) | {mode}")
 }
 
 /// 헥스 본문의 키 입력 한 건. 클릭(`HexClick`)과 같은 이유로 인텐트로
@@ -8308,6 +8388,9 @@ fn apply_hex_intent(doc: &mut Document, clipboard: &mut String, intent: HexInten
                 let cap = e.bytes.len() as u64;
                 h.caret = (p.min(cap), true);
                 h.sel = None;
+                // 되돌리기/다시하기도 삽입/삭제를 되감으므로 그 뒤 바이트가
+                // 통째로 밀린다 — 편집과 같은 이유로 매치를 버린다(C2).
+                h.last_match = None;
             }
         }
         HexIntent::Nibble(_)
@@ -8334,6 +8417,20 @@ fn apply_hex_intent(doc: &mut Document, clipboard: &mut String, intent: HexInten
             let Some(h) = doc.hex.as_mut() else { return };
             let insert_mode = h.insert_mode;
             let sel = hex_selection_range(h);
+
+            // **빈 입력은 선택을 지우기 전에 걸러낸다(I5).** 예전에는 선택
+            // 삭제가 먼저였고 `if b.is_empty() { return; }`가 그 뒤에 있어서,
+            // 클립보드가 빈 채로 Ctrl+V를 누르면 선택된 바이트가 사라지고
+            // (`h.sel`도 지워진 채) 캐럿 대입(`h.caret = caret`)마저 건너뛰어
+            // 캐럿이 낡은 자리에 남았다. 빈 입력은 완전한 no-op이어야 한다.
+            let empty_input = match &intent {
+                HexIntent::Ascii(s) => s.is_empty(),
+                HexIntent::Paste(_) => paste_bytes.as_ref().is_none_or(|b| b.is_empty()),
+                _ => false,
+            };
+            if empty_input {
+                return;
+            }
             let Some(e) = h.edit.as_mut() else { return };
 
             // 선택이 있으면 어느 편집이든 먼저 지우고 그 자리에서 시작한다
@@ -8362,10 +8459,8 @@ fn apply_hex_intent(doc: &mut Document, clipboard: &mut String, intent: HexInten
                     }
                 }
                 HexIntent::Ascii(s) => {
+                    // 빈 문자열은 위(`empty_input`)에서 이미 걸러졌다.
                     let b = s.as_bytes();
-                    if b.is_empty() {
-                        return;
-                    }
                     if insert_mode {
                         e.insert(caret.0, b);
                     } else {
@@ -8374,10 +8469,8 @@ fn apply_hex_intent(doc: &mut Document, clipboard: &mut String, intent: HexInten
                     caret = (caret.0 + b.len() as u64, true);
                 }
                 HexIntent::Paste(_) => {
+                    // 빈 바이트열은 위(`empty_input`)에서 이미 걸러졌다.
                     let b = paste_bytes.unwrap_or_default();
-                    if b.is_empty() {
-                        return;
-                    }
                     // 붙여넣기는 관행상 **삽입**이다(스펙).
                     e.insert(caret.0, &b);
                     caret = (caret.0 + b.len() as u64, true);
@@ -8405,6 +8498,15 @@ fn apply_hex_intent(doc: &mut Document, clipboard: &mut String, intent: HexInten
                 _ => unreachable!("이 갈래는 편집 인텐트만 온다"),
             }
             h.caret = caret;
+            // **편집은 매치를 무효로 만든다(C2).** 삽입/삭제는 편집 지점
+            // 뒤의 모든 바이트를 밀어 `(offset, len)`이 가리키던 자리가
+            // 검색한 바이트열과 무관해진다 — 그대로 두면 `hex_byte_bg`가
+            // 검색한 적 없는 바이트를 하이라이트하고, 다음 `hex_find_next`가
+            // 무의미한 위치에서 `from`을 잡아 매치를 건너뛴다. 덮어쓰기도
+            // 매치 안의 바이트를 바꿔 놓을 수 있으므로 함께 버린다.
+            // 텍스트 쪽이 편집 지점마다 `doc.last_match = None`을 두는 것과
+            // 같은 규율이다.
+            h.last_match = None;
         }
         // 위 이동 분기에서 이미 처리하고 반환했다.
         HexIntent::Move { .. }
@@ -8489,9 +8591,22 @@ fn collect_hex_intents(
 }
 
 /// 512MB 초과 파일의 메모리 로드 확인. "Load"면 그 자리에서 로드한다.
+///
+/// **활성 문서를 읽어도 되는 이유(I4).** 이 다이얼로그가 떠 있는 동안은
+/// `tab_bar_locked`가 참이라(활성 문서의 `confirm_load`를 조건에 넣었다)
+/// 탭 전환·닫기·드롭이 전부 막힌다. 즉 플래그를 세운 문서가 곧 활성 문서로
+/// 고정되므로, 크기 문구도 Load/Cancel의 대상도 `app.doc()`으로 읽는 것이
+/// 맞다. 이 잠금이 사라지면 크기가 다른 파일의 것으로 바뀌고 Load가 엉뚱한
+/// 문서를 메모리에 올린다 — 잠금과 이 함수는 한 묶음이다.
+///
+/// 창 X(`.open()`)와 Escape는 Cancel과 같다 — 형제 다이얼로그가 전부 갖고
+/// 있는 탈출구다. 이게 없으면 플래그가 켜진 채 잠금이 영영 풀리지 않는다.
 fn render_confirm_hex_load_dialog(ctx: &egui::Context, app: &mut App) {
     let len = app.doc().map_or(0, |d| d.source.len());
+    let mut open = true;
+    let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
     egui::Window::new("Load Entire File?")
+        .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .show(ctx, |ui| {
@@ -8510,12 +8625,15 @@ fn render_confirm_hex_load_dialog(ctx: &egui::Context, app: &mut App) {
                     }
                 }
                 if ui.button("Cancel").clicked() {
-                    if let Some(h) = app.doc_mut().and_then(|d| d.hex.as_mut()) {
-                        h.confirm_load = false;
-                    }
+                    cancel = true;
                 }
             });
         });
+    if cancel || !open {
+        if let Some(h) = app.doc_mut().and_then(|d| d.hex.as_mut()) {
+            h.confirm_load = false;
+        }
+    }
 }
 
 /// 이번 프레임의 입력 이벤트에서 텍스트 편집 인텐트를 뽑는다.
@@ -8963,6 +9081,55 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
+    /// **보류 중인 열기 방식 선택을 덮어쓰지 않는다(C1 회귀).**
+    /// .gpkg 셋을 한 번에 드롭하면 예전에는 `open_path`가 매번
+    /// `pending_binary_open`을 무조건 대입해, 앞의 둘이 소리 없이 사라지고
+    /// 마지막 하나만 다이얼로그를 띄웠다. 사용자가 이미 인코딩을 고른 뒤에
+    /// File▸Open…을 또 써도 그 선택이 초기화됐다.
+    ///
+    /// 그리고 그 다이얼로그가 떠 있는 동안은 `tab_bar_locked`가 참이라
+    /// 드롭 자체가 막힌다 — 두 겹의 방어 모두를 고정한다.
+    #[test]
+    fn open_path_refuses_while_binary_dialog_pending() {
+        let p1 = temp_ext(b"SQLite format 3\x00\x10\x00\x01", "gpkg");
+        let p2 = temp_ext(b"\x00\x01\x02\x03\x00\x00\x00\x00", "gpkg");
+        let p3 = temp(b"a,b\n1,2\n"); // 텍스트도 마찬가지로 막힌다.
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+
+        app.open_path(&p1, &ctx);
+        // 사용자가 인코딩을 골라 둔 상태를 흉내낸다.
+        app.pending_binary_open.as_mut().unwrap().enc = Encoding::Utf16Le;
+
+        app.open_path(&p2, &ctx);
+        let pending = app.pending_binary_open.as_ref().expect("보류가 남아 있어야 한다");
+        assert_eq!(pending.path, p1, "첫 파일의 보류를 덮어쓰면 안 된다");
+        assert_eq!(pending.enc, Encoding::Utf16Le, "고른 인코딩도 유지돼야 한다");
+        assert_eq!(app.error.as_deref(), Some(BINARY_OPEN_PENDING_STATUS));
+
+        // 텍스트 파일도 탭을 만들지 못한다(활성 탭이 바뀌면 다이얼로그가
+        // 엉뚱한 문서를 겨눈다).
+        app.open_path(&p3, &ctx);
+        assert_eq!(app.docs.len(), 0, "다이얼로그가 떠 있는 동안은 탭이 늘지 않는다");
+
+        // 잠금이 드롭 경로도 막는다.
+        assert!(tab_bar_locked_for(&app), "열기 방식 선택 중에는 탭 바가 잠긴다");
+        assert!(matches!(
+            plan_dropped_files(vec![p3.clone()], tab_bar_locked_for(&app)),
+            DropPlan::Locked(_)
+        ));
+
+        // 다이얼로그를 닫으면 다시 열린다.
+        app.pending_binary_open = None;
+        assert!(!tab_bar_locked_for(&app));
+        app.open_path(&p3, &ctx);
+        assert_eq!(app.docs.len(), 1);
+
+        for p in [&p1, &p2, &p3] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
     /// 다이얼로그에서 "헥스로 열기"를 고르면 헥스 문서가 생긴다.
     #[test]
     fn open_path_hex_creates_hex_document() {
@@ -9062,7 +9229,7 @@ mod tests {
         };
         let p = temp(b"a,b\n1,2\n");
         let ctx = egui::Context::default();
-        let locked = tab_bar_locked(&app.pending_action, app.show_save_dialog);
+        let locked = tab_bar_locked_for(&app);
         match plan_dropped_files(vec![p], locked) {
             DropPlan::Locked(msg) => app.error = Some(msg),
             DropPlan::Open(paths) => {
@@ -9266,12 +9433,12 @@ mod tests {
         // 클릭이 want_close를 만들어내지 못한다(= 탭 바 UI가 비활성 상태라
         // 클릭이 애초에 등록되지 않는 것과 같다).
         assert!(
-            tab_bar_locked(&app.pending_action, app.show_save_dialog),
+            tab_bar_locked_for(&app),
             "확인 대기 중에는 탭 바가 잠겨야 다른 탭 클릭이 무시된다"
         );
         // 잠겨 있으므로 tab 0 클릭 인텐트를 적용하지 않는다(가드 자체를 검증).
         // 혹시라도 아래 처럼 클릭이 새어 들어왔다면 즉시 닫히지 않아야 한다.
-        if !tab_bar_locked(&app.pending_action, app.show_save_dialog) {
+        if !tab_bar_locked_for(&app) {
             app.close_tab(0);
         }
         assert_eq!(app.docs.len(), 4, "잠긴 동안에는 어떤 탭도 닫히지 않는다");
@@ -9306,12 +9473,20 @@ mod tests {
     fn tab_switch_blocked_while_save_dialog_open() {
         let pending: Option<PendingAction> = None;
         assert!(
-            !tab_bar_locked(&pending, false),
+            !tab_bar_locked(&pending, false, false, false),
             "평상시에는 탭 바가 잠기지 않아야 한다"
         );
         assert!(
-            tab_bar_locked(&pending, true),
+            tab_bar_locked(&pending, true, false, false),
             "저장 다이얼로그가 떠 있으면 탭 바가 잠겨야 한다"
+        );
+        assert!(
+            tab_bar_locked(&pending, false, true, false),
+            "열기 방식 선택이 보류 중이면 탭 바가 잠겨야 한다(C1)"
+        );
+        assert!(
+            tab_bar_locked(&pending, false, false, true),
+            "대형 바이너리 로드 확인 중이면 탭 바가 잠겨야 한다(I4)"
         );
     }
 
@@ -13714,15 +13889,15 @@ mod tests {
     /// 찾기 창이 열려 있어도(`show_find = true`) 탭 바를 잠그면 안 된다 —
     /// 찾기는 저장/확인 다이얼로그와 달리 탭 전환을 막을 이유가 없다(찾기
     /// 상태는 Document별이라 탭을 바꾸면 자연히 그 탭의 상태를 본다).
-    /// `tab_bar_locked`는 `pending_action`/`show_save_dialog`만 보고
-    /// `show_find`를 아예 인자로 받지 않으므로, 이 테스트는 그 시그니처
-    /// 자체가 계약을 지킨다는 것을 실제로 호출해 고정한다.
+    /// `tab_bar_locked`는 다이얼로그 넷(`pending_action`/저장/열기 방식/
+    /// 헥스 로드 확인)만 보고 `show_find`를 아예 인자로 받지 않으므로, 이
+    /// 테스트는 그 시그니처 자체가 계약을 지킨다는 것을 실제로 호출해 고정한다.
     #[test]
     fn find_dialog_open_does_not_lock_tab_bar() {
         let mut app = find_test_doc(&["hit"]);
         app.doc_mut().unwrap().show_find = true;
         assert!(
-            !tab_bar_locked(&app.pending_action, app.show_save_dialog),
+            !tab_bar_locked_for(&app),
             "찾기 창이 떠 있어도 탭 바는 잠기지 않아야 한다"
         );
     }
@@ -15157,6 +15332,62 @@ mod tests {
         assert!(h.edit.is_none(), "승격이 막혔으므로 버퍼가 없다");
         assert!(h.confirm_load, "확인 창이 떴다");
         assert_eq!(h.caret, (0, true), "캐럿도 움직이지 않는다");
+    }
+
+    /// **로드 확인 창은 탭 바를 잠그고, 빠져나갈 길이 있어야 한다(I4).**
+    ///
+    /// 잠그지 않으면 창이 떠 있는 동안 탭을 바꿀 수 있고, 그러면 (a) 크기
+    /// 문구가 다른 파일의 것으로 바뀌고 (b) "Load"가 엉뚱한 문서를 메모리에
+    /// 올리며 (c) 원래 탭의 `confirm_load`는 영영 `true`로 남는다.
+    /// 그리고 Escape/창 X로 닫을 수 있어야 그 플래그가 풀린다 — 형제
+    /// 다이얼로그가 전부 갖고 있는 탈출구다(Minor 9).
+    #[test]
+    fn hex_confirm_load_dialog_locks_tabs_and_escapes() {
+        let mut app = hex_test_doc(&[1, 2, 3]);
+        assert!(!tab_bar_locked_for(&app), "사전 조건: 잠겨 있지 않다");
+
+        app.doc_mut().unwrap().hex.as_mut().unwrap().edit_limit = 1;
+        let mut clip = String::new();
+        apply_hex_intent(app.doc_mut().unwrap(), &mut clip, HexIntent::Nibble(0xF));
+        assert!(
+            app.doc().unwrap().hex.as_ref().unwrap().confirm_load,
+            "사전 조건: 확인 창이 떴다"
+        );
+        assert!(
+            tab_bar_locked_for(&app),
+            "확인 창이 떠 있는 동안은 탭 전환/드롭이 막혀야 한다"
+        );
+        // 그래서 드롭도 거절된다 — 크기 문구/Load 대상이 활성 문서를 읽어도
+        // 안전하다는 근거가 이 잠금이다.
+        let p = temp(b"a,b\n1,2\n");
+        assert!(matches!(
+            plan_dropped_files(vec![p.clone()], tab_bar_locked_for(&app)),
+            DropPlan::Locked(_)
+        ));
+        std::fs::remove_file(&p).ok();
+
+        // Escape로 닫으면 플래그가 풀리고 잠금도 풀린다.
+        let ctx = egui::Context::default();
+        let esc = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(esc, |ctx| render_confirm_hex_load_dialog(ctx, &mut app));
+        assert!(
+            !app.doc().unwrap().hex.as_ref().unwrap().confirm_load,
+            "Escape가 확인 창을 닫아야 한다(플래그가 영영 켜진 채 남으면 안 된다)"
+        );
+        assert!(!tab_bar_locked_for(&app), "닫혔으니 잠금도 풀린다");
+        assert!(
+            app.doc().unwrap().hex.as_ref().unwrap().edit.is_none(),
+            "Escape는 Cancel과 같다 — 로드하지 않는다"
+        );
     }
 
     /// 이동: 방향키 좌우는 1바이트, 상하는 32바이트, 경계 클램프.
@@ -16741,13 +16972,27 @@ mod tests {
         assert!(!took);
     }
 
-    /// 상태줄 문구: 헥스 문서는 인덱싱 표시 대신 크기/오프셋.
+    /// 상태줄 문구: 헥스 문서는 인덱싱 표시 대신 크기/오프셋, 그리고
+    /// 삽입/덮어쓰기 모드(M7). 형식은
+    /// `"Binary — {len} bytes | 0x{caret:X} ({caret}) | {INS|OVR}"`.
+    /// 모드 표시가 없으면 Insert 키 토글에 아무 피드백이 없다.
     #[test]
     fn hex_status_line_reads_size_and_caret() {
         let mut app = hex_test_doc(&[0u8; 100]);
         app.doc_mut().unwrap().hex.as_mut().unwrap().caret = (0x1A, true);
-        let doc = app.doc().unwrap();
-        assert_eq!(hex_status_text(doc), "Binary — 100 bytes | 0x1A (26)");
+        assert_eq!(
+            hex_status_text(app.doc().unwrap()),
+            "Binary — 100 bytes | 0x1A (26) | OVR",
+            "기본은 덮어쓰기"
+        );
+        // Insert 키(= ToggleInsert 인텐트)를 누르면 문구가 INS로 바뀐다.
+        let mut clip = String::new();
+        apply_hex_intent(app.doc_mut().unwrap(), &mut clip, HexIntent::ToggleInsert);
+        assert_eq!(
+            hex_status_text(app.doc().unwrap()),
+            "Binary — 100 bytes | 0x1A (26) | INS",
+            "삽입 모드 토글이 상태줄에 드러나야 한다"
+        );
     }
 
     /// 상태줄의 dirty 표시 조건은 `doc_dirty` — 헥스 편집이 dirty면 켜진다.
@@ -16761,7 +17006,7 @@ mod tests {
         apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0xF));
         assert!(doc_dirty(doc), "편집하면 상태줄에 ● Modified가 붙는다");
         // 크기 문구도 편집 버퍼를 진실로 삼는다.
-        assert_eq!(hex_status_text(doc), "Binary — 2 bytes | 0x0 (0)");
+        assert_eq!(hex_status_text(doc), "Binary — 2 bytes | 0x0 (0) | OVR");
     }
 
     /// 메뉴의 "Undo" 항목은 헥스 문서에서 헥스 undo 경로로 간다 —
@@ -16891,6 +17136,125 @@ mod tests {
         assert_eq!(doc.find_status, "Invalid pattern");
     }
 
+    /// **편집은 `last_match`를 무효로 만든다(C2 회귀).** 삽입은 편집 지점
+    /// 뒤의 모든 바이트를 밀어 `(offset, len)`이 가리키던 자리가 검색한
+    /// 바이트열과 무관해진다. 그대로 남으면 (1) `hex_byte_bg`가 검색한 적
+    /// 없는 바이트를 매치 색으로 칠하고 (2) 다음 `hex_find_next`가
+    /// `last_match.0 + 1`을 시작점으로 삼아 실제 매치를 건너뛴다.
+    #[test]
+    fn hex_edit_clears_last_match() {
+        let mut app = hex_test_doc(&[0x4F, 0x4B, 0x00, 0x00]);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "4F 4B".into();
+        hex_find_next(doc);
+        assert_eq!(
+            doc.hex.as_ref().unwrap().last_match,
+            Some((0, 2)),
+            "사전 조건: 매치가 잡혀 있다"
+        );
+
+        let mut clip = String::new();
+        // 문서 맨 앞에 한 바이트 삽입 — 매치가 있던 0..2가 1..3으로 밀린다.
+        doc.hex.as_mut().unwrap().insert_mode = true;
+        doc.hex.as_mut().unwrap().caret = (0, true);
+        apply_hex_intent(doc, &mut clip, HexIntent::Ascii("Z".into()));
+        assert_eq!(
+            doc.hex.as_ref().unwrap().last_match,
+            None,
+            "삽입 편집 뒤에 낡은 매치가 남으면 안 된다"
+        );
+
+        // 니블/삭제/붙여넣기/Backspace/Undo도 같은 규율을 지킨다.
+        for intent in [
+            HexIntent::Nibble(0xA),
+            HexIntent::DeleteForward,
+            HexIntent::Backspace,
+            HexIntent::Paste("FF".into()),
+            HexIntent::Undo,
+            HexIntent::Redo,
+        ] {
+            doc.hex.as_mut().unwrap().caret = (1, true);
+            doc.hex.as_mut().unwrap().last_match = Some((0, 2));
+            apply_hex_intent(doc, &mut clip, intent.clone());
+            assert_eq!(
+                doc.hex.as_ref().unwrap().last_match,
+                None,
+                "{intent:?} 뒤에도 매치를 버려야 한다"
+            );
+        }
+    }
+
+    /// **빈 붙여넣기는 완전한 no-op이어야 한다(I5 회귀).** 예전에는 선택
+    /// 삭제가 빈 판정보다 먼저라, 선택해 둔 상태에서 빈 클립보드로 Ctrl+V를
+    /// 누르면 바이트가 사라지고(되돌릴 수 없는 바이너리 손상) 선택도 지워진
+    /// 채 캐럿 대입마저 건너뛰어 캐럿이 낡은 자리에 남았다.
+    #[test]
+    fn hex_empty_paste_over_selection_is_noop() {
+        let mut app = hex_test_doc(&[0x11, 0x22, 0x33, 0x44]);
+        let doc = app.doc_mut().unwrap();
+        // 편집 버퍼를 미리 만들어 둔다(이 테스트는 승격 경로가 아니라
+        // 빈 입력의 no-op 성질을 본다).
+        doc.hex.as_mut().unwrap().edit =
+            Some(crate::hex::HexEditBuffer::new(vec![0x11, 0x22, 0x33, 0x44]));
+        doc.hex.as_mut().unwrap().sel = Some((1, 3));
+        doc.hex.as_mut().unwrap().caret = (3, true);
+        let mut clip = String::new();
+
+        apply_hex_intent(doc, &mut clip, HexIntent::Paste(String::new()));
+        let h = doc.hex.as_ref().unwrap();
+        assert_eq!(
+            h.edit.as_ref().unwrap().bytes,
+            vec![0x11, 0x22, 0x33, 0x44],
+            "빈 붙여넣기가 선택 바이트를 지우면 안 된다"
+        );
+        assert_eq!(h.sel, Some((1, 3)), "선택도 그대로여야 한다");
+        assert_eq!(h.caret, (3, true), "캐럿도 그대로여야 한다");
+        assert!(
+            !h.edit.as_ref().unwrap().dirty,
+            "아무 일도 없었으므로 dirty가 아니다"
+        );
+
+        // 문자 패널의 빈 입력(`Ascii("")`)도 같은 갈래를 지난다.
+        doc.hex.as_mut().unwrap().pane = crate::hex::HexPane::Ascii;
+        apply_hex_intent(doc, &mut clip, HexIntent::Ascii(String::new()));
+        let h = doc.hex.as_ref().unwrap();
+        assert_eq!(h.edit.as_ref().unwrap().bytes, vec![0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(h.sel, Some((1, 3)));
+        assert_eq!(h.caret, (3, true));
+    }
+
+    /// **헥스 문서의 화면 행 수는 바이트 길이에서 나온다(I3 회귀).**
+    /// 헥스 문서는 줄 인덱서를 띄우지 않아 `doc.index.line_count()`가 영영
+    /// 0이다. `doc_screen_row_count`가 그걸 그대로 쓰면 `page_target_row`가
+    /// `total == 0`으로 보고 `None`을 돌려, Page Up/Down이 캐럿만 옮기고
+    /// 화면은 그대로 서 있는다.
+    #[test]
+    fn hex_screen_row_count_follows_byte_length() {
+        let mut app = hex_test_doc(&[0u8; 100]);
+        let doc = app.doc_mut().unwrap();
+        assert_eq!(doc.index.line_count(), 0, "사전 조건: 줄 인덱서가 없다");
+        assert_eq!(
+            doc_screen_row_count(doc),
+            4,
+            "100바이트 = 32바이트 행 4개(마지막 행은 4바이트)"
+        );
+
+        // 편집 버퍼가 진실이면 그 길이를 따른다.
+        doc.hex.as_mut().unwrap().edit = Some(crate::hex::HexEditBuffer::new(vec![0u8; 64]));
+        assert_eq!(doc_screen_row_count(doc), 2, "편집 버퍼 64바이트 = 2행");
+
+        // 그래서 Page Down이 실제 스크롤 요청을 만든다.
+        doc.hex.as_mut().unwrap().edit = Some(crate::hex::HexEditBuffer::new(vec![0u8; 32 * 100]));
+        doc.first_visible_row = 0;
+        doc.visible_rows = 20;
+        apply_page_scroll(doc, PageDir::Down);
+        assert_eq!(
+            doc.pending_scroll_row,
+            Some(19),
+            "헥스에서도 Page Down이 화면을 옮겨야 한다(한 행 겹침)"
+        );
+    }
+
     /// 헥스 문서에서 `render_find_panel`은 헥스 전용 패널을 그리고, 찾기
     /// 입력란에서 Enter를 치면(텍스트 모드와 같은 관용) `FindAction::HexNext`를
     /// 반환한다 — 호출부가 이걸 받아 `hex_find_next`를 부르는 게 계약이다.
@@ -16935,6 +17299,35 @@ mod tests {
             action = render_find_panel(ctx, doc);
         });
         assert_eq!(action, Some(FindAction::HexNext));
+    }
+
+    /// **해석 방식(Hex 체크박스)을 바꾸면 커서를 버린다(Minor 6).**
+    /// `"4F4B"`는 헥스로 두 바이트, 텍스트로 네 글자다 — 기준이 달라졌는데
+    /// `last_match`가 남으면 하이라이트가 거짓이 되고 다음 Find Next가 그
+    /// 무의미한 자리에서 이어 찾는다. 패널은 체크박스가 `changed()`일 때
+    /// 이 함수를 부른다(`render_hex_find_panel`).
+    #[test]
+    fn hex_find_mode_toggle_resets_cursor() {
+        let mut app = hex_test_doc(&[0x4F, 0x4B, 0x00, 0x4F, 0x4B]);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "4F 4B".into();
+        hex_find_next(doc);
+        assert_eq!(
+            doc.hex.as_ref().unwrap().last_match,
+            Some((0, 2)),
+            "사전 조건: 헥스 해석으로 매치가 잡혀 있다"
+        );
+        doc.find_status = "Not found".into();
+
+        // 체크박스 토글이 하는 일.
+        doc.hex.as_mut().unwrap().find_hex = false;
+        reset_hex_find_cursor(doc);
+        assert_eq!(
+            doc.hex.as_ref().unwrap().last_match,
+            None,
+            "기준이 바뀌었으므로 커서를 버린다"
+        );
+        assert!(doc.find_status.is_empty(), "이전 안내도 지운다");
     }
 
     /// IME는 **편집 모드에서만** 캐럿을 따라간다. 뷰 모드에서 켜면 입력할 수
