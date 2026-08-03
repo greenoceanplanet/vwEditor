@@ -8,6 +8,222 @@
 //! "수정분만 반영해 저장"이 가능한 것은 바이트 오프셋이 안정적이기
 //! 때문인데, Parquet에는 그 성질이 없다.
 
+use std::collections::HashSet;
+
+/// 천 단위 쉼표를 넣는다. 셀 값은 인용 규칙을 타므로(`quote_cell`) 쉼표가
+/// 컬럼을 깨지 않는다.
+pub fn group_digits(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// WKB(Well-Known Binary) 한 값의 **요약**. 좌표를 전부 파싱하지 않는다 —
+/// Point만 좌표를 읽고 나머지는 개수만 센다(큰 폴리곤에서 수만 개를 읽을
+/// 이유가 없다).
+///
+/// ```text
+/// 바이트 0    : 엔디안 (0 = big, 1 = little)
+/// 바이트 1..5 : geometry 타입 (u32)
+/// 이후        : 타입별 페이로드
+/// ```
+///
+/// 깨진 입력·짧은 입력·모르는 타입은 **None**이다. 호출부가 `<binary N B>`로
+/// 폴백한다 — 뷰어가 데이터 문제로 죽으면 안 된다.
+///
+/// Z/M 차원(타입 코드에 1000/2000/3000을 더해 표현)은 기본 타입으로 환원한다.
+pub fn wkb_summary(b: &[u8]) -> Option<String> {
+    if b.len() < 5 {
+        return None;
+    }
+    let little = match b[0] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let u32_at = |o: usize| -> Option<u32> {
+        let s: [u8; 4] = b.get(o..o + 4)?.try_into().ok()?;
+        Some(if little {
+            u32::from_le_bytes(s)
+        } else {
+            u32::from_be_bytes(s)
+        })
+    };
+    let f64_at = |o: usize| -> Option<f64> {
+        let s: [u8; 8] = b.get(o..o + 8)?.try_into().ok()?;
+        Some(if little {
+            f64::from_le_bytes(s)
+        } else {
+            f64::from_be_bytes(s)
+        })
+    };
+
+    match u32_at(1)? % 1000 {
+        1 => {
+            let x = f64_at(5)?;
+            let y = f64_at(13)?;
+            Some(format!("POINT({x} {y})"))
+        }
+        2 => Some(format!("LINESTRING({} pts)", group_digits(u32_at(5)? as u64))),
+        3 => {
+            // 링마다 좌표 수가 앞에 붙는다. 좌표는 건너뛰며 개수만 더한다.
+            let nrings = u32_at(5)? as usize;
+            let mut off = 9usize;
+            let mut total = 0u64;
+            for _ in 0..nrings {
+                let n = u32_at(off)? as u64;
+                total += n;
+                // 좌표 하나 = f64 두 개 = 16바이트.
+                //
+                // **버퍼 길이로 검증한다.** checked 연산만으로는 부족하다 —
+                // 64비트에서 `u32::MAX * 16`은 usize를 넘지 않아 산술은
+                // 멀쩡히 성공하고, 파일에 있을 수 없는 좌표 수를 그대로
+                // 보고하게 된다(조작된 값으로 실제 재현). 다음 링의 시작이
+                // 버퍼 안이어야만 계속 간다.
+                off = off
+                    .checked_add(4)?
+                    .checked_add((n as usize).checked_mul(16)?)?;
+                if off > b.len() {
+                    return None;
+                }
+            }
+            Some(format!("POLYGON({} pts)", group_digits(total)))
+        }
+        4 => Some(format!("MULTIPOINT({} pts)", group_digits(u32_at(5)? as u64))),
+        5 => Some(format!(
+            "MULTILINESTRING({} parts)",
+            group_digits(u32_at(5)? as u64)
+        )),
+        6 => Some(format!(
+            "MULTIPOLYGON({} parts)",
+            group_digits(u32_at(5)? as u64)
+        )),
+        7 => Some(format!(
+            "GEOMETRYCOLLECTION({} parts)",
+            group_digits(u32_at(5)? as u64)
+        )),
+        _ => None,
+    }
+}
+
+/// 셀 값에서 개행을 없앤다. **표 렌더링의 전제를 지키는 함수다.**
+///
+/// 텍스트 경로는 `decode_logical_line`이 `trim_end_matches(['\r','\n'])`로
+/// 개행을 제거하므로 한 줄에 개행이 절대 없다. Parquet 문자열 셀에는 들어갈
+/// 수 있고, 그대로 두면 egui가 여러 줄 galley를 만들어 행 높이와 정렬이
+/// 어긋난다.
+///
+/// **손실 변환이다.** 읽기 전용이라 원본은 안전하지만 CSV로 내보내면 개행이
+/// 공백이 된 채 나간다 — 화면과 내보내기 결과를 일치시키는 의도적 선택이다.
+pub fn sanitize_cell(s: &str) -> String {
+    if !s.contains(['\r', '\n']) {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                // CRLF는 공백 하나로 접는다(둘로 만들면 폭이 달라진다).
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push(' ');
+            }
+            '\n' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// CSV 규칙으로 인용한다. `parse::split_fields`(csv_core)가 되돌릴 수 있는
+/// 형태여야 한다 — **이 왕복이 표의 컬럼 정렬을 지탱한다**(`join_row` 참조).
+pub fn quote_cell(s: &str, delim: u8) -> String {
+    let needs = s
+        .bytes()
+        .any(|b| b == delim || b == b'"' || b == b'\r' || b == b'\n');
+    if !needs {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' {
+            out.push('"'); // `""`로 이스케이프
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// 셀들을 한 논리 행 문자열로 잇는다. 표는 이것을 `split_fields`로 되자른다.
+///
+/// **계약**: `split_fields(&join_row(&cells, d), d) == cells`. 이게 깨지면
+/// 표의 모든 컬럼이 어긋난다(테스트 `join_row_round_trips_through_split_fields`).
+pub fn join_row(cells: &[String], delim: u8) -> String {
+    let d = delim as char;
+    let mut out = String::new();
+    for (i, c) in cells.iter().enumerate() {
+        if i > 0 {
+            out.push(d);
+        }
+        out.push_str(&quote_cell(c, delim));
+    }
+    out
+}
+
+/// 바이너리 셀 표시. `ArrayFormatter`는 바이너리를 전체 16진수 덤프로 내므로
+/// (21바이트 WKB가 42자) 셀이 감당하지 못한다. 길이 요약으로 바꾸고,
+/// geometry 컬럼이면 WKB 요약을 시도한다.
+pub fn format_binary_cell(bytes: &[u8], is_geometry: bool) -> String {
+    if is_geometry {
+        if let Some(s) = wkb_summary(bytes) {
+            return s;
+        }
+        // WKB가 깨졌으면 조용히 길이 요약으로 폴백한다.
+    }
+    format!("<binary {} B>", bytes.len())
+}
+
+/// `geo` 키-값 메타데이터에서 **WKB로 인코딩된 geometry 컬럼 이름**을 뽑는다.
+///
+/// GeoParquet은 평범한 Parquet이고 `geo` 키에 JSON이 들어 있다:
+/// `{"version":"1.0.0","primary_column":"geometry",
+///   "columns":{"geometry":{"encoding":"WKB",...}}}`
+///
+/// **JSON을 손으로 파싱하지 않는다.** 이스케이프된 따옴표(`"my\"col"`) 하나만
+/// 잘못 처리해도 멀쩡한 문자열 컬럼을 geometry로 오인해 `<binary>`로 표시한다.
+/// 신뢰 경계에 검증 안 된 파서를 두는 것이 크레이트 몇 개보다 비싸다.
+///
+/// 어떤 이유로든 읽을 수 없으면 **빈 집합**이다(오류가 아니다). geometry 표시는
+/// 부가 기능이라, 그것 때문에 파일을 못 여는 것이 더 나쁘다.
+pub fn geometry_columns(geo_json: Option<&str>) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(j) = geo_json else { return out };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else {
+        return out;
+    };
+    let Some(cols) = v.get("columns").and_then(|c| c.as_object()) else {
+        return out;
+    };
+    for (name, spec) in cols {
+        let enc = spec.get("encoding").and_then(|e| e.as_str()).unwrap_or("");
+        // WKT 등 다른 인코딩은 `wkb_summary`로 읽을 수 없으므로 제외한다.
+        if enc.eq_ignore_ascii_case("WKB") {
+            out.insert(name.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 pub(crate) mod testutil {
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
@@ -77,6 +293,14 @@ pub(crate) mod testutil {
 mod tests {
     use super::testutil::*;
 
+    /// little-endian POINT WKB를 만든다.
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut v = vec![1u8, 1, 0, 0, 0];
+        v.extend_from_slice(&x.to_le_bytes());
+        v.extend_from_slice(&y.to_le_bytes());
+        v
+    }
+
     #[test]
     fn fixture_writes_a_readable_parquet_file() {
         let p = temp_path("fixture");
@@ -85,5 +309,215 @@ mod tests {
         assert!(bytes.starts_with(b"PAR1"), "Parquet 매직으로 시작해야 한다");
         assert!(bytes.ends_with(b"PAR1"), "Parquet은 매직으로 끝나기도 한다");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- WKB 요약 파서 ----
+
+    #[test]
+    fn wkb_point_shows_coordinates() {
+        let b = wkb_point(127.024, 37.512);
+        assert_eq!(
+            super::wkb_summary(&b).as_deref(),
+            Some("POINT(127.024 37.512)")
+        );
+    }
+
+    #[test]
+    fn wkb_big_endian_point_is_read_correctly() {
+        let mut v = vec![0u8, 0, 0, 0, 1];
+        v.extend_from_slice(&1.5f64.to_be_bytes());
+        v.extend_from_slice(&2.5f64.to_be_bytes());
+        assert_eq!(super::wkb_summary(&v).as_deref(), Some("POINT(1.5 2.5)"));
+    }
+
+    #[test]
+    fn wkb_polygon_counts_all_ring_points() {
+        // 링 2개(4점 + 3점) → 7점
+        let mut v = vec![1u8, 3, 0, 0, 0];
+        v.extend_from_slice(&2u32.to_le_bytes());
+        for n in [4u32, 3] {
+            v.extend_from_slice(&n.to_le_bytes());
+            for i in 0..n {
+                v.extend_from_slice(&(i as f64).to_le_bytes());
+                v.extend_from_slice(&(i as f64).to_le_bytes());
+            }
+        }
+        assert_eq!(super::wkb_summary(&v).as_deref(), Some("POLYGON(7 pts)"));
+    }
+
+    #[test]
+    fn wkb_z_dimension_falls_back_to_base_type() {
+        // 1001 = Point Z. 기본 타입(1)으로 환원해 표시한다.
+        let mut v = vec![1u8];
+        v.extend_from_slice(&1001u32.to_le_bytes());
+        v.extend_from_slice(&1.0f64.to_le_bytes());
+        v.extend_from_slice(&2.0f64.to_le_bytes());
+        assert_eq!(super::wkb_summary(&v).as_deref(), Some("POINT(1 2)"));
+    }
+
+    #[test]
+    fn wkb_multipolygon_counts_parts_not_points() {
+        let mut v = vec![1u8, 6, 0, 0, 0];
+        v.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            super::wkb_summary(&v).as_deref(),
+            Some("MULTIPOLYGON(3 parts)")
+        );
+    }
+
+    #[test]
+    fn wkb_rejects_broken_input_instead_of_panicking() {
+        assert_eq!(super::wkb_summary(&[]), None, "빈 입력");
+        assert_eq!(super::wkb_summary(&[1, 1]), None, "너무 짧음");
+        assert_eq!(super::wkb_summary(&[9, 1, 0, 0, 0]), None, "엔디안 코드 이상");
+        assert_eq!(
+            super::wkb_summary(&[1, 99, 0, 0, 0]),
+            None,
+            "타입 코드 범위 밖"
+        );
+        assert_eq!(super::wkb_summary(&[1, 1, 0, 0, 0]), None, "좌표 부족");
+    }
+
+    #[test]
+    fn wkb_polygon_with_absurd_ring_count_does_not_overflow() {
+        // 조작된 좌표 수(u32::MAX)로 오프셋 계산이 넘치면 패닉한다.
+        let mut v = vec![1u8, 3, 0, 0, 0];
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(super::wkb_summary(&v), None, "포화 대신 None");
+    }
+
+    #[test]
+    fn group_digits_inserts_thousand_separators() {
+        assert_eq!(super::group_digits(0), "0");
+        assert_eq!(super::group_digits(999), "999");
+        assert_eq!(super::group_digits(1204), "1,204");
+        assert_eq!(super::group_digits(1_000_000), "1,000,000");
+    }
+
+    // ---- 셀 포맷과 CSV 인용 ----
+
+    #[test]
+    fn sanitize_replaces_newlines_with_space() {
+        // 표 렌더링은 "한 줄에 개행 없음"을 전제한다(decode_logical_line이
+        // trim_end_matches로 보장하는 성질). Parquet 셀에는 들어갈 수 있다.
+        assert_eq!(super::sanitize_cell("a\r\nb"), "a b", "CRLF는 공백 하나");
+        assert_eq!(super::sanitize_cell("a\nb"), "a b");
+        assert_eq!(super::sanitize_cell("a\rb"), "a b");
+        assert_eq!(super::sanitize_cell("깨끗함"), "깨끗함", "개행 없으면 그대로");
+    }
+
+    #[test]
+    fn quote_cell_only_quotes_when_needed() {
+        assert_eq!(super::quote_cell("plain", b','), "plain");
+        assert_eq!(super::quote_cell("a,b", b','), "\"a,b\"");
+        assert_eq!(super::quote_cell("a\"b", b','), "\"a\"\"b\"");
+        // 탭 구분자면 콤마는 인용 대상이 아니다.
+        assert_eq!(super::quote_cell("a,b", b'\t'), "a,b");
+        assert_eq!(super::quote_cell("a\tb", b'\t'), "\"a\tb\"");
+    }
+
+    /// **설계의 핵심 계약**: `join_row`로 만든 줄을 `split_fields`가 원래
+    /// 셀로 되돌린다. 이게 깨지면 표의 모든 컬럼이 어긋난다.
+    #[test]
+    fn join_row_round_trips_through_split_fields() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["a", "b", "c"],
+            vec!["", "b", ""],
+            vec!["a,b", "c"],
+            vec!["a\"b", "c"],
+            vec!["\"quoted\"", "c"],
+            vec!["a,\"b", "c"],
+            vec!["강남역", "서초구"],
+            vec!["a\tb", "c"],
+            vec![" leading", "trailing "],
+            vec!["POLYGON(1,204 pts)", "서초구"],
+            vec!["\"\"\"", "c"],
+        ];
+        for cells in cases {
+            let owned: Vec<String> = cells.iter().map(|s| s.to_string()).collect();
+            let line = super::join_row(&owned, b',');
+            let back = crate::parse::split_fields(&line, b',');
+            assert_eq!(back, owned, "왕복 실패: {owned:?} → {line:?} → {back:?}");
+        }
+    }
+
+    #[test]
+    fn join_row_round_trips_with_tab_delimiter() {
+        let cells = vec!["a,b".to_string(), "c\td".to_string(), "e".to_string()];
+        let line = super::join_row(&cells, b'\t');
+        assert_eq!(crate::parse::split_fields(&line, b'\t'), cells);
+    }
+
+    #[test]
+    fn binary_cell_summarizes_length_when_not_geometry() {
+        assert_eq!(super::format_binary_cell(&[1, 2, 3], false), "<binary 3 B>");
+        assert_eq!(super::format_binary_cell(&[], false), "<binary 0 B>");
+    }
+
+    #[test]
+    fn binary_cell_uses_wkb_summary_for_geometry() {
+        let pt = wkb_point(1.5, 2.5);
+        assert_eq!(super::format_binary_cell(&pt, true), "POINT(1.5 2.5)");
+    }
+
+    #[test]
+    fn binary_cell_falls_back_to_length_when_wkb_is_broken() {
+        // geometry 컬럼이어도 WKB가 깨졌으면 길이 요약으로 돌아간다.
+        assert_eq!(
+            super::format_binary_cell(&[1, 99, 0, 0, 0], true),
+            "<binary 5 B>"
+        );
+    }
+
+    // ---- geo 메타데이터 ----
+
+    #[test]
+    fn geometry_columns_reads_wkb_columns_from_geo_json() {
+        let j = r#"{"version":"1.0.0","primary_column":"geom",
+                    "columns":{"geom":{"encoding":"WKB"}}}"#;
+        let got = super::geometry_columns(Some(j));
+        assert!(got.contains("geom"));
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn geometry_columns_accepts_multiple_columns() {
+        let j = r#"{"columns":{"a":{"encoding":"WKB"},"b":{"encoding":"wkb"}}}"#;
+        let got = super::geometry_columns(Some(j));
+        assert!(got.contains("a"), "대문자 WKB");
+        assert!(got.contains("b"), "소문자 wkb도 받는다");
+    }
+
+    #[test]
+    fn geometry_columns_skips_non_wkb_encodings() {
+        // WKT는 `wkb_summary`로 읽을 수 없으므로 제외한다.
+        let j = r#"{"columns":{"a":{"encoding":"WKT"},"b":{"encoding":"WKB"}}}"#;
+        let got = super::geometry_columns(Some(j));
+        assert!(!got.contains("a"), "WKT는 제외");
+        assert!(got.contains("b"));
+    }
+
+    #[test]
+    fn geometry_columns_is_empty_without_geo_metadata() {
+        assert!(super::geometry_columns(None).is_empty(), "geo 키 없음");
+    }
+
+    #[test]
+    fn geometry_columns_survives_broken_json() {
+        // 깨진 JSON으로 파일 열기를 실패시키지 않는다 — geometry 표시는
+        // 부가 기능이고, 그것 때문에 파일을 못 여는 것이 더 나쁘다.
+        assert!(super::geometry_columns(Some("{not json")).is_empty());
+        assert!(super::geometry_columns(Some("null")).is_empty());
+        assert!(super::geometry_columns(Some("[]")).is_empty(), "배열");
+        assert!(super::geometry_columns(Some("{}")).is_empty(), "columns 없음");
+        assert!(
+            super::geometry_columns(Some(r#"{"columns":"nope"}"#)).is_empty(),
+            "columns가 객체가 아님"
+        );
+        assert!(
+            super::geometry_columns(Some(r#"{"columns":{"a":5}}"#)).is_empty(),
+            "컬럼 값이 객체가 아님"
+        );
     }
 }
