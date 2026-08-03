@@ -234,6 +234,72 @@ pub fn geometry_columns(geo_json: Option<&str>) -> HashSet<String> {
     out
 }
 
+/// 정렬이 이 바이트를 넘게 쓸 것 같으면 사용자에게 확인을 받는다.
+/// hex 모드의 `HEX_EDIT_CONFIRM_BYTES`와 같은 대역(512MB)이지만 **상수를
+/// 공유하지 않는다** — 용도가 달라 한쪽을 조정할 때 다른 쪽이 따라 움직이면
+/// 안 된다.
+pub const PARQUET_SORT_CONFIRM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 정렬이 쓸 메모리 예상치.
+///
+/// **행 수가 아니라 바이트로 게이트하는 이유가 여기 있다.** 숫자 키는 행당
+/// 12바이트(키 8 + 순열 4)로 고정이지만, 문자열 키는 실제 문자열을 들고 있어야
+/// 해서 데이터에 달렸다 — 행 수만으로는 위험을 예측할 수 없다.
+///
+/// 거대한/조작된 값에서 곱셈이 넘치면 게이트가 작은 수를 보고 통과시키므로
+/// 포화 연산을 쓴다.
+pub fn estimate_sort_bytes(rows: u64, numeric: bool, avg_len: usize) -> u64 {
+    let per_row: u64 = if numeric {
+        12
+    } else {
+        12u64.saturating_add(avg_len as u64)
+    };
+    rows.saturating_mul(per_row)
+}
+
+/// 정렬 키 값들에서 순열을 만든다.
+///
+/// **규약(틀리면 모든 행이 밀린다)**: 돌려주는 값은
+/// `permutation[view_row] = 논리 행번호`이고, 논리 행번호는 **1-based**다
+/// (헤더가 논리 행 0을 차지하므로). 파일 행 `f`의 논리 행번호는 `f + 1`이다.
+/// `app.rs:2759` 주석과 그 테스트가 정한 규약이다.
+///
+/// `numeric`이면 f64로 파싱해 비교하고, **파싱할 수 없는 값은 방향과 무관하게
+/// 뒤로** 보낸다(값 없는 행이 맨 뒤에 모이는 것이 읽기 쉽다).
+/// 같은 키는 원래 순서를 지킨다(안정 정렬).
+pub fn sort_permutation(values: &[String], numeric: bool, ascending: bool) -> Vec<u32> {
+    let mut idx: Vec<u32> = (0..values.len() as u32).collect();
+    if numeric {
+        let keys: Vec<Option<f64>> = values.iter().map(|v| v.trim().parse::<f64>().ok()).collect();
+        idx.sort_by(|&a, &b| {
+            match (keys[a as usize], keys[b as usize]) {
+                (Some(x), Some(y)) => {
+                    let ord = x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal);
+                    if ascending {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+    } else {
+        idx.sort_by(|&a, &b| {
+            let ord = values[a as usize].cmp(&values[b as usize]);
+            if ascending {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+    }
+    // 파일 행 → 논리 행(헤더가 0을 차지하므로 +1).
+    idx.into_iter().map(|f| f + 1).collect()
+}
+
 /// 디코드된 row group 하나.
 struct CachedGroup {
     index: usize,
@@ -975,6 +1041,85 @@ mod tests {
         assert!(d.column_is_numeric(0), "id는 int64");
         assert!(!d.column_is_numeric(1), "name은 utf8");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ---- 정렬 ----
+
+    #[test]
+    fn sort_permutation_uses_one_based_logical_rows() {
+        // **규약**: permutation[view_row] = 논리 행번호(1-based, 헤더 포함
+        // 좌표계). 파일 행 f의 논리 행번호는 f+1이다. 여기를 틀리면 모든
+        // 행이 하나씩 밀린다.
+        let vals = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        // 오름차순: a(파일행1) < b(파일행2) < c(파일행0) → 논리행 2, 3, 1
+        assert_eq!(super::sort_permutation(&vals, false, true), vec![2u32, 3, 1]);
+    }
+
+    #[test]
+    fn sort_permutation_descending_reverses() {
+        let vals = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(super::sort_permutation(&vals, false, false), vec![1u32, 3, 2]);
+    }
+
+    #[test]
+    fn sort_permutation_numeric_is_not_lexicographic() {
+        let vals = vec!["10".to_string(), "9".to_string(), "100".to_string()];
+        // 숫자: 9 < 10 < 100 → 파일행 1,0,2 → 논리행 2,1,3
+        assert_eq!(super::sort_permutation(&vals, true, true), vec![2u32, 1, 3]);
+        // 문자열이면 "10" < "100" < "9"
+        assert_eq!(super::sort_permutation(&vals, false, true), vec![1u32, 3, 2]);
+    }
+
+    #[test]
+    fn sort_permutation_puts_unparseable_numbers_last() {
+        let vals = vec!["5".to_string(), "".to_string(), "1".to_string()];
+        // 1(논리3), 5(논리1), 빈값(논리2)
+        assert_eq!(super::sort_permutation(&vals, true, true), vec![3u32, 1, 2]);
+    }
+
+    #[test]
+    fn sort_permutation_keeps_unparseable_last_even_when_descending() {
+        // 방향과 무관하게 뒤 — 값 없는 행이 맨 뒤에 모이는 것이 읽기 쉽다.
+        let vals = vec!["5".to_string(), "".to_string(), "1".to_string()];
+        assert_eq!(super::sort_permutation(&vals, true, false), vec![1u32, 3, 2]);
+    }
+
+    #[test]
+    fn sort_permutation_is_stable_for_equal_keys() {
+        let vals = vec!["a".to_string(), "a".to_string(), "a".to_string()];
+        assert_eq!(super::sort_permutation(&vals, false, true), vec![1u32, 2, 3]);
+    }
+
+    #[test]
+    fn numeric_sort_estimate_is_twelve_bytes_per_row() {
+        assert_eq!(super::estimate_sort_bytes(1000, true, 0), 12_000);
+    }
+
+    #[test]
+    fn string_sort_estimate_includes_average_length() {
+        // 문자열은 가변 길이라 12바이트 모델이 성립하지 않는다.
+        assert_eq!(super::estimate_sort_bytes(1000, false, 20), 32_000);
+    }
+
+    #[test]
+    fn sort_estimate_saturates_instead_of_overflowing() {
+        // 넘치면 게이트가 작은 수를 보고 통과시킨다.
+        assert_eq!(
+            super::estimate_sort_bytes(u64::MAX, false, usize::MAX),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn hundred_million_numeric_rows_exceed_the_confirm_threshold() {
+        let bytes = super::estimate_sort_bytes(100_000_000, true, 0);
+        assert!(bytes > super::PARQUET_SORT_CONFIRM_BYTES, "1.2GB > 512MB");
+    }
+
+    #[test]
+    fn a_small_sort_stays_under_the_threshold() {
+        let bytes = super::estimate_sort_bytes(1_000_000, true, 0);
+        assert!(bytes < super::PARQUET_SORT_CONFIRM_BYTES, "12MB < 512MB");
     }
 
     // ---- 컬럼 프로젝션 ----

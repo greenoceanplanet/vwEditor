@@ -222,6 +222,10 @@ pub struct Document {
     /// 시그니처를 바꾸면 전부 깨지므로 내부 가변성으로 감춘다. 단일 스레드
     /// UI에서만 쓰므로 `RefCell`이면 충분하다.
     pub parquet: Option<std::cell::RefCell<crate::parquet::ParquetDoc>>,
+    /// 메모리를 크게 쓸 것 같아 사용자 확인을 기다리는 Parquet 정렬
+    /// `(컬럼, 방향)`. hex 모드의 `confirm_load`와 같은 방식이다 —
+    /// 확인 전에는 정렬을 시작하지 않는다.
+    pub pending_parquet_sort: Option<(usize, SortDir)>,
 }
 
 /// 확인 없이 바로 수행할 컬럼 연산의 최대 행 수. 이보다 크면 사용자에게 묻는다.
@@ -683,6 +687,7 @@ impl App {
             show_errors_window: false,
             hex: None,
             parquet: None,
+            pending_parquet_sort: None,
         });
 
         // 작은 파일은 곧바로 편집 모드로. 뷰 모드로 열었다가 사용자가 메뉴에서
@@ -3213,6 +3218,16 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
         }
         // ---- 뷰 모드: mmap 바이트 전체 memmem + offset 이진탐색 ----
         None => {
+            // Parquet은 mmap 바이트가 없다 — 구분자로 나뉜 원본 텍스트가
+            // 애초에 존재하지 않는다. 아래 바이트 빠른 경로 셋을 전부 건너뛰고
+            // 행 단위 폴백으로 간다(`logical_line`이 row group을 디코드한다).
+            //
+            // 렌더가 좁혀 둔 컬럼 프로젝션을 **전체로 되돌린다** — 그러지 않으면
+            // 화면 밖 컬럼의 매치를 조용히 놓친다.
+            if doc.parquet.is_some() {
+                widen_parquet_to_all_columns(doc);
+                return scan_rows_scoped(doc, query, opts, delim);
+            }
             if opts.match_case {
                 scan_view_memmem(doc, query, opts, delim)
             } else if let Some(rows) = scan_view_ci_bytes(doc, query, opts, delim) {
@@ -3225,6 +3240,93 @@ fn scan_all_matches(doc: &Document) -> Vec<u32> {
             }
         }
     }
+}
+
+/// 찾기·정렬·내보내기 전에 **전체 컬럼**을 보게 한다.
+///
+/// 렌더는 보이는 컬럼만 디코드하도록 프로젝션을 좁혀 둔다(스크롤 성능).
+/// 그 상태로 전체 스캔을 돌리면 화면 밖 컬럼의 매치를 **조용히 놓친다** —
+/// 오류도 안 나고 "찾기가 동작한다"만 보는 테스트는 통과한다.
+fn widen_parquet_to_all_columns(doc: &Document) {
+    if let Some(pq) = &doc.parquet {
+        pq.borrow_mut().set_visible_columns(None);
+    }
+}
+
+/// Parquet 문서를 한 컬럼으로 정렬한다.
+///
+/// **mmap 바이트 스캔이 불가능하므로 별도 경로다.** `sort.rs`의 빠른 경로는
+/// 구분자로 나뉜 원본 바이트를 전제하는데(15M행 정렬이 빠른 이유) Parquet에는
+/// 그 바이트가 없다. 대신 컬럼 지향의 이점을 쓴다 — **정렬 키 컬럼만** 읽고
+/// 다른 컬럼은 디코드조차 하지 않는다.
+///
+/// 순열이 만들어지면 렌더는 텍스트 경로와 **완전히 동일**해진다
+/// (`render_table`이 이미 `permutation`으로 행을 매핑한다).
+fn sort_parquet_column(doc: &mut Document, col: usize, dir: SortDir) {
+    let Some(pq) = &doc.parquet else { return };
+    let (values, numeric) = {
+        let mut p = pq.borrow_mut();
+        let Ok(v) = p.column_values(col) else { return };
+        // Parquet은 타입이 확정적이라 "숫자로 보이는지" 추론이 필요 없다.
+        (v, p.column_is_numeric(col))
+    };
+    let perm = crate::parquet::sort_permutation(&values, numeric, dir == SortDir::Asc);
+    doc.sort = Some(SortState {
+        permutation: perm,
+        col,
+        kind: if numeric { SortKind::Number } else { SortKind::Text },
+        dir,
+        spec_count: 1,
+    });
+}
+
+/// 정렬을 시작하기 전에 메모리 예상치를 확인한다. 임계 초과면 확인 플래그만
+/// 세우고 **정렬은 시작하지 않는다**(hex의 `confirm_load`와 같은 규율).
+fn request_parquet_sort(doc: &mut Document, col: usize, dir: SortDir) {
+    let Some(pq) = &doc.parquet else { return };
+    let bytes = {
+        let mut p = pq.borrow_mut();
+        let numeric = p.column_is_numeric(col);
+        let rows = p.total_rows();
+        let avg = p.estimated_avg_len(col);
+        crate::parquet::estimate_sort_bytes(rows, numeric, avg)
+    };
+    if bytes > crate::parquet::PARQUET_SORT_CONFIRM_BYTES {
+        doc.pending_parquet_sort = Some((col, dir));
+        return;
+    }
+    sort_parquet_column(doc, col, dir);
+}
+
+/// 내보낼 줄들을 모은다. 정렬이 적용돼 있으면 **화면 순서**를 따른다 —
+/// 보이는 것과 나가는 것이 다르면 혼란스럽다.
+///
+/// 헤더는 정렬과 무관하게 언제나 첫 줄이다(정렬은 데이터 행만 재배치한다).
+fn collect_export_lines(doc: &Document) -> Vec<String> {
+    // 화면 밖 컬럼도 전부 내보낸다.
+    widen_parquet_to_all_columns(doc);
+    let n = doc_line_count(doc);
+    let mut out = Vec::with_capacity(n);
+    if let Some(h) = logical_line(doc, 0) {
+        out.push(h);
+    }
+    match doc.sort.as_ref() {
+        Some(s) => {
+            for &logical in &s.permutation {
+                if let Some(l) = logical_line(doc, logical as usize) {
+                    out.push(l);
+                }
+            }
+        }
+        None => {
+            for i in 1..n {
+                if let Some(l) = logical_line(doc, i) {
+                    out.push(l);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 인코딩이 **단일 바이트 구분자**(delimiter/개행이 1바이트)를 쓰는가.
@@ -3566,7 +3668,12 @@ fn scan_rows_scoped(
     opts: &crate::find::FindOptions,
     delim: Option<u8>,
 ) -> Vec<u32> {
-    let n = doc.index.line_count();
+    // **`doc.index.line_count()`가 아니다.** Parquet 문서는 `LineIndex`가 비어
+    // 있어 0이 되고, 오류 없이 **조용히 0건**을 돌려준다("찾기가 동작한다"만
+    // 보는 테스트는 그대로 통과한다). `doc_line_count`는 편집 버퍼와 Parquet을
+    // 모두 아는 유일한 함수이고, 텍스트 뷰 모드에서는 `index.line_count()`와
+    // 같은 값이라 기존 동작이 바뀌지 않는다.
+    let n = doc_line_count(doc);
     let mut out = Vec::new();
     for i in 0..n {
         let Some(text) = logical_line(doc, i) else { continue };
@@ -4195,6 +4302,7 @@ fn build_extracted_doc(
         show_errors_window: false,
         hex: None,
         parquet: None,
+        pending_parquet_sort: None,
     }
 }
 
@@ -4251,6 +4359,7 @@ fn hex_document(source: Arc<Source>, path: &Path) -> Document {
         show_errors_window: false,
         hex: Some(crate::hex::HexState::new()),
         parquet: None,
+        pending_parquet_sort: None,
     }
 }
 
@@ -4321,6 +4430,7 @@ fn parquet_document(
         show_errors_window: false,
         hex: None,
         parquet: Some(std::cell::RefCell::new(pq)),
+        pending_parquet_sort: None,
     }
 }
 
@@ -6171,7 +6281,11 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
         // 다중 정렬 다이얼로그에서.
         let ci = kind == SortKind::Text;
         let spec = SortSpec { col, kind, dir, ci };
-        if editing {
+        if doc.parquet.is_some() {
+            // Parquet은 mmap 바이트가 없어 `sort::spawn_sort`의 전제가 성립하지
+            // 않는다. 정렬 키 컬럼만 읽는 별도 경로로 보낸다(메모리 확인 포함).
+            request_parquet_sort(doc, col, dir);
+        } else if editing {
             apply_edit_sort(doc, &[spec], delim, data_start);
         } else {
             doc.sort_job = Some(sort::spawn_sort(
@@ -9609,6 +9723,132 @@ mod tests {
         assert_eq!(logical_line(doc, 0).as_deref(), Some("id,name"));
         assert_eq!(logical_line(doc, 1).as_deref(), Some("10,가"));
         assert_eq!(logical_line(doc, 2), None);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn find_all_finds_matches_in_a_parquet_document() {
+        let p = crate::parquet::testutil::temp_path("find");
+        crate::parquet::testutil::write_simple(
+            &p,
+            vec![1, 2, 3],
+            vec![Some("서울"), Some("부산"), Some("서울시청")],
+        );
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.find_query = "서울".to_string();
+        let rows = scan_all_matches(doc);
+        // 논리 행 1(서울)과 3(서울시청). 헤더(0)에는 없다.
+        assert_eq!(rows, vec![1u32, 3], "실제: {rows:?}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn find_widens_projection_so_hidden_columns_still_match() {
+        // 렌더가 좁혀 둔 프로젝션을 되돌리지 않으면 화면 밖 컬럼의 매치를
+        // 조용히 놓친다 — 오류도 안 나는 종류라 반드시 테스트로 막는다.
+        let p = crate::parquet::testutil::temp_path("widen");
+        crate::parquet::testutil::write_simple(&p, vec![42], vec![Some("가")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.parquet
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .set_visible_columns(Some(vec![0]));
+        doc.find_query = "가".to_string();
+        assert_eq!(
+            scan_all_matches(doc),
+            vec![1u32],
+            "안 보이는 컬럼의 매치도 잡아야 한다"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn find_next_works_in_a_parquet_document() {
+        let p = crate::parquet::testutil::temp_path("findnext");
+        crate::parquet::testutil::write_simple(&p, vec![1, 2], vec![Some("가"), Some("나")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        app.doc_mut().unwrap().find_query = "나".to_string();
+        let doc = app.doc().unwrap();
+        let m = search_from(doc, crate::edit::TextPos { line: 0, col: 0 }, true);
+        assert!(m.is_some(), "다음 찾기가 매치를 찾아야 한다");
+        assert_eq!(m.unwrap().line, 2, "논리 행 2");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn sorting_a_parquet_document_reorders_rendered_rows() {
+        let p = crate::parquet::testutil::temp_path("sortdoc");
+        crate::parquet::testutil::write_simple(
+            &p,
+            vec![3, 1, 2],
+            vec![Some("c"), Some("a"), Some("b")],
+        );
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        sort_parquet_column(doc, 1, SortDir::Asc);
+        let perm = &doc.sort.as_ref().expect("정렬 상태가 있어야 한다").permutation;
+        // a(논리2), b(논리3), c(논리1)
+        assert_eq!(perm, &vec![2u32, 3, 1]);
+        // 순열을 통해 읽으면 정렬된 순서다.
+        let first = logical_line(doc, perm[0] as usize).unwrap();
+        assert!(first.ends_with(",a"), "첫 행은 a여야 한다: {first}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_small_parquet_sort_runs_without_confirmation() {
+        let p = crate::parquet::testutil::temp_path("nogate");
+        crate::parquet::testutil::write_simple(&p, vec![2, 1], vec![Some("b"), Some("a")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        request_parquet_sort(doc, 0, SortDir::Asc);
+        assert!(doc.pending_parquet_sort.is_none(), "확인 없이 바로 정렬");
+        assert!(doc.sort.is_some(), "정렬이 적용됐다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn exporting_a_parquet_document_writes_all_rows_as_csv() {
+        let p = crate::parquet::testutil::temp_path("export");
+        crate::parquet::testutil::write_simple(&p, vec![1, 2], vec![Some("가"), Some("a,b")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().unwrap();
+        let lines = collect_export_lines(doc);
+        assert_eq!(lines.len(), 3, "헤더 + 데이터 2행");
+        assert_eq!(lines[0], "id,name");
+        assert_eq!(lines[1], "1,가");
+        assert_eq!(lines[2], "2,\"a,b\"", "구분자가 든 값은 인용된다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn exporting_a_sorted_parquet_document_follows_screen_order() {
+        let p = crate::parquet::testutil::temp_path("expsort");
+        crate::parquet::testutil::write_simple(&p, vec![2, 1], vec![Some("b"), Some("a")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        sort_parquet_column(doc, 0, SortDir::Asc);
+        let lines = collect_export_lines(doc);
+        assert_eq!(lines[0], "id,name", "헤더가 먼저");
+        assert_eq!(lines[1], "1,a", "정렬된 순서");
+        assert_eq!(lines[2], "2,b");
         std::fs::remove_file(&p).ok();
     }
 
