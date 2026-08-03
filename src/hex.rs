@@ -122,6 +122,15 @@ pub struct HexState {
     pub last_match: Option<(u64, usize)>,
     /// 512MB 초과 파일의 편집 진입 확인 대기 중인가.
     pub confirm_load: bool,
+    /// 확인 없이 통째로 메모리에 올릴 수 있는 최대 크기. 프로덕션에서는 언제나
+    /// `HEX_EDIT_CONFIRM_BYTES`(512MB)이고, **테스트만** 이 값을 낮춰 확인 대기
+    /// 경로를 실제 바이트로 밟는다.
+    ///
+    /// 상수가 아니라 문서마다 두는 이유: 512MB짜리 소스를 테스트가 만들 수
+    /// 없어 그 경로 전체가 어떤 테스트에도 닿지 않았고, 게이트를 지우는 변이가
+    /// 아무 테스트도 깨뜨리지 않고 살아남았다(변이 테스트에서 관측). 전역
+    /// 값으로 두면 병렬 테스트끼리 서로의 임계를 흔들므로 문서마다 둔다.
+    pub edit_limit: u64,
 }
 
 impl HexState {
@@ -135,6 +144,7 @@ impl HexState {
             find_hex: true,
             last_match: None,
             confirm_load: false,
+            edit_limit: HEX_EDIT_CONFIRM_BYTES,
         }
     }
 }

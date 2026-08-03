@@ -8185,9 +8185,10 @@ enum HexIntent {
     ClearSelection,
 }
 
-/// 512MB 초과면 확인이 필요하다. (실파일로 테스트할 수 없어 뽑아 둔 순수 가드.)
-fn hex_load_needs_confirm(len: u64) -> bool {
-    len > crate::hex::HEX_EDIT_CONFIRM_BYTES
+/// 임계 초과면 확인이 필요하다. `limit`은 `HexState.edit_limit`에서 온다
+/// (프로덕션은 언제나 512MB, 테스트만 낮춘다 — 그 필드 주석 참조).
+fn hex_load_needs_confirm(len: u64, limit: u64) -> bool {
+    len > limit
 }
 
 /// 정규화된 선택 범위 [lo, hi). 빈 선택은 None — 역방향 선택도 여기서 편다.
@@ -8201,7 +8202,9 @@ fn hex_selection_range(h: &crate::hex::HexState) -> Option<(u64, u64)> {
 /// 크면 `confirm_load`만 세우고 false(그 조작은 버려진다 — 스펙).
 fn ensure_hex_edit(doc: &mut Document) -> bool {
     let len = doc.source.len();
-    let bytes = if doc.hex.as_ref().is_some_and(|h| h.edit.is_none()) && !hex_load_needs_confirm(len)
+    let limit = doc.hex.as_ref().map_or(u64::MAX, |h| h.edit_limit);
+    let bytes = if doc.hex.as_ref().is_some_and(|h| h.edit.is_none())
+        && !hex_load_needs_confirm(len, limit)
     {
         Some(doc.source.as_bytes().to_vec())
     } else {
@@ -15108,13 +15111,52 @@ mod tests {
         );
     }
 
-    /// 512MB 초과는 즉시 승격하지 않고 확인을 세운다.
+    /// 512MB 초과는 즉시 승격하지 않고 확인을 세운다 — 경계 판정.
+    /// (그 판정을 `ensure_hex_edit`이 실제로 쓰는지는 아래 테스트가 본다.)
     #[test]
     fn big_file_requires_confirm_before_load() {
-        // 실제 512MB를 만들 수는 없으므로 ensure_hex_edit의 게이트만 검사한다 —
-        // 소스 길이를 크게 보이게 할 수 없으니 임계 판정을 순수 함수로 뽑는다.
-        assert!(!hex_load_needs_confirm(crate::hex::HEX_EDIT_CONFIRM_BYTES));
-        assert!(hex_load_needs_confirm(crate::hex::HEX_EDIT_CONFIRM_BYTES + 1));
+        let limit = crate::hex::HEX_EDIT_CONFIRM_BYTES;
+        assert!(!hex_load_needs_confirm(limit, limit), "임계와 같으면 확인 불필요");
+        assert!(hex_load_needs_confirm(limit + 1, limit), "임계 초과면 확인");
+    }
+
+    /// **`ensure_hex_edit`이 임계 판정을 실제로 쓰는가.** 위 테스트는 순수
+    /// 함수만 보므로, 승격 경로가 그 판정을 무시하고 무조건 로드하도록
+    /// 바뀌어도 통과한다 — 그러면 512MB 확인 창이 조용히 사라진다(변이
+    /// 테스트에서 살아남은 구멍).
+    ///
+    /// 512MB짜리 소스를 만들 수 없으므로 **그 문서의** 임계를 1바이트로 낮춰
+    /// 세 바이트 문서를 "큰 파일"로 만든다. 임계가 문서마다 있으니 병렬로 도는
+    /// 다른 테스트를 방해하지 않는다.
+    #[test]
+    fn ensure_hex_edit_consults_the_threshold() {
+        // (1) 임계 이하 → 확인 없이 곧바로 승격
+        let mut small = hex_test_doc(&[1, 2, 3]);
+        let doc = small.doc_mut().unwrap();
+        assert!(ensure_hex_edit(doc), "임계 이하는 곧바로 승격");
+        let h = doc.hex.as_ref().unwrap();
+        assert!(h.edit.is_some());
+        assert!(!h.confirm_load, "확인 창을 띄우지 않는다");
+
+        // (2) 임계 초과 → 승격하지 않고 확인만 세운다
+        let mut big = hex_test_doc(&[1, 2, 3]);
+        let doc = big.doc_mut().unwrap();
+        doc.hex.as_mut().unwrap().edit_limit = 1;
+        assert!(!ensure_hex_edit(doc), "임계 초과는 승격을 미룬다");
+        let h = doc.hex.as_ref().unwrap();
+        assert!(h.edit.is_none(), "메모리에 올리지 않는다");
+        assert!(h.confirm_load, "확인 창을 세운다");
+
+        // (3) 확인 대기 중 편집 인텐트는 버려진다(스펙) — 니블이 들어가면 안 된다
+        let mut pending = hex_test_doc(&[0xAA, 0xBB]);
+        let doc = pending.doc_mut().unwrap();
+        doc.hex.as_mut().unwrap().edit_limit = 1;
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0xF));
+        let h = doc.hex.as_ref().unwrap();
+        assert!(h.edit.is_none(), "승격이 막혔으므로 버퍼가 없다");
+        assert!(h.confirm_load, "확인 창이 떴다");
+        assert_eq!(h.caret, (0, true), "캐럿도 움직이지 않는다");
     }
 
     /// 이동: 방향키 좌우는 1바이트, 상하는 32바이트, 경계 클램프.

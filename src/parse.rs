@@ -908,4 +908,36 @@ mod tests {
         assert!(matches!(detect_text(&ok), TextDetection::Text(_)));
         assert!(matches!(detect_text(&bad), TextDetection::Binary));
     }
+
+    /// **부등호 경계 자체를 못박는다.** 위 테스트는 3.8%와 37.5%만 밟아
+    /// `>`를 `>=`로 바꿔도 통과했다(변이 테스트 생존자). 정확히 5%인 입력은
+    /// "5% 초과면 바이너리"라는 규칙상 **텍스트**여야 하므로 그 한 점을 고정한다.
+    ///
+    /// 5%를 정확히 만들기 위해 디코드 결과의 문자 수를 직접 세어 표본을 찾는다 —
+    /// CP949 디코드가 깨진 바이트 쌍을 몇 개의 U+FFFD로 바꾸는지는 encoding_rs의
+    /// 사정이라, 그것을 가정하지 않고 관측한다.
+    #[test]
+    fn detect_text_exact_five_percent_is_text() {
+        let mut found: Option<Vec<u8>> = None;
+        'outer: for bad_pairs in 1..=8usize {
+            for good in 1..=400usize {
+                let mut v = vec![b'a'; good];
+                for _ in 0..bad_pairs {
+                    v.extend_from_slice(&[0xFF, 0xFF]);
+                }
+                let decoded = decode_line(&v, detect_encoding(&v));
+                let total = decoded.chars().count();
+                let bad = decoded.chars().filter(|&c| c == '\u{FFFD}').count();
+                if bad > 0 && bad * 20 == total {
+                    found = Some(v);
+                    break 'outer;
+                }
+            }
+        }
+        let v = found.expect("정확히 5%인 표본을 만들 수 있어야 한다");
+        assert!(
+            matches!(detect_text(&v), TextDetection::Text(_)),
+            "정확히 5%는 '초과'가 아니므로 텍스트다"
+        );
+    }
 }
