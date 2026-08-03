@@ -1,5 +1,3 @@
-#![allow(dead_code)] // 아직 GUI가 소비하지 않는 항목들 — Task 9(마무리)에서 제거하고 재검증한다
-
 //! 헥스 모드의 순수 로직 — 레이아웃 산술, 편집 버퍼, 바이트 검색.
 //! egui 없음. `find.rs`/`edit.rs`/`convert.rs`와 같은 규율이다.
 
@@ -203,6 +201,13 @@ impl HexEditBuffer {
         }
         let removed: Vec<u8> = self.bytes.splice(s..e, std::iter::empty()).collect();
         self.push_op(HexOp::Delete { offset: s as u64, bytes: removed });
+    }
+
+    /// 되돌릴 것이 있는가. 메뉴의 "Undo" 항목 활성 조건이다 — 텍스트 쪽이
+    /// `!e.undo.is_empty()`를 직접 보는 것과 같은 판정이되, 스택은 여기서만
+    /// 만지므로(불변식이 `push_op`/`undo`/`redo`에 갇혀 있다) 접근자로 낸다.
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
     }
 
     /// 되돌리고 캐럿을 둘 오프셋을 준다. 스택이 비면 None.

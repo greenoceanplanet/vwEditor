@@ -1028,7 +1028,11 @@ fn auto_edit_on_open(size: u64) -> bool {
 }
 
 /// 편집 모드로 진입: 파일 전체를 현재 인코딩으로 줄 배열 로드.
-/// (동기 로드 — 큰 파일 백그라운드화는 Task 9에서.)
+///
+/// **동기 로드다.** 자동 진입은 `AUTO_EDIT_MAX_BYTES` 이하로 제한되고
+/// (`auto_edit_on_open`), 수동 진입도 그 대역에서만 체감이 없다. 큰 파일의
+/// 백그라운드 로드는 아직 없다 — 예전 주석이 "Task 9에서"라고 적어 두었으나
+/// 헥스 모드 Task 9의 범위가 아니었다(기능 게이트·상태줄·회귀 방어).
 pub fn enter_edit_mode(doc: &mut Document) {
     if doc.edit.is_some() {
         return;
@@ -1280,10 +1284,17 @@ impl eframe::App for App {
         // "찾기/바꾸기" 메뉴 클릭. 같은 이유로 인텐트만 받아 둔다.
         let mut find_menu_clicked = false;
         // "실행 취소" 항목 활성 조건: 편집 모드 + 되돌릴 게 있음.
-        let can_undo = self
-            .doc()
-            .and_then(|d| d.edit.as_ref())
-            .map_or(false, |e| !e.undo.is_empty());
+        // 헥스 문서는 텍스트 편집 버퍼가 없으므로 헥스 편집 버퍼를 본다 —
+        // 항목 하나가 문서 종류에 따라 각자의 undo 경로로 간다.
+        let can_undo = match self.doc() {
+            Some(d) if d.hex.is_some() => d
+                .hex
+                .as_ref()
+                .and_then(|h| h.edit.as_ref())
+                .is_some_and(|e| e.can_undo()),
+            Some(d) => d.edit.as_ref().is_some_and(|e| !e.undo.is_empty()),
+            None => false,
+        };
 
         // 최상단 메뉴바 (파일 / 편집 / 도구)
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
@@ -1333,7 +1344,14 @@ impl eframe::App for App {
                 ui.menu_button("Edit", |ui| {
                     // 편집 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
                     let has_doc = self.doc().is_some();
-                    ui.add_enabled_ui(has_doc, |ui| {
+                    // "Edit Mode"는 **텍스트** 편집 버퍼 토글이다. 헥스 문서에
+                    // 걸면 바이너리를 인코딩으로 디코드해 줄로 쪼갠 버퍼가
+                    // 생긴다 — 헥스 편집은 첫 타이핑에 저절로 승격되므로
+                    // (`ensure_hex_edit`) 이 토글은 헥스에서 의미가 없고
+                    // 해로울 뿐이다.
+                    let text_edit_toggle =
+                        has_doc && self.doc().is_some_and(text_tools_enabled);
+                    ui.add_enabled_ui(text_edit_toggle, |ui| {
                         // 편집 모드 토글. 켜면 파일 전체를 인메모리 버퍼로 읽고,
                         // 끄면 버퍼를 버린다(dirty면 확인 후).
                         // 편집의 진입점이므로 편집 메뉴 맨 위에 둔다.
@@ -1368,9 +1386,17 @@ impl eframe::App for App {
                     });
                 });
                 ui.menu_button("Tools", |ui| {
-                    // 도구 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
-                    let has_doc = self.doc().is_some();
-                    ui.add_enabled_ui(has_doc, |ui| {
+                    // 도구 메뉴 항목은 파일이 열려 있을 때만, 그리고 **텍스트
+                    // 문서일 때만** 의미가 있다. 정렬·구분자 변환·행/열 번호·
+                    // 오류 행은 전부 "행과 필드"를 전제하는데 헥스 문서에는
+                    // 그 개념이 없다(`text_tools_enabled`).
+                    //
+                    // Convert/Bad Rows는 `table_mode`(구분자가 문자)에도 걸려
+                    // 있어 헥스 문서(`sep: None`)에서는 이미 꺼지지만, 그건
+                    // `hex_document`가 sep을 어떻게 두느냐에 기댄 우연이다.
+                    // 그룹 전체를 명시적으로 잠근다.
+                    let tools_enabled = self.doc().is_some_and(text_tools_enabled);
+                    ui.add_enabled_ui(tools_enabled, |ui| {
                         if ui.button("Sort by Columns…").clicked() {
                             if let Some(doc) = self.doc_mut() {
                                 // 표 모드 + 인덱싱 완료일 때만 실제로 연다.
@@ -1470,6 +1496,17 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 if let Some(doc) = self.doc_mut() {
                     ui.separator();
+                    // 헥스 문서에는 구분자·인코딩·헤더·정렬이 전부 무의미하다
+                    // (`hex_document`가 그 필드들을 불활성 값으로 둔다). 항목마다
+                    // `add_enabled`로 회색 처리하면 "지금은 안 되지만 언젠가는
+                    // 되는 것"처럼 보인다 — 헥스 문서에서는 영영 아니므로 아예
+                    // 그리지 않고 무엇을 보고 있는지만 한 줄로 알린다.
+                    if !text_tools_enabled(doc) {
+                        ui.label(crate::theme::chrome_text("Binary"));
+                        ui.separator();
+                        ui.label(crate::theme::chrome_text(doc.path_label.clone()));
+                        return;
+                    }
                     // 구분자 드롭다운. None(텍스트) + 표준 구분자들 + 직접 입력.
                     let sep_label = match doc.sep {
                         SeparatorMode::None => "None (plain text)".to_owned(),
@@ -1597,6 +1634,25 @@ impl eframe::App for App {
                     }
                 }
                 if let Some(doc) = self.doc_mut() {
+                    // 헥스 문서는 인덱싱 진행을 말하지 않는다. 줄 인덱서를 아예
+                    // 띄우지 않으므로(`hex_document`가 `indexer: None`)
+                    // `LineIndex`가 `Priming`에서 움직이지 않고, 아래 `match`를
+                    // 그대로 태우면 "Indexing… 0%"와 [Stop] 버튼이 영영 남는다
+                    // — 멈출 것도 없는 작업을 멈추라고 권하는 셈이다.
+                    // 대신 크기와 캐럿 오프셋을 알린다.
+                    //
+                    // 오류 행 요약도 건너뛴다(필드 수 검사가 헥스에 없다).
+                    if !text_tools_enabled(doc) {
+                        ui.label(crate::theme::chrome_text(hex_status_text(doc)));
+                        // 변경 표시는 텍스트 쪽과 같은 문구·같은 색이다.
+                        if doc_dirty(doc) {
+                            ui.label(
+                                crate::theme::chrome_text("● Modified")
+                                    .color(egui::Color32::from_rgb(200, 90, 20)),
+                            );
+                        }
+                        return;
+                    }
                     let st = doc.index.status();
                     let done_gb = st.bytes_done as f64 / 1e9;
                     let total_gb = st.total_bytes as f64 / 1e9;
@@ -1751,9 +1807,13 @@ impl eframe::App for App {
         // 때만 데이터 영역 오른쪽에 얇은 세로 거터를 뗀다. **egui는 SidePanel을
         // CentralPanel보다 먼저 등록해야** 남은 영역이 본문에 돌아가므로,
         // CentralPanel 앞에 둔다.
+        // 헥스 문서는 제외한다 — 거터는 `highlight` 스냅샷(행/열 좌표의 매치
+        // 목록)을 행 번호로 그리는데, 헥스 찾기는 그 스냅샷을 만들지 않고
+        // 바이트 오프셋으로 움직인다. 지금은 `highlight`가 늘 None이라 조건이
+        // 저절로 거짓이지만, 그 사실에 기대지 않고 명시한다.
         if self
             .doc()
-            .is_some_and(|d| show_gutter(d.highlight.as_ref()))
+            .is_some_and(|d| d.hex.is_none() && show_gutter(d.highlight.as_ref()))
         {
             if let Some(doc) = self.docs.get_mut(self.active) {
                 render_match_gutter(ctx, doc);
@@ -2003,9 +2063,21 @@ impl eframe::App for App {
 
         // 메뉴에서 고른 되돌리기(단축키를 모르는 사용자용). 메뉴바 클로저 안에서는
         // self를 가변 대여할 수 없어 인텐트만 받아 여기서 적용한다.
+        //
+        // 문서 종류에 따라 되돌리기 경로가 다르다 — 헥스는 본문 Ctrl+Z가 가는
+        // 것과 같은 `HexIntent::Undo`로 보낸다(`undo_once`는 텍스트 편집 버퍼
+        // 전용이라 헥스 문서에서는 조용히 아무 일도 하지 않는다).
         if undo_clicked {
-            if let Some(doc) = self.doc_mut() {
-                undo_once(doc);
+            // `apply_hex_intent`는 클립보드 캐시도 가변으로 받으므로 `doc_mut`과
+            // 동시 대여가 되지 않는다 — 필드를 각각 빌려 쪼갠다(본문 렌더가
+            // `clipboard`를 넘기는 것과 같은 방식).
+            let clipboard = &mut self.clipboard_cache;
+            if let Some(doc) = self.docs.get_mut(self.active) {
+                if doc.hex.is_some() {
+                    apply_hex_intent(doc, clipboard, HexIntent::Undo);
+                } else {
+                    undo_once(doc);
+                }
             }
         }
 
@@ -8044,14 +8116,52 @@ fn doc_dirty(doc: &Document) -> bool {
             .is_some_and(|e| e.dirty)
 }
 
+/// 텍스트/표 전용 도구(Sort, Convert, Numbering, 오류 창)의 활성 조건.
+///
+/// **왜 자유 함수인가.** 이 판정이 쓰이는 자리는 전부 egui 클로저 안(메뉴바)
+/// 이라 테스트가 구동할 수 없다. 판정만 순수 함수로 떼어 두면 "헥스 문서에서
+/// 잠긴다 / 텍스트 문서에서 열린다"를 두 줄로 검증할 수 있다 — 이 저장소가
+/// `ending_glyphs`·`show_gutter` 등에 쓰는 것과 같은 패턴이다.
+///
+/// 헥스 문서는 행·필드·인코딩이라는 개념 자체가 없다. "N번째 컬럼으로 정렬",
+/// "구분자 변환", "행/열 번호", "필드 수가 맞는가"는 물음이 성립하지 않는다.
+fn text_tools_enabled(doc: &Document) -> bool {
+    doc.hex.is_none()
+}
+
+/// 헥스 문서의 상태줄 문구 — 크기와 캐럿 오프셋.
+///
+/// **왜 인덱싱 문구를 대신하는가.** 헥스 문서는 줄 인덱서를 아예 띄우지
+/// 않으므로(`hex_document`가 `indexer: None`) `LineIndex`가 `Priming`에서
+/// 영영 움직이지 않는다. 그대로 두면 상태줄이 "Indexing… 0%"를 무한히
+/// 띄운다 — 진행 중이 아닌데 진행 중이라고 말하는 셈이다.
+///
+/// 크기는 편집 버퍼가 있으면 그쪽이 진실이다(`hex_doc_len`이 그 분기를 안다).
+/// 오프셋은 10진/16진 둘 다 적는다 — 헥스 뷰의 오프셋 컬럼과 맞춰 보려면
+/// 16진이, 크기와 견주려면 10진이 필요하다.
+fn hex_status_text(doc: &Document) -> String {
+    let len = hex_doc_len(doc);
+    let caret = doc.hex.as_ref().map(|h| h.caret.0).unwrap_or(0);
+    format!("Binary — {len} bytes | 0x{caret:X} ({caret})")
+}
+
 /// 헥스 본문의 키 입력 한 건. 클릭(`HexClick`)과 같은 이유로 인텐트로
 /// 모았다가 렌더 클로저 밖에서 적용한다.
 #[derive(Debug, Clone, PartialEq)]
 enum HexIntent {
     /// 상대 이동(바이트 단위). `extend`면 선택을 늘린다.
     Move { delta: i64, extend: bool },
-    /// 절대 이동. 찾기가 매치 오프셋으로 캐럿을 옮길 때 쓴다 —
-    /// 지금은 테스트만 만든다. // Task 7이 소비하면 제거
+    /// 절대 이동(클램프 + 선택 확장 포함). **테스트만 만든다.**
+    ///
+    /// 찾기가 이걸 쓸 것으로 예상했지만 실제 `hex_find_next`는 `last_match`와
+    /// `pending_scroll_row`까지 한 묶음으로 갱신해야 해서 캐럿을 직접 놓는다 —
+    /// 인텐트 한 겹을 거치면 그 셋이 갈라진다.
+    ///
+    /// 그래도 남긴다: 이동 계열 인텐트(Home/End/DocStart/DocEnd)와 편집 계열
+    /// (Backspace/Nibble) 테스트가 "캐럿을 N에 놓고 시작"하는 **설정 수단**으로
+    /// 쓴다. 대안은 `h.caret`을 직접 대입하는 것인데, 그러면 인텐트 경로가
+    /// 적용하는 클램프를 건너뛰어 테스트가 실제와 다른 상태에서 출발한다.
+    /// (임시 표식이 아니다 — 지울 조건이 없다.)
     #[allow(dead_code)]
     MoveTo { offset: u64, extend: bool },
     /// 행 시작/행 마지막 바이트.
@@ -16559,6 +16669,97 @@ mod tests {
         assert!(!doc_dirty(&text_doc));
         text_doc.edit.as_mut().unwrap().dirty = true;
         assert!(doc_dirty(&text_doc), "텍스트 dirty도 그대로 잡힌다");
+    }
+
+    // ---- 헥스 기능 게이트 / 상태줄 ----
+
+    /// 헥스 문서에서 텍스트/표 전용 기능이 잠긴다 — 게이트를 자유 함수로.
+    #[test]
+    fn hex_doc_locks_text_features() {
+        let app = hex_test_doc(&[1, 2, 3]);
+        let doc = app.doc().unwrap();
+        assert!(!text_tools_enabled(doc), "Sort/Convert/Numbering/오류창 비활성");
+        // 텍스트 문서 대조군
+        let app2 = find_test_doc(&["a,b"]);
+        assert!(text_tools_enabled(app2.doc().unwrap()));
+    }
+
+    /// Tab은 헥스 문서에서 본문으로 가지 않는다(포커스 순회 유지).
+    #[test]
+    fn tab_is_not_captured_in_hex_doc() {
+        // `wants_tab_character`는 `&self`만 받는다(브리프 스니펫의 `mut`는 불필요).
+        let app = hex_test_doc(&[1]);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![tab_event(egui::Modifiers::NONE)],
+            ..Default::default()
+        };
+        let mut took = false;
+        let _ = ctx.run(input, |ctx| took = app.wants_tab_character(ctx));
+        assert!(!took);
+    }
+
+    /// 상태줄 문구: 헥스 문서는 인덱싱 표시 대신 크기/오프셋.
+    #[test]
+    fn hex_status_line_reads_size_and_caret() {
+        let mut app = hex_test_doc(&[0u8; 100]);
+        app.doc_mut().unwrap().hex.as_mut().unwrap().caret = (0x1A, true);
+        let doc = app.doc().unwrap();
+        assert_eq!(hex_status_text(doc), "Binary — 100 bytes | 0x1A (26)");
+    }
+
+    /// 상태줄의 dirty 표시 조건은 `doc_dirty` — 헥스 편집이 dirty면 켜진다.
+    /// (문구/색은 텍스트 쪽과 같은 리터럴을 쓰므로 조건만 검증한다.)
+    #[test]
+    fn hex_status_dirty_marker_follows_doc_dirty() {
+        let mut app = hex_test_doc(&[1, 2]);
+        let doc = app.doc_mut().unwrap();
+        assert!(!doc_dirty(doc), "뷰 상태에는 변경 표시가 없다");
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0xF));
+        assert!(doc_dirty(doc), "편집하면 상태줄에 ● Modified가 붙는다");
+        // 크기 문구도 편집 버퍼를 진실로 삼는다.
+        assert_eq!(hex_status_text(doc), "Binary — 2 bytes | 0x0 (0)");
+    }
+
+    /// 메뉴의 "Undo" 항목은 헥스 문서에서 헥스 undo 경로로 간다 —
+    /// 활성 조건(`HexEditBuffer::can_undo`)과 적용(`HexIntent::Undo`) 양쪽.
+    #[test]
+    fn hex_menu_undo_uses_hex_path() {
+        let mut app = hex_test_doc(&[0xAA, 0xBB]);
+        let doc = app.doc_mut().unwrap();
+        // 뷰 상태(편집 버퍼 없음)에서는 되돌릴 것이 없다 → 항목 비활성.
+        assert!(doc
+            .hex
+            .as_ref()
+            .and_then(|h| h.edit.as_ref())
+            .is_none_or(|e| !e.can_undo()));
+        let mut clip = String::new();
+        apply_hex_intent(doc, &mut clip, HexIntent::Nibble(0x1));
+        assert_eq!(
+            doc.hex.as_ref().unwrap().edit.as_ref().unwrap().bytes,
+            vec![0x1A, 0xBB],
+            "사전 조건: 상위 니블이 바뀌었다"
+        );
+        assert!(
+            doc.hex.as_ref().unwrap().edit.as_ref().unwrap().can_undo(),
+            "이제 항목이 활성이다"
+        );
+        // update()의 undo_clicked 분기가 하는 것과 같은 호출.
+        apply_hex_intent(doc, &mut clip, HexIntent::Undo);
+        assert_eq!(
+            doc.hex.as_ref().unwrap().edit.as_ref().unwrap().bytes,
+            vec![0xAA, 0xBB],
+            "메뉴 되돌리기가 헥스 버퍼를 되돌린다"
+        );
+        // 텍스트 전용 `undo_once`는 헥스 문서에서 아무 일도 하지 않아야 한다
+        // (두 경로가 겹쳐 두 번 되돌리는 사고 방지).
+        undo_once(doc);
+        assert_eq!(
+            doc.hex.as_ref().unwrap().edit.as_ref().unwrap().bytes,
+            vec![0xAA, 0xBB],
+            "undo_once는 헥스 문서를 건드리지 않는다"
+        );
     }
 
     // ---- 헥스 찾기 ----
