@@ -11532,16 +11532,22 @@ mod tests {
         assert_ne!(fc, de);
     }
 
-    /// 백그라운드 검사가 끝날 때까지 폴링한다(테스트 전용).
+    /// 백그라운드 검사가 끝날 때까지 기다린 뒤 결과를 문서에 반영한다(테스트 전용).
+    ///
+    /// 예전에는 `poll_error_scan`을 10만 번 돌리는 스핀락이었는데, 그 상한은
+    /// 사실상 **시간** 상한이라 테스트가 병렬로 돌아 CPU가 붐비면 워커가 그 안에
+    /// 스케줄되지 못해 간헐적으로 패닉했다(제품 버그가 아니라 테스트의 문제).
+    /// `join_result`는 OS에 기다림을 맡기므로 부하와 무관하게 정확하고, 대기
+    /// 시간도 스핀보다 짧다.
+    ///
+    /// 편집 모드는 `start_error_scan`이 그 자리에서 동기로 끝내 `error_scan`이
+    /// 아예 없다 — 그 경우 할 일이 없다.
     fn poll_scan_to_completion(doc: &mut Document) {
-        for _ in 0..100_000 {
-            poll_error_scan(doc);
-            if doc.error_scan.is_none() {
-                return;
-            }
-            std::thread::yield_now();
-        }
-        panic!("검사가 끝나지 않았다");
+        let Some(job) = &mut doc.error_scan else {
+            return;
+        };
+        doc.row_errors = job.join_result();
+        doc.error_scan = None;
     }
 
     #[test]

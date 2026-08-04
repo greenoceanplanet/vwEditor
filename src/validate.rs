@@ -296,6 +296,24 @@ impl ScanJob {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+
+    /// 워커가 끝날 때까지 **블로킹으로** 기다린 뒤 결과를 꺼낸다(테스트 전용).
+    ///
+    /// 프로덕션에는 이런 함수가 없어야 한다 — UI 스레드가 여기서 멈추면 그동안
+    /// 화면이 얼어붙는다. 그래서 실제 코드는 매 프레임 `take_result`로 폴링한다.
+    ///
+    /// 반면 테스트에는 "끝났을 때 무엇이 나오는가"만 궁금한 경우가 많고, 그때
+    /// 폴링 루프를 돌리면 **횟수 상한이 곧 시간 상한이 되어** 병렬 실행으로 부하가
+    /// 걸린 순간 워커가 스케줄되지 못해 헛되이 실패한다. 실제로
+    /// `error_status_text_distinguishes_states`가 10만 회 폴링 뒤 패닉하는 형태로
+    /// 간헐 실패했다. `join`은 OS에 기다림을 맡기므로 부하와 무관하게 정확하다.
+    #[cfg(test)]
+    pub fn join_result(&mut self) -> Option<ScanResult> {
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        self.result.lock().unwrap().take()
+    }
 }
 
 /// 스레드를 join하지 않고 버려도 프로세스가 종료될 때까지 코어를 붙들지
