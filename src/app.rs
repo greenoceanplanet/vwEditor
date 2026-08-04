@@ -435,7 +435,7 @@ impl Default for App {
             clipboard_cache: String::new(),
             pending_action: None,
             // eframe이 창을 만들 때 쓴 제목과 같은 값으로 시작한다(main.rs).
-            window_title: "textViewer".to_owned(),
+            window_title: "vwEditor".to_owned(),
             pending_binary_open: None,
             view_scale: 1.0,
         }
@@ -1357,7 +1357,7 @@ impl eframe::App for App {
         // OS DPI 스케일링은 egui가 알아서 처리한다.
         self.apply_ctrl_wheel_zoom(ctx);
 
-        // 창 제목 = "<파일명> — textViewer". 바뀔 때만 보낸다(매 프레임 보내면
+        // 창 제목 = "<파일명> — vwEditor". 바뀔 때만 보낸다(매 프레임 보내면
         // 창 시스템 왕복이 낭비다). "다른 이름으로 저장"으로 path가 바뀌어도
         // 이 비교가 자동으로 잡아낸다.
         let want_title = crate::theme::window_title(self.doc().map(|d| d.path.as_path()));

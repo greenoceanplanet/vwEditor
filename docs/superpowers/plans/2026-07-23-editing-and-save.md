@@ -2845,7 +2845,7 @@ pub fn install_visuals(ctx: &egui::Context) {
 `install_korean_font`를 제거하고 `theme::install_fonts` / `install_text_styles` /
 `install_visuals` 호출로 대체한다. `mod theme;` 추가.
 
-창 제목도 정리: `"textViewer"` → 열린 파일이 있으면 `"<파일명> — textViewer"`
+창 제목도 정리: `"vwEditor"` → 열린 파일이 있으면 `"<파일명> — vwEditor"`
 형태로(상용 에디터 관례). eframe의 `ViewportCommand::Title`로 갱신한다.
 
 - [ ] **Step 7: 빌드 + 전체 테스트**

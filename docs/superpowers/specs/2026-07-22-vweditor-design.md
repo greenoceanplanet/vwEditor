@@ -1,4 +1,4 @@
-# textViewer 설계 문서 (MVP)
+# vwEditor 설계 문서 (MVP)
 
 - 날짜: 2026-07-22
 - 목표: EMEditor처럼 **10GB+ CSV/TSV/텍스트 파일을 여는 순간 즉시** 테이블로 확인하는 빠른 뷰어

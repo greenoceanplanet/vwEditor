@@ -1,4 +1,4 @@
-// textViewer — 대용량 CSV/TSV/텍스트 뷰어
+// vwEditor — 대용량 CSV/TSV/텍스트 뷰어
 // Copyright (C) 2026 vuski
 //
 // This program is free software: you can redistribute it and/or modify
@@ -66,7 +66,7 @@ fn main() -> eframe::Result<()> {
     let initial = std::env::args().nth(1).map(std::path::PathBuf::from);
     let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "textViewer",
+        "vwEditor",
         options,
         Box::new(move |cc| {
             // 폰트/텍스트 스타일/Visuals를 한 번에 설치한다(theme.rs).

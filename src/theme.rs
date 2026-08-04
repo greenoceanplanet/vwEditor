@@ -408,12 +408,12 @@ pub fn chrome_text(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text).text_style(TextStyle::Button)
 }
 
-/// 창 제목. 파일이 열려 있으면 `"<파일명> — textViewer"`, 없으면 `"textViewer"`
+/// 창 제목. 파일이 열려 있으면 `"<파일명> — vwEditor"`, 없으면 `"vwEditor"`
 /// (상용 에디터 관례). 경로 전체가 아니라 파일명만 쓴다 — 제목 표시줄은 짧다.
 pub fn window_title(path: Option<&std::path::Path>) -> String {
     match path.and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
-        Some(name) if !name.is_empty() => format!("{name} — textViewer"),
-        _ => "textViewer".to_owned(),
+        Some(name) if !name.is_empty() => format!("{name} — vwEditor"),
+        _ => "vwEditor".to_owned(),
     }
 }
 
@@ -514,20 +514,20 @@ mod tests {
 
     #[test]
     fn title_without_file_is_app_name() {
-        assert_eq!(window_title(None), "textViewer");
+        assert_eq!(window_title(None), "vwEditor");
     }
 
     #[test]
     fn title_with_file_shows_basename_only() {
         assert_eq!(
             window_title(Some(Path::new(r"C:\data\big.csv"))),
-            "big.csv — textViewer"
+            "big.csv — vwEditor"
         );
     }
 
     /// 디렉터리처럼 파일명이 없는 경로는 앱 이름으로 떨어져야 한다(크래시 없음).
     #[test]
     fn title_with_rootish_path_falls_back() {
-        assert_eq!(window_title(Some(Path::new(r"C:\"))), "textViewer");
+        assert_eq!(window_title(Some(Path::new(r"C:\"))), "vwEditor");
     }
 }

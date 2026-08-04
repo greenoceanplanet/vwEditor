@@ -2571,7 +2571,7 @@ Run: `cargo clippy 2>&1 | grep -c "^warning"`
 Expected: 20 이하
 
 Run: `cargo build --release`
-Expected: 성공 (실행 중인 textviewer.exe가 있으면 닫고 다시 시도)
+Expected: 성공 (실행 중인 vweditor.exe가 있으면 닫고 다시 시도)
 
 - [ ] **Step 4: 실제 파일로 손 검증**
 

@@ -1,4 +1,4 @@
-# textViewer MVP Implementation Plan
+# vwEditor MVP Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 플랫폼: Windows, 단일 `.exe` (`cargo build --release` → `target/release/textviewer.exe`). 설치 불필요.
+- 플랫폼: Windows, 단일 `.exe` (`cargo build --release` → `target/release/vweditor.exe`). 설치 불필요.
 - Rust edition 2021.
 - 파일 크기와 무관하게 메모리 낮게: 파일은 mmap, 상주 인덱스는 `Vec<u64>`(줄당 8바이트)만.
 - 첫 화면 표시 목표 0.5초 이내(1단계는 앞부분만 스캔).
@@ -24,7 +24,7 @@
 ## File Structure
 
 ```
-textViewer/
+vwEditor/
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs        — eframe 진입점, App 실행
@@ -57,7 +57,7 @@ textViewer/
 
 ```toml
 [package]
-name = "textviewer"
+name = "vweditor"
 version = "0.1.0"
 edition = "2021"
 
@@ -81,7 +81,7 @@ lto = true
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "textViewer",
+        "vwEditor",
         options,
         Box::new(|_cc| Ok(Box::new(PlaceholderApp))),
     )
@@ -92,7 +92,7 @@ struct PlaceholderApp;
 impl eframe::App for PlaceholderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("textViewer");
+            ui.label("vwEditor");
         });
     }
 }
@@ -1270,7 +1270,7 @@ mod source;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "textViewer",
+        "vwEditor",
         options,
         Box::new(|_cc| Ok(Box::new(app::App::default()))),
     )
@@ -1531,14 +1531,14 @@ Write-Host "created $path"
 - [ ] **Step 2: 릴리스 빌드**
 
 Run: `cargo build --release`
-Expected: `target/release/textviewer.exe` 생성
+Expected: `target/release/vweditor.exe` 생성
 
 - [ ] **Step 3: 대용량 파일 생성 후 열기 (수동)**
 
 PowerShell:
 ```
 powershell -ExecutionPolicy Bypass -File scripts/make_big_csv.ps1
-.\target\release\textviewer.exe
+.\target\release\vweditor.exe
 ```
 확인 항목:
 - 파일 열기 → big_test.csv 선택 시 **즉시**(0.5초 이내) 앞부분 테이블 표시
