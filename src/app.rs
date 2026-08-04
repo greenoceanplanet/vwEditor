@@ -832,12 +832,23 @@ impl App {
     /// 탭이 하나도 없는 상태가 된다. 그 경우에도 빈 새 파일을 띄운다 — 사용자
     /// 입장에서 "열려던 파일이 없었다"와 "앱이 텅 비었다"는 다른 문제이고,
     /// 에러 메시지는 `self.error`가 이미 전한다.
-    pub fn start(&mut self, initial: Option<&Path>, ctx: &egui::Context) {
+    /// `fonts`는 `theme::install`의 결과다. 한글 폰트를 못 찾았으면 안내를
+    /// 띄운다 — 단, **파일 열기 오류를 덮지 않는다.** 열려던 파일이 없다는
+    /// 사실이 폰트 안내보다 급하고, 폰트 문제는 화면의 두부만 봐도 드러난다.
+    pub fn start(
+        &mut self,
+        initial: Option<&Path>,
+        ctx: &egui::Context,
+        fonts: crate::theme::FontReport,
+    ) {
         if let Some(p) = initial {
             self.open_path(p, ctx);
         }
         if self.docs.is_empty() {
             self.add_document(new_document());
+        }
+        if fonts.korean_missing && self.error.is_none() {
+            self.error = Some(crate::theme::KOREAN_FONT_MISSING_MSG.to_owned());
         }
     }
 
@@ -10873,7 +10884,7 @@ mod tests {
     fn start_without_argument_opens_a_new_file() {
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(None, &ctx);
+        app.start(None, &ctx, Default::default());
         assert_eq!(app.docs.len(), 1, "탭 하나로 시작한다");
         let doc = app.doc().unwrap();
         assert!(doc.edit.is_some(), "바로 타이핑할 수 있어야 한다");
@@ -10887,7 +10898,7 @@ mod tests {
         let p = temp(b"a,b\n1,2\n");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         assert_eq!(app.docs.len(), 1, "빈 새 파일이 덤으로 붙지 않는다");
         assert_eq!(app.doc().unwrap().path, p);
     }
@@ -10899,10 +10910,55 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         let missing = std::path::PathBuf::from("Z:\\없는폴더\\없는파일_tv.csv");
-        app.start(Some(&missing), &ctx);
+        app.start(Some(&missing), &ctx, Default::default());
         assert!(app.error.is_some(), "실패는 실패라고 알린다");
         assert_eq!(app.docs.len(), 1, "그래도 빈 새 파일로 시작한다");
         assert!(app.doc().unwrap().edit.is_some());
+    }
+
+    // ---- 한글 폰트 부재 안내 ----
+    //
+    // 이 상황은 Windows에서 재현되지 않는다(맑은 고딕이 항상 있다). CJK 폰트가
+    // 없는 리눅스에서만 일어나므로, 검증 수단이 이 테스트뿐이다.
+
+    /// 한글 폰트를 못 찾으면 설치 방법을 안내한다 — 화면이 두부로 덮이는데
+    /// 아무 설명이 없으면 사용자는 앱이 깨진 줄 안다.
+    #[test]
+    fn missing_korean_font_is_reported_to_the_user() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let fonts = crate::theme::FontReport {
+            korean_missing: true,
+        };
+        app.start(None, &ctx, fonts);
+        let msg = app.error.as_deref().expect("안내가 있어야 한다");
+        assert_eq!(msg, crate::theme::KOREAN_FONT_MISSING_MSG);
+        assert_eq!(app.docs.len(), 1, "안내와 무관하게 앱은 정상 동작한다");
+    }
+
+    /// 폰트가 정상이면 아무 말도 하지 않는다. Windows/맥의 보통 경로가
+    /// 조용해야 이 안내가 신호로 남는다.
+    #[test]
+    fn present_korean_font_says_nothing() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.start(None, &ctx, crate::theme::FontReport::default());
+        assert!(app.error.is_none(), "정상 경로는 조용하다: {:?}", app.error);
+    }
+
+    /// 파일 열기 오류가 폰트 안내에 덮이지 않는다. 열려던 파일이 없다는 사실이
+    /// 더 급하고, 폰트 문제는 화면만 봐도 드러난다.
+    #[test]
+    fn open_error_outranks_the_font_notice() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let missing = std::path::PathBuf::from("Z:\\없는폴더\\없는파일_tv.csv");
+        let fonts = crate::theme::FontReport {
+            korean_missing: true,
+        };
+        app.start(Some(&missing), &ctx, fonts);
+        let msg = app.error.as_deref().expect("에러가 있어야 한다");
+        assert!(msg.contains("Failed to open file"), "열기 오류가 남는다: {msg}");
     }
 
     // ---- 작은 파일 자동 편집 모드 ----
@@ -17838,7 +17894,7 @@ mod tests {
         let p = temp_ext(b"aaa\r\nbbb\nccc", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
         view_doc(doc);
@@ -17859,7 +17915,7 @@ mod tests {
         let p = temp_ext(b"only\r\n", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
         view_doc(doc);
@@ -17874,7 +17930,7 @@ mod tests {
         let p = temp_ext(b"aaa\r\nbbb\r\nccc\r\n", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         let doc = app.doc_mut().unwrap();
         assert!(doc.edit.is_some(), "전제: 작은 파일이라 편집 모드");
         assert_eq!(
@@ -17892,7 +17948,7 @@ mod tests {
         let p = temp_ext(b"aaa\nbbb\n", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         let doc = app.doc().unwrap();
         assert_eq!(line_ending_for_row(doc, 0), parse::LineEnding::Lf);
         std::fs::remove_file(&p).ok();
@@ -17905,7 +17961,7 @@ mod tests {
         let p = temp_ext(b"aaa\nbbb\n", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         let doc = app.doc().unwrap();
         let n = doc.edit.as_ref().unwrap().lines.len();
         assert_eq!(
@@ -17957,7 +18013,7 @@ mod tests {
         let p = temp_ext(b"a\nb\n", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         assert_eq!(
             app.doc().unwrap().edit.as_ref().unwrap().newline,
             crate::edit::Newline::Lf,
@@ -17980,7 +18036,7 @@ mod tests {
         let p = temp_ext(b"a\r\nb\r\n", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         let doc = app.doc_mut().unwrap();
         assert_eq!(
             doc.edit.as_ref().unwrap().newline,
@@ -18015,7 +18071,7 @@ mod tests {
         let p = temp_ext(b"a\n", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         let doc = app.doc_mut().unwrap();
         doc.indexer.take().unwrap().join().unwrap();
         view_doc(doc);
@@ -18248,7 +18304,7 @@ mod tests {
         let p = temp_ext(b"a\nb\n", "txt");
         let ctx0 = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx0);
+        app.start(Some(&p), &ctx0, Default::default());
         {
             let doc = app.doc_mut().unwrap();
             doc.indexer.take().unwrap().join().unwrap();
@@ -18988,7 +19044,7 @@ mod tests {
         let p = temp_ext(b"a\r\nb\r\n", "txt");
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.start(Some(&p), &ctx);
+        app.start(Some(&p), &ctx, Default::default());
         assert_eq!(
             app.doc().unwrap().edit.as_ref().unwrap().newline,
             crate::edit::Newline::CrLf,

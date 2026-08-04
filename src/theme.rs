@@ -9,8 +9,14 @@
 //!   데이터 도구처럼 보인다. 한글은 고정폭 영문 폰트에 글리프가 없으므로
 //!   **뒤에 폴백으로** 맑은 고딕을 붙인다(앞에 붙이면 영문·숫자까지 가변폭이
 //!   되어 정렬이 깨진다 — 이것이 이전 구현의 문제였다).
-//! - **UI 크롬은 Segoe UI**(Windows 표준). 메뉴·버튼·상태바.
+//! - **UI 크롬은 가변폭**(Windows Segoe UI / macOS SF / Linux DejaVu Sans).
+//!   메뉴·버튼·상태바.
 //! - 폰트 파일이 없으면 그 단계만 건너뛰고 egui 내장 폰트로 떨어진다(크래시 없음).
+//!
+//! **폰트 파일은 시스템 것만 쓴다 — 앱에 폰트를 내장하지 않는다.** 실행 파일과
+//! 저장소를 가볍게 유지하려는 선택이다. 대가는 한글 폰트가 없는 환경(주로
+//! 최소 설치 리눅스)에서 한글이 두부(□)로 보인다는 것인데, 그 경우
+//! `KOREAN_FONT_MISSING_MSG`로 설치 방법을 안내한다.
 
 use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke, TextStyle};
 
@@ -183,6 +189,94 @@ fn load_font(fonts: &mut FontDefinitions, key: &str, paths: &[&str]) -> Option<S
     Some(key.to_owned())
 }
 
+/// 고정폭 폰트 후보. 데이터 영역용 — 숫자 자릿수가 세로로 맞아야 한다.
+///
+/// 플랫폼 순서가 아니라 **선호 순서**로 늘어놓는다. `load_font`가 처음 읽히는
+/// 것을 쓰므로, 남의 플랫폼 경로는 그냥 읽기 실패로 건너뛰어진다. `cfg!` 분기를
+/// 쓰지 않는 이유: 분기하면 각 플랫폼 목록이 그 플랫폼에서만 컴파일되어,
+/// Windows에서 리눅스 경로 오타를 잡을 수 없다.
+const MONO_CANDIDATES: &[&str] = &[
+    // Windows
+    r"C:\Windows\Fonts\CascadiaMono.ttf",
+    r"C:\Windows\Fonts\CascadiaCode.ttf",
+    r"C:\Windows\Fonts\consola.ttf",
+    // macOS — SFNSMono는 시스템 UI 고정폭, Menlo는 터미널 기본.
+    "/System/Library/Fonts/SFNSMono.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Monaco.dfont",
+    // Linux — 배포판마다 경로가 다르므로 흔한 것을 넓게 깐다.
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+];
+
+/// UI 크롬(메뉴·버튼·상태바)용 가변폭 폰트 후보.
+const UI_CANDIDATES: &[&str] = &[
+    // Windows
+    r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\tahoma.ttf",
+    // macOS
+    "/System/Library/Fonts/SFNS.ttf",
+    "/System/Library/Fonts/SFNSDisplay.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    // Linux
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+];
+
+/// 한글 폴백 폰트 후보.
+///
+/// 이 목록이 **전부 실패하면 UI의 한글이 두부(□)가 된다** — egui 내장 폰트에는
+/// CJK 글리프가 없다. 그래서 다른 둘과 달리 실패가 사용자에게 보고된다
+/// (`FontReport::korean_missing`). 앱 자체는 정상 동작하므로 오류가 아니라
+/// 안내다.
+///
+/// 리눅스 항목이 많은 이유: 배포판마다 한글 폰트 패키지 이름도 설치 경로도
+/// 다르고, 최소 설치 이미지에는 CJK 폰트가 아예 없는 경우도 흔하다.
+const KR_CANDIDATES: &[&str] = &[
+    // Windows
+    r"C:\Windows\Fonts\malgun.ttf",
+    r"C:\Windows\Fonts\gulim.ttc",
+    // macOS
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/Library/Fonts/AppleGothic.ttf",
+    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+    // Linux — 나눔(Ubuntu/Debian, Fedora), Noto CJK(Arch, 최신 배포판 공통).
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    "/usr/share/fonts/nhn-nanum/NanumGothic.ttf",
+    "/usr/share/fonts/nanum/NanumGothic.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansKR-Regular.otf",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+];
+
+/// 폰트 설치 결과. 화면에 한글이 그려질 수 있는지를 호출부에 알린다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FontReport {
+    /// 한글 글리프를 가진 폰트를 하나도 못 찾았다. UI 한글이 두부가 된다.
+    pub korean_missing: bool,
+}
+
+/// 한글 폰트를 못 찾았을 때 사용자에게 보일 안내.
+///
+/// 문구를 여기 두는 이유: 이 상황은 Windows 개발 환경에서 재현되지 않아
+/// (맑은 고딕이 항상 있다) 테스트로만 검증된다. 테스트와 실제 문구가 같은
+/// 상수를 봐야 어긋나지 않는다.
+pub const KOREAN_FONT_MISSING_MSG: &str = "한글 폰트를 찾지 못해 한글이 □로 보입니다. \
+     한글 폰트를 설치하면 해결됩니다 — Debian/Ubuntu: `sudo apt install fonts-nanum`, \
+     Fedora: `sudo dnf install nhn-nanum-fonts`, Arch: `sudo pacman -S noto-fonts-cjk`. \
+     설치한 폰트 경로가 목록에 없다면 src/theme.rs의 KR_CANDIDATES에 추가해 주세요.";
+
 /// 데이터 영역은 고정폭(Cascadia Mono), UI는 Segoe UI, 한글은 맑은 고딕 폴백.
 ///
 /// 폴백 체인 뒤에는 egui 내장 폰트를 남겨 둔다:
@@ -190,35 +284,16 @@ fn load_font(fonts: &mut FontDefinitions, key: &str, paths: &[&str]) -> Option<S
 /// `"NotoEmoji-Regular"` / `"emoji-icon-font"`는 UI가 실제로 쓰는 기호
 /// (`↑ ↓ ✖ ●`)를 그린다 — 빼면 그 글자들이 두부(□)가 된다.
 /// (키 이름은 `epaint-0.28.1/src/text/fonts.rs:267-289` 확인.)
-pub fn install_fonts(ctx: &egui::Context) {
+pub fn install_fonts(ctx: &egui::Context) -> FontReport {
     let mut fonts = FontDefinitions::default();
 
-    let mono = load_font(
-        &mut fonts,
-        "mono",
-        &[
-            r"C:\Windows\Fonts\CascadiaMono.ttf",
-            r"C:\Windows\Fonts\CascadiaCode.ttf",
-            r"C:\Windows\Fonts\consola.ttf",
-        ],
-    );
-    let ui = load_font(
-        &mut fonts,
-        "ui",
-        &[
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\tahoma.ttf",
-        ],
-    );
+    let mono = load_font(&mut fonts, "mono", MONO_CANDIDATES);
+    let ui = load_font(&mut fonts, "ui", UI_CANDIDATES);
     // 한글 폴백(영문 폰트에 한글 글리프가 없으므로 **뒤에** 붙인다).
-    let kr = load_font(
-        &mut fonts,
-        "kr",
-        &[
-            r"C:\Windows\Fonts\malgun.ttf",
-            r"C:\Windows\Fonts\gulim.ttc",
-        ],
-    );
+    let kr = load_font(&mut fonts, "kr", KR_CANDIDATES);
+    let report = FontReport {
+        korean_missing: kr.is_none(),
+    };
 
     // Monospace: 고정폭 먼저, 한글은 뒤에서 폴백.
     let m = fonts.families.entry(FontFamily::Monospace).or_default();
@@ -248,6 +323,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     p.push("emoji-icon-font".to_owned());
 
     ctx.set_fonts(fonts);
+    report
 }
 
 /// 역할별 텍스트 스타일. Windows 표준(Segoe UI 9pt ≈ 12~13px)에 맞춘다.
@@ -310,10 +386,14 @@ pub fn install_visuals(ctx: &egui::Context) {
 }
 
 /// 앱 시작 시 한 번 호출 — 폰트·스타일·Visuals를 모두 설치한다.
-pub fn install(ctx: &egui::Context) {
-    install_fonts(ctx);
+///
+/// 폰트 설치 결과를 그대로 돌려준다. 호출부(`main`)가 이를 `App::start`에
+/// 넘겨 한글 폰트 부재를 사용자에게 안내한다.
+pub fn install(ctx: &egui::Context) -> FontReport {
+    let report = install_fonts(ctx);
     install_text_styles(ctx, 1.0);
     install_visuals(ctx);
+    report
 }
 
 /// UI 크롬(툴바·상태바·다이얼로그)에서 쓰는 라벨 텍스트.
@@ -341,6 +421,96 @@ pub fn window_title(path: Option<&std::path::Path>) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // ---- 폰트 후보 목록 ----
+    //
+    // 목록의 대부분은 **남의 플랫폼 경로**라 이 환경에서 읽어 볼 수 없다.
+    // 그래서 "존재하는가"가 아니라 "형태가 맞는가"를 본다 — 오타·중복·빈 항목
+    // 같은, 실제로 저지르는 실수를 잡는 게 목적이다.
+
+    /// 세 목록 모두 세 플랫폼을 실제로 담고 있다. 한 플랫폼이 통째로 빠지면
+    /// 그 OS에서 폰트가 하나도 안 잡힌다 — 목록을 손볼 때 가장 쉬운 실수다.
+    #[test]
+    fn font_candidates_cover_all_three_platforms() {
+        for (name, list) in [
+            ("mono", MONO_CANDIDATES),
+            ("ui", UI_CANDIDATES),
+            ("kr", KR_CANDIDATES),
+        ] {
+            assert!(
+                list.iter().any(|p| p.starts_with(r"C:\Windows")),
+                "{name}: Windows 경로가 없다"
+            );
+            assert!(
+                list.iter().any(|p| p.starts_with("/System/") || p.starts_with("/Library/")),
+                "{name}: macOS 경로가 없다"
+            );
+            assert!(
+                list.iter().any(|p| p.starts_with("/usr/share/fonts")),
+                "{name}: Linux 경로가 없다"
+            );
+        }
+    }
+
+    /// 절대 경로여야 하고 빈 항목이 없어야 한다. 상대 경로는 실행 위치에 따라
+    /// 결과가 달라져(테스트에서만 우연히 통과하는) 재현 불가능한 버그가 된다.
+    #[test]
+    fn font_candidates_are_absolute_and_nonempty() {
+        for (name, list) in [
+            ("mono", MONO_CANDIDATES),
+            ("ui", UI_CANDIDATES),
+            ("kr", KR_CANDIDATES),
+        ] {
+            assert!(!list.is_empty(), "{name}: 목록이 비었다");
+            for p in list {
+                assert!(!p.trim().is_empty(), "{name}: 빈 경로 항목");
+                let absolute = p.starts_with('/') || p.starts_with(r"C:\");
+                assert!(absolute, "{name}: 절대 경로가 아니다 — {p}");
+            }
+        }
+    }
+
+    /// 같은 경로를 두 번 적지 않는다. 중복은 무해해 보이지만, 목록을 손볼 때
+    /// 한쪽만 고치고 다른 쪽을 놓치는 함정이 된다.
+    #[test]
+    fn font_candidates_have_no_duplicates() {
+        for (name, list) in [
+            ("mono", MONO_CANDIDATES),
+            ("ui", UI_CANDIDATES),
+            ("kr", KR_CANDIDATES),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for p in list {
+                assert!(seen.insert(*p), "{name}: 중복 경로 — {p}");
+            }
+        }
+    }
+
+    /// 안내 문구는 "무엇이 문제인지"와 "어떻게 고치는지"를 둘 다 담아야 한다.
+    /// 증상만 알리고 해결책이 없으면 사용자는 앱을 지운다.
+    #[test]
+    fn korean_font_message_tells_how_to_fix_it() {
+        let m = KOREAN_FONT_MISSING_MSG;
+        assert!(m.contains("한글"), "증상을 한글로 설명한다");
+        assert!(m.contains("apt") && m.contains("dnf") && m.contains("pacman"),
+            "주요 배포판 설치 명령을 안내한다: {m}");
+        assert!(m.contains("KR_CANDIDATES"),
+            "목록에 없는 폰트를 쓰는 사용자를 위해 고칠 지점을 알려준다");
+    }
+
+    /// 이 환경(Windows)에서는 한글 폰트가 반드시 잡힌다. 이 테스트가 깨지면
+    /// Windows 경로 목록이 망가진 것이다 — 실제 파일을 읽는 유일한 검증이다.
+    #[test]
+    fn windows_korean_font_actually_loads_here() {
+        if !cfg!(target_os = "windows") {
+            return; // 다른 OS에서는 확인할 수 없다.
+        }
+        let found = KR_CANDIDATES
+            .iter()
+            .filter(|p| p.starts_with(r"C:\Windows"))
+            .any(|p| std::fs::metadata(p).is_ok());
+        assert!(found, "Windows에 한글 폰트가 하나는 있어야 한다: {KR_CANDIDATES:?}");
+    }
 
     #[test]
     fn title_without_file_is_app_name() {

@@ -1,3 +1,19 @@
+// textViewer — 대용량 CSV/TSV/텍스트 뷰어
+// Copyright (C) 2026 vuski
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 // 릴리스 빌드에서는 콘솔 창을 띄우지 않는다(GUI 앱).
 // Rust 기본은 콘솔 서브시스템이라 exe를 실행하면 cmd 창이 함께 뜬다.
 // 디버그 빌드에서는 println!/패닉 메시지를 봐야 하므로 콘솔을 남긴다.
@@ -54,9 +70,11 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             // 폰트/텍스트 스타일/Visuals를 한 번에 설치한다(theme.rs).
-            theme::install(&cc.egui_ctx);
+            // 결과에는 한글 폰트를 찾았는지가 담긴다 — 못 찾았으면 `start`가
+            // 설치 방법을 안내한다(주로 CJK 폰트 없는 리눅스).
+            let fonts = theme::install(&cc.egui_ctx);
             let mut app = app::App::default();
-            app.start(initial.as_deref(), &cc.egui_ctx);
+            app.start(initial.as_deref(), &cc.egui_ctx, fonts);
             Ok(Box::new(app))
         }),
     )
