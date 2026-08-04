@@ -13,6 +13,9 @@ encoding_rs = "0.8"
 rfd = "0.14"
 rayon = "1"
 memchr = "2"
+# OS 로케일에서 시작 언어를 정한다(src/i18n.rs). Windows는
+# GetUserDefaultLocaleName, 맥·리눅스는 각자 관례를 이 크레이트가 흡수한다.
+sys-locale = "0.3"
 # Windows 기본 힙(RtlAllocateHeap)이 이 앱 비용의 큰 몫이다 — 15.4M행 파일에서
 # 전체 바꾸기 시간의 61%가 할당자였다(측정). main.rs의 #[global_allocator] 참조.
 mimalloc = "0.1"

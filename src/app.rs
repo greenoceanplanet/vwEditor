@@ -396,6 +396,13 @@ pub struct App {
     /// 모든 탭이 하나의 값을 공유한다(문서별이 아니다) — 탭을 옮길 때마다 글자
     /// 크기가 바뀌면 산만하고, 사용자가 기대하는 것은 "앱의 보기 배율"이다.
     pub view_scale: f32,
+    /// UI 언어. 시작할 때 OS 로케일에서 정하고(`Lang::detect`), 메뉴에서
+    /// 바꿀 수 있다. 문구는 전부 `crate::i18n`에 있다.
+    ///
+    /// 선택을 디스크에 남기지 않는다 — 앱이 설정 파일을 쓰지 않는다는 원칙을
+    /// 언어 하나 때문에 깨지 않는다. 로케일이 맞는 사용자는 바꿀 일이 없고,
+    /// 바꾸는 쪽은 그 세션에서만 유효하다.
+    pub lang: crate::i18n::Lang,
 }
 
 /// 바이너리 열기 다이얼로그의 보류 상태.
@@ -438,6 +445,8 @@ impl Default for App {
             window_title: "vwEditor".to_owned(),
             pending_binary_open: None,
             view_scale: 1.0,
+            // OS 로케일을 따른다. 읽지 못하면 영어.
+            lang: crate::i18n::Lang::detect(),
         }
     }
 }
@@ -724,7 +733,7 @@ impl App {
     /// 필요가 없고(푸터가 행 수를 안다), 읽기 전용이라 편집 모드가 없다.
     pub fn open_path_parquet(&mut self, path: &Path) {
         self.error = None;
-        let pq = match crate::parquet::open(path) {
+        let pq = match crate::parquet::open(path, self.lang) {
             Ok(p) => p,
             Err(e) => {
                 self.error = Some(e);
@@ -1486,17 +1495,29 @@ impl eframe::App for App {
             None => false,
         };
 
-        // 최상단 메뉴바 (파일 / 편집 / 도구)
+        // 문구는 매 프레임 같은 언어를 본다. 메뉴 안에서 `self.lang`을 다시
+        // 읽으면 언어 항목을 누른 프레임에 절반만 바뀐 UI가 그려진다.
+        //
+        // `lang`을 따로 복사해 두는 이유: 아래 렌더 함수들은 `self.doc_mut()`이
+        // self를 빌린 안쪽에서 불리므로 그 자리에서 `self.lang`을 읽을 수 없다.
+        // Lang은 Copy라 미리 꺼내 두면 빌림과 무관해진다.
+        let lang = self.lang;
+        let s = crate::i18n::t(lang);
+        // 메뉴 안에서 self를 빌리는 곳이 많아, 언어 변경은 여기에 적어 두고
+        // 패널이 끝난 뒤 반영한다.
+        let mut pick_lang: Option<crate::i18n::Lang> = None;
+
+        // 최상단 메뉴바 (파일 / 편집 / 도구 / 언어)
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
+                ui.menu_button(s.menu_file, |ui| {
                     // 빈 새 파일을 새 탭으로. 저장할 때 경로를 묻는다.
                     // 열려 있던 탭은 건드리지 않는다(`open_new_tab` 참조).
-                    if ui.button("New").clicked() {
+                    if ui.button(s.menu_new).clicked() {
                         self.open_new_tab();
                         ui.close_menu();
                     }
-                    if ui.button("Open…").clicked() {
+                    if ui.button(s.menu_open).clicked() {
                         // 열기 필터는 저장과 달리 **넓은 것이 먼저**다 —
                         // 어떤 파일을 열지 아직 모르므로, 아는 확장자를 한
                         // 항목에 모아 보여 주고 그다음 개별 형식을 둔다.
@@ -1518,7 +1539,7 @@ impl eframe::App for App {
                     // 의미가 있다(뷰 모드는 저장할 버퍼가 없다).
                     let editing = self.doc().map_or(false, doc_savable);
                     ui.add_enabled_ui(editing, |ui| {
-                        if ui.button("Save").clicked() {
+                        if ui.button(s.menu_save).clicked() {
                             self.show_save_dialog = true;
                             self.save_as = false;
                             self.init_save_defaults();
@@ -1544,7 +1565,7 @@ impl eframe::App for App {
                         }
                     });
                 });
-                ui.menu_button("Edit", |ui| {
+                ui.menu_button(s.menu_edit, |ui| {
                     // 편집 메뉴 항목은 파일이 열려 있을 때만 의미가 있다.
                     let has_doc = self.doc().is_some();
                     // "Edit Mode"는 **텍스트** 편집 버퍼 토글이다. 헥스 문서에
@@ -1562,7 +1583,7 @@ impl eframe::App for App {
                         // 끄면 버퍼를 버린다(dirty면 확인 후).
                         // 편집의 진입점이므로 편집 메뉴 맨 위에 둔다.
                         let mut edit_on = self.doc().map_or(false, |d| d.edit.is_some());
-                        if ui.checkbox(&mut edit_on, "Edit Mode").clicked() {
+                        if ui.checkbox(&mut edit_on, s.menu_edit_mode).clicked() {
                             if edit_on {
                                 if let Some(doc) = self.doc_mut() {
                                     enter_edit_mode(doc);
@@ -1577,7 +1598,7 @@ impl eframe::App for App {
                     });
                     ui.separator();
                     ui.add_enabled_ui(can_undo, |ui| {
-                        if ui.button("Undo   Ctrl+Z").clicked() {
+                        if ui.button(s.menu_undo).clicked() {
                             undo_clicked = true;
                             ui.close_menu();
                         }
@@ -1585,13 +1606,13 @@ impl eframe::App for App {
                     ui.separator();
                     // 찾기는 뷰 모드에서도 되므로 has_doc만 보면 된다.
                     ui.add_enabled_ui(has_doc, |ui| {
-                        if ui.button("Find / Replace…   Ctrl+F").clicked() {
+                        if ui.button(s.menu_find_replace).clicked() {
                             find_menu_clicked = true;
                             ui.close_menu();
                         }
                     });
                 });
-                ui.menu_button("Tools", |ui| {
+                ui.menu_button(s.menu_tools, |ui| {
                     // 도구 메뉴 항목은 파일이 열려 있을 때만, 그리고 **텍스트
                     // 문서일 때만** 의미가 있다. 정렬·구분자 변환·행/열 번호·
                     // 오류 행은 전부 "행과 필드"를 전제하는데 헥스 문서에는
@@ -1603,7 +1624,7 @@ impl eframe::App for App {
                     // 그룹 전체를 명시적으로 잠근다.
                     let tools_enabled = self.doc().is_some_and(text_tools_enabled);
                     ui.add_enabled_ui(tools_enabled, |ui| {
-                        if ui.button("Sort by Columns…").clicked() {
+                        if ui.button(s.menu_sort_columns).clicked() {
                             if let Some(doc) = self.doc_mut() {
                                 // 표 모드 + 전체 행 접근 가능일 때만 실제로 연다.
                                 // 편집 버퍼와 Parquet은 인덱싱 진행 상태와 무관
@@ -1632,7 +1653,7 @@ impl eframe::App for App {
                         let table_mode =
                             self.doc().is_some_and(|d| matches!(d.sep, SeparatorMode::Char(_)));
                         ui.add_enabled_ui(table_mode, |ui| {
-                            if ui.button("Convert Delimiter…").clicked() {
+                            if ui.button(s.menu_convert_delim).clicked() {
                                 if let Some(doc) = self.doc_mut() {
                                     // 열 때마다 초기화한다 — 지난번 선택이 남아
                                     // 있으면 무심코 누른 Convert가 의도치 않은
@@ -1645,21 +1666,40 @@ impl eframe::App for App {
                             }
                             // 오류 행 목록도 표 모드 전용이다 — "필드 수가 맞는가"
                             // 라는 물음 자체가 컬럼이 있어야 성립한다.
-                            if ui.button("Bad Rows…").clicked() {
+                            if ui.button(s.menu_bad_rows).clicked() {
                                 if let Some(doc) = self.doc_mut() {
                                     doc.show_errors_window = true;
                                 }
                                 ui.close_menu();
                             }
                         });
-                        if ui.button("Row & Column Numbers…").clicked() {
+                        if ui.button(s.menu_row_col_numbers).clicked() {
                             self.show_numbering_dialog = true;
                             ui.close_menu();
                         }
                     });
                 });
+                // 언어. 시작 언어는 OS 로케일이 정하고(`Lang::detect`), 여기서
+                // 그 세션 동안 바꿀 수 있다. 각 항목은 **그 언어로** 적혀 있어
+                // (`native_name`) 낯선 언어로 떠 있어도 자기 언어를 찾을 수 있다.
+                ui.menu_button(s.menu_language, |ui| {
+                    for &l in crate::i18n::Lang::ALL {
+                        // 라디오 형태로 지금 언어를 표시한다.
+                        if ui.radio(self.lang == l, l.native_name()).clicked() {
+                            pick_lang = Some(l);
+                            ui.close_menu();
+                        }
+                    }
+                });
             });
         });
+
+        // 언어 변경은 메뉴를 그린 뒤에 반영한다 — 메뉴 안에서 `self.lang`을
+        // 바꾸면 이 프레임의 나머지 UI가 이전 `s`를 계속 써서 한 프레임 동안
+        // 두 언어가 섞인다. 다음 프레임부터 전부 새 언어로 그려진다.
+        if let Some(l) = pick_lang {
+            self.lang = l;
+        }
 
         // 탭 바. 문서가 2개 이상일 때만 보인다(1개면 탭이라는 개념이 무의미하고
         // 공간만 낭비한다).
@@ -1743,7 +1783,7 @@ impl eframe::App for App {
                         });
                     // 직접 입력: 한 글자 텍스트박스. 입력하면 그 글자(첫 바이트)를
                     // 구분자로 사용. ASCII 한 글자만 유효(멀티바이트는 첫 바이트).
-                    ui.label(crate::theme::chrome_text("Custom:"));
+                    ui.label(crate::theme::chrome_text(s.convert_custom));
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut doc.custom_sep_input)
                             .desired_width(28.0)
@@ -1790,7 +1830,7 @@ impl eframe::App for App {
                     // 헤더 체크박스는 표 모드에서만 의미가 있다.
                     if matches!(doc.sep, SeparatorMode::Char(_)) {
                         let hdr_before = doc.has_header;
-                        ui.checkbox(&mut doc.has_header, "Header");
+                        ui.checkbox(&mut doc.has_header, s.common_header);
                         // 헤더 유무가 바뀌면 data_start가 달라져 permutation이 어긋나므로 무효화.
                         if doc.has_header != hdr_before {
                             doc.sort = None;
@@ -1803,7 +1843,7 @@ impl eframe::App for App {
                     // 정렬 컨트롤: 표 모드 + 컬럼 선택 + 인덱싱 완료일 때만 활성.
                     if matches!(doc.sep, SeparatorMode::Char(_)) {
                         ui.separator();
-                        render_sort_controls(ui, doc, ctx);
+                        render_sort_controls(ui, doc, ctx, lang);
                     }
 
                     ui.separator();
@@ -1886,7 +1926,7 @@ impl eframe::App for App {
                             ui.label(crate::theme::chrome_text(format!(
                                 "Indexing… {done_gb:.2} / {total_gb:.2} GB ({pct}%)"
                             )));
-                            if ui.button("Stop").clicked() {
+                            if ui.button(s.common_stop).clicked() {
                                 doc.index.request_pause();
                             }
                         }
@@ -1895,7 +1935,7 @@ impl eframe::App for App {
                                 "Stopped — showing first {} rows ({done_gb:.2} / {total_gb:.2} GB)",
                                 doc.index.line_count()
                             )));
-                            if ui.button("Resume").clicked() {
+                            if ui.button(s.common_resume).clicked() {
                                 // 재개 = 처음부터 다시 병렬 스캔. spawn_indexer가
                                 // 프라이밍→병렬을 새로 수행하며 인덱스를 덮어쓴다.
                                 // 기존 핸들은 이미 종료됨.
@@ -1970,7 +2010,7 @@ impl eframe::App for App {
                                 .color(egui::Color32::from_rgb(200, 60, 40));
                             if ui
                                 .add(egui::Label::new(label).sense(egui::Sense::click()))
-                                .on_hover_text("Click to see the list")
+                                .on_hover_text(s.bad_click_to_list)
                                 .clicked()
                             {
                                 doc.show_errors_window = true;
@@ -1981,7 +2021,7 @@ impl eframe::App for App {
                     }
                 } else if self.error.is_none() {
                     // 문서도 오류도 없을 때만 안내 문구.
-                    ui.label(crate::theme::chrome_text("No file open"));
+                    ui.label(crate::theme::chrome_text(s.common_no_file));
                 }
             });
         });
@@ -1997,7 +2037,7 @@ impl eframe::App for App {
         let mut find_action: Option<FindAction> = None;
         if self.doc().is_some_and(|d| d.show_find) {
             if let Some(doc) = self.doc_mut() {
-                find_action = render_find_panel(ctx, doc);
+                find_action = render_find_panel(ctx, doc, lang);
             }
         }
         // 추출만 `App`(탭 목록 + active)을 건드리므로 따로 태운다. 헥스 찾기도
@@ -2065,7 +2105,7 @@ impl eframe::App for App {
                         render_table(ui, doc, delim, row_base, col_base, clipboard)
                     }
                     SeparatorMode::None => {
-                        render_text(ui, doc, row_base, clipboard, tab_for_body)
+                        render_text(ui, doc, row_base, clipboard, tab_for_body, lang)
                     }
                 }
             }
@@ -2074,14 +2114,14 @@ impl eframe::App for App {
         // 다중 컬럼 정렬 다이얼로그(표시 중일 때만).
         if let Some(doc) = self.doc_mut() {
             if doc.show_sort_dialog {
-                render_sort_dialog(ctx, doc, col_base);
+                render_sort_dialog(ctx, doc, col_base, lang);
             }
         }
 
         // 구분자 변환 다이얼로그. `Convert`를 누르면 그 자리에서 변환한다.
         if let Some(doc) = self.doc_mut() {
             if doc.show_convert_dialog {
-                let want = render_convert_dialog(ctx, doc);
+                let want = render_convert_dialog(ctx, doc, lang);
                 if want {
                     if let Some(new) = doc.convert_target {
                         convert_delimiter_in_doc(doc, new);
@@ -2095,7 +2135,7 @@ impl eframe::App for App {
         // 정렬 permutation 역매핑을 두 벌 두면 한쪽만 고쳐져 어긋난다.
         if let Some(doc) = self.doc_mut() {
             if doc.show_errors_window {
-                if let Some(logical) = render_errors_window(ctx, doc, row_base) {
+                if let Some(logical) = render_errors_window(ctx, doc, row_base, lang) {
                     let (align, row) = gutter_click_target(doc, logical, doc.sep);
                     doc.pending_scroll_align = align;
                     doc.pending_scroll_row = Some(row);
@@ -4882,7 +4922,8 @@ fn reset_hex_find_cursor(doc: &mut Document) {
 /// 범위가 없다(문서 전체 하나). 검색어 입력란은 텍스트 모드와 같은
 /// `doc.find_query`를 그대로 쓴다 — 필드를 따로 두면 탭을 오가며 두 값이
 /// 갈릴 수 있고, 애초에 헥스/텍스트 문서는 한 탭에 동시에 있을 수 없다.
-fn render_hex_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindAction> {
+fn render_hex_find_panel(ctx: &egui::Context, doc: &mut Document, lang: crate::i18n::Lang) -> Option<FindAction> {
+    let s = crate::i18n::t(lang);
     let mut action: Option<FindAction> = None;
     let want_focus = std::mem::take(&mut doc.find_focus_pending);
     let mut open = doc.show_find;
@@ -4893,7 +4934,7 @@ fn render_hex_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<Find
         .default_pos(find_window_default_pos(ctx.screen_rect()))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(crate::theme::chrome_text("Find:"));
+                ui.label(crate::theme::chrome_text(s.find_label));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut doc.find_query)
                         .id(find_query_id())
@@ -4912,13 +4953,13 @@ fn render_hex_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<Find
             // (`render_find_panel`이 `doc.hex.is_some()`일 때만 여기로 분기한다).
             let mode_changed = {
                 let h = doc.hex.as_mut().unwrap();
-                ui.checkbox(&mut h.find_hex, "Hex").changed()
+                ui.checkbox(&mut h.find_hex, s.find_hex).changed()
             };
             if mode_changed {
                 reset_hex_find_cursor(doc);
             }
             ui.separator();
-            if ui.button("Find Next").clicked() {
+            if ui.button(s.find_next).clicked() {
                 action = Some(FindAction::HexNext);
             }
             if !doc.find_status.is_empty() {
@@ -4938,9 +4979,10 @@ fn render_hex_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<Find
 ///
 /// 라벨은 `chrome_text`를 거친다. Body 텍스트 스타일이 데이터용 고정폭이라
 /// 그냥 `ui.label(s)`을 쓰면 UI 문구까지 데이터 폰트로 나온다.
-fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindAction> {
+fn render_find_panel(ctx: &egui::Context, doc: &mut Document, lang: crate::i18n::Lang) -> Option<FindAction> {
+    let s = crate::i18n::t(lang);
     if doc.hex.is_some() {
-        return render_hex_find_panel(ctx, doc);
+        return render_hex_find_panel(ctx, doc, lang);
     }
     let mut action: Option<FindAction> = None;
     // 바꾸기는 편집 버퍼가 있어야 가능하다. 뷰 모드에서는 찾기만.
@@ -4959,7 +5001,7 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
         .default_pos(find_window_default_pos(ctx.screen_rect()))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(crate::theme::chrome_text("Find:"));
+                ui.label(crate::theme::chrome_text(s.find_label));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut doc.find_query)
                         .id(find_query_id())
@@ -4979,7 +5021,7 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
             });
             ui.add_enabled_ui(editing, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(crate::theme::chrome_text("Replace:"));
+                    ui.label(crate::theme::chrome_text(s.find_replace_label));
                     ui.add(
                         egui::TextEdit::singleline(&mut doc.replace_text).desired_width(260.0),
                     );
@@ -4998,22 +5040,22 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
             let before_esc = doc.find_escapes;
             let mut scope = doc.find_opts.scope;
             ui.horizontal(|ui| {
-                ui.radio_value(&mut scope, crate::find::MatchScope::Partial, "Partial");
-                ui.radio_value(&mut scope, crate::find::MatchScope::WholeWord, "Whole word");
+                ui.radio_value(&mut scope, crate::find::MatchScope::Partial, s.find_partial);
+                ui.radio_value(&mut scope, crate::find::MatchScope::WholeWord, s.find_whole_word);
                 // Whole cell은 표 모드에서만 의미가 있다(셀 개념). 텍스트
                 // 모드로 이미 WholeCell이 걸린 채 넘어왔더라도(탭 전환 등)
                 // 라디오만 비활성일 뿐 E1이 그 조합을 "행 전체 일치"로 안전하게
                 // 정의해 두었으므로 패닉·오작동은 없다.
                 ui.add_enabled_ui(whole_cell_enabled(doc), |ui| {
-                    ui.radio_value(&mut scope, crate::find::MatchScope::WholeCell, "Whole cell");
+                    ui.radio_value(&mut scope, crate::find::MatchScope::WholeCell, s.find_whole_cell);
                 });
             });
             doc.find_opts.scope = scope;
             ui.horizontal(|ui| {
-                ui.checkbox(&mut doc.find_opts.match_case, "Match case");
+                ui.checkbox(&mut doc.find_opts.match_case, s.find_match_case);
                 // 이스케이프 해석은 매칭 규칙(`FindOptions`)이 아니라 "입력란을
                 // 어떻게 읽을 것인가"이므로 별도 필드를 직접 토글한다.
-                ui.checkbox(&mut doc.find_escapes, "Escape sequences")
+                ui.checkbox(&mut doc.find_escapes, s.find_escapes)
                     .on_hover_text(FIND_ESCAPES_TOOLTIP);
             });
             if find_inputs_changed(&before, &doc.find_opts, before_esc, doc.find_escapes) {
@@ -5024,31 +5066,31 @@ fn render_find_panel(ctx: &egui::Context, doc: &mut Document) -> Option<FindActi
             ui.separator();
 
             ui.horizontal(|ui| {
-                if ui.button("Find Prev").clicked() {
+                if ui.button(s.find_prev).clicked() {
                     action = Some(FindAction::Prev);
                 }
-                if ui.button("Find Next").clicked() {
+                if ui.button(s.find_next).clicked() {
                     action = Some(FindAction::Next);
                 }
                 // Find All: 전체를 스캔해 하이라이트 스냅샷을 만든다. 하이라이트가
                 // 갱신되는 유일한 버튼이다. 검색어가 비면 비활성(찾을 게 없다).
                 ui.add_enabled_ui(find_all_button_enabled(&doc.find_query), |ui| {
-                    if ui.button("Find All").clicked() {
+                    if ui.button(s.find_all).clicked() {
                         action = Some(FindAction::All);
                     }
                 });
                 ui.add_enabled_ui(editing, |ui| {
-                    if ui.button("Replace").clicked() {
+                    if ui.button(s.find_replace_one).clicked() {
                         action = Some(FindAction::ReplaceOne);
                     }
-                    if ui.button("Replace All").clicked() {
+                    if ui.button(s.find_replace_all).clicked() {
                         action = Some(FindAction::ReplaceAll);
                     }
                 });
                 // 추출은 뷰/편집 모드 둘 다에서 동작한다(찾기와 같다) — 바꾸기처럼
                 // `editing`으로 가두면 안 된다. 검색어가 비었을 때만 비활성.
                 ui.add_enabled_ui(extract_button_enabled(&doc.find_query), |ui| {
-                    if ui.button("Extract Rows").clicked() {
+                    if ui.button(s.find_extract_rows).clicked() {
                         action = Some(FindAction::Extract);
                     }
                 });
@@ -5206,6 +5248,7 @@ fn apply_save_newline(doc: &mut Document, nl: crate::edit::Newline) {
 /// 저장 다이얼로그. 인코딩/BOM/개행을 고르고 저장하거나 취소한다.
 /// `app.save_as`가 참이면 rfd 파일 선택 창으로 경로를 새로 고른다.
 fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
+    let s = crate::i18n::t(app.lang);
     // 저장할 것이 없으면(편집 모드 이탈 등) 다이얼로그를 닫는다.
     // `doc_exportable`이라 Parquet(편집 버퍼가 없다)도 통과한다 — 그 경우는
     // 제자리 저장이 아니라 CSV/TSV 내보내기다.
@@ -5239,7 +5282,7 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
                     "You will choose the file location after clicking Save.",
                 ));
             } else {
-                ui.label(crate::theme::chrome_text(format!("Overwrite: {cur_label}")));
+                ui.label(crate::theme::chrome_text(format!("{} {cur_label}", s.save_overwrite)));
             }
             ui.separator();
 
@@ -5271,10 +5314,10 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
                     app.save_bom = false;
                 }
                 ui.add_enabled_ui(bom_allowed, |ui| {
-                    ui.checkbox(&mut app.save_bom, "Include BOM");
+                    ui.checkbox(&mut app.save_bom, s.save_include_bom);
                 });
                 if !bom_allowed {
-                    ui.label(crate::theme::chrome_text("(CP949 has no BOM)"));
+                    ui.label(crate::theme::chrome_text(s.save_cp949_no_bom));
                 }
 
                 // 개행 스타일. 파일 전체에 하나로 적용된다(줄마다 다르게 저장하는
@@ -5297,10 +5340,10 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if ui.button(s.menu_save).clicked() {
                     do_save = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(s.common_cancel).clicked() {
                     app.show_save_dialog = false;
                 }
             });
@@ -5450,6 +5493,7 @@ fn render_save_dialog(ctx: &egui::Context, app: &mut App) {
 /// 바이너리로 판정된 파일의 열기 방식 선택. Sort/Convert 다이얼로그와
 /// 같은 `egui::Window` 패턴.
 fn render_binary_open_dialog(ctx: &egui::Context, app: &mut App) {
+    let s = crate::i18n::t(app.lang);
     let Some(pending) = &app.pending_binary_open else { return };
     let path = pending.path.clone();
     let mut open = true;
@@ -5464,11 +5508,11 @@ fn render_binary_open_dialog(ctx: &egui::Context, app: &mut App) {
             ));
             ui.label(crate::theme::chrome_text(path.display().to_string()));
             ui.separator();
-            if ui.button("Open as Binary (Hex)").clicked() {
+            if ui.button(s.open_as_binary).clicked() {
                 choice = Some(true);
             }
             ui.separator();
-            ui.label(crate::theme::chrome_text("Or force a text encoding:"));
+            ui.label(crate::theme::chrome_text(s.open_force_encoding));
             ui.horizontal(|ui| {
                 let enc = &mut app.pending_binary_open.as_mut().unwrap().enc;
                 let label = match enc {
@@ -5485,12 +5529,12 @@ fn render_binary_open_dialog(ctx: &egui::Context, app: &mut App) {
                         ui.selectable_value(enc, Encoding::Utf16Le, "UTF-16LE");
                         ui.selectable_value(enc, Encoding::Utf16Be, "UTF-16BE");
                     });
-                if ui.button("Open as Text").clicked() {
+                if ui.button(s.open_as_text).clicked() {
                     choice = Some(false);
                 }
             });
             ui.separator();
-            if ui.button("Cancel").clicked() {
+            if ui.button(s.common_cancel).clicked() {
                 app.pending_binary_open = None;
             }
         });
@@ -5510,6 +5554,7 @@ fn render_binary_open_dialog(ctx: &egui::Context, app: &mut App) {
 
 /// 저장하지 않은 변경을 버릴 수 있는 동작 전에 띄우는 확인 창.
 fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
+    let s = crate::i18n::t(app.lang);
     let mut open = true;
     let mut proceed = false;
     let mut cancel = false;
@@ -5523,10 +5568,10 @@ fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
             ));
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Continue").clicked() {
+                if ui.button(s.common_continue).clicked() {
                     proceed = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(s.common_cancel).clicked() {
                     cancel = true;
                 }
             });
@@ -5574,6 +5619,7 @@ fn render_confirm_discard_dialog(ctx: &egui::Context, app: &mut App) {
 /// `delim`이 필요하므로 표 모드(`SeparatorMode::Char`)에서만 의미가 있다.
 /// 텍스트 모드에는 컬럼 개념이 없어 애초에 대기 연산이 생기지 않는다.
 fn render_confirm_big_column_op_dialog(ctx: &egui::Context, app: &mut App) {
+    let s = crate::i18n::t(app.lang);
     let Some(doc) = app.doc() else { return };
     let Some(pending) = doc.pending_column_op.clone() else { return };
     let SeparatorMode::Char(delim) = doc.sep else {
@@ -5609,10 +5655,10 @@ fn render_confirm_big_column_op_dialog(ctx: &egui::Context, app: &mut App) {
             ));
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Continue").clicked() {
+                if ui.button(s.common_continue).clicked() {
                     proceed = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(s.common_cancel).clicked() {
                     cancel = true;
                 }
             });
@@ -5653,6 +5699,7 @@ fn render_confirm_big_column_op_dialog(ctx: &egui::Context, app: &mut App) {
 
 /// 행/열 번호 시작값(0 또는 1) 설정 다이얼로그.
 fn render_numbering_dialog(ctx: &egui::Context, app: &mut App) {
+    let s = crate::i18n::t(app.lang);
     let mut open = true;
     egui::Window::new("Row & Column Numbers")
         .open(&mut open)
@@ -5664,17 +5711,17 @@ fn render_numbering_dialog(ctx: &egui::Context, app: &mut App) {
             ));
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label(crate::theme::chrome_text("Rows:"));
+                ui.label(crate::theme::chrome_text(s.common_rows));
                 ui.selectable_value(&mut app.row_base, 0, "From 0");
                 ui.selectable_value(&mut app.row_base, 1, "From 1");
             });
             ui.horizontal(|ui| {
-                ui.label(crate::theme::chrome_text("Columns:"));
+                ui.label(crate::theme::chrome_text(s.common_columns));
                 ui.selectable_value(&mut app.col_base, 0, "From 0");
                 ui.selectable_value(&mut app.col_base, 1, "From 1");
             });
             ui.separator();
-            if ui.button("Close").clicked() {
+            if ui.button(s.common_close).clicked() {
                 app.show_numbering_dialog = false;
             }
         });
@@ -5803,7 +5850,8 @@ fn convert_enabled(current: SeparatorMode, target: Option<u8>) -> bool {
 /// `Convert`를 누르면 `want_convert`가 참으로 돌아온다. 실제 변환은 호출부가
 /// 한다 — 변환은 편집 버퍼 진입(`enter_edit_mode`)이 필요할 수 있는데, 그건
 /// `Document` 하나가 아니라 더 넓은 범위를 건드리기 때문이다.
-fn render_convert_dialog(ctx: &egui::Context, doc: &mut Document) -> bool {
+fn render_convert_dialog(ctx: &egui::Context, doc: &mut Document, lang: crate::i18n::Lang) -> bool {
+    let s = crate::i18n::t(lang);
     let mut open = true;
     let mut want_convert = false;
     let cur_label = match doc.sep {
@@ -5824,7 +5872,7 @@ fn render_convert_dialog(ctx: &egui::Context, doc: &mut Document) -> bool {
                 "Current delimiter:  {cur_label}"
             )));
             ui.separator();
-            ui.label(crate::theme::chrome_text("Convert to"));
+            ui.label(crate::theme::chrome_text(s.convert_to));
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut doc.convert_target, Some(b','), "Comma  ,");
                 ui.selectable_value(&mut doc.convert_target, Some(b'\t'), "Tab");
@@ -5832,7 +5880,7 @@ fn render_convert_dialog(ctx: &egui::Context, doc: &mut Document) -> bool {
                 ui.selectable_value(&mut doc.convert_target, Some(b';'), "Semicolon  ;");
             });
             ui.horizontal(|ui| {
-                ui.label(crate::theme::chrome_text("Custom:"));
+                ui.label(crate::theme::chrome_text(s.convert_custom));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut doc.convert_custom_input)
                         .desired_width(28.0)
@@ -5859,20 +5907,18 @@ fn render_convert_dialog(ctx: &egui::Context, doc: &mut Document) -> bool {
                 );
             }
             ui.separator();
+            ui.label(crate::theme::chrome_text(s.convert_warn_change));
             ui.label(crate::theme::chrome_text(
-                "파일 내용이 바뀝니다. 되돌리려면 Ctrl+Z.",
-            ));
-            ui.label(crate::theme::chrome_text(
-                "저장해야 디스크에 반영됩니다. 뷰 모드면 편집 모드로 전환됩니다.",
+                s.convert_warn_save,
             ));
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
+                if ui.button(s.common_cancel).clicked() {
                     doc.show_convert_dialog = false;
                 }
                 let enabled = convert_enabled(doc.sep, doc.convert_target);
                 ui.add_enabled_ui(enabled, |ui| {
-                    if ui.button("Convert").clicked() {
+                    if ui.button(s.convert_do).clicked() {
                         want_convert = true;
                     }
                 });
@@ -5925,7 +5971,8 @@ fn issue_label(issue: crate::validate::RowIssue) -> String {
 /// 창 안에서 곧바로 스크롤을 걸지 않는 이유는 이 코드베이스의 규율이다 —
 /// `doc`이 클로저에 가변 대여돼 있어 `logical_to_screen_row`가 다시 빌릴 수
 /// 없고, 인텐트만 받아 두면 그 문제가 사라진다(찾기 창과 같은 방식).
-fn render_errors_window(ctx: &egui::Context, doc: &mut Document, row_base: usize) -> Option<usize> {
+fn render_errors_window(ctx: &egui::Context, doc: &mut Document, row_base: usize, lang: crate::i18n::Lang) -> Option<usize> {
+    let s = crate::i18n::t(lang);
     let mut open = true;
     let mut goto: Option<usize> = None;
 
@@ -5944,17 +5991,17 @@ fn render_errors_window(ctx: &egui::Context, doc: &mut Document, row_base: usize
             if doc.error_scan.is_some() {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(crate::theme::chrome_text("Checking rows…"));
+                    ui.label(crate::theme::chrome_text(s.bad_checking));
                 });
                 return;
             }
             let Some(result) = &doc.row_errors else {
                 // 인덱싱이 아직인 경우가 대부분이다.
-                ui.label(crate::theme::chrome_text("Not checked yet."));
+                ui.label(crate::theme::chrome_text(s.bad_not_checked));
                 return;
             };
             if result.total() == 0 {
-                ui.label(crate::theme::chrome_text("No bad rows."));
+                ui.label(crate::theme::chrome_text(s.bad_none));
                 return;
             }
 
@@ -5994,7 +6041,7 @@ fn render_errors_window(ctx: &egui::Context, doc: &mut Document, row_base: usize
                                     .sense(egui::Sense::click())
                                     .truncate(),
                             )
-                            .on_hover_text("Click to jump to this row")
+                            .on_hover_text(s.bad_click_to_jump)
                             .clicked()
                         {
                             goto = Some(e.logical);
@@ -6011,7 +6058,8 @@ fn render_errors_window(ctx: &egui::Context, doc: &mut Document, row_base: usize
 
 /// 다중 컬럼 정렬 다이얼로그. 정렬 기준(컬럼·문자/숫자·오름/내림) 목록을
 /// 위(1차)→아래(N차) 순으로 편집하고, "정렬"로 백그라운드 다중 정렬을 시작한다.
-fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) {
+fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize, lang: crate::i18n::Lang) {
+    let s = crate::i18n::t(lang);
     let delim = match doc.sep {
         SeparatorMode::Char(d) => d,
         SeparatorMode::None => {
@@ -6069,7 +6117,7 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
 
             for i in 0..doc.sort_specs.len() {
                 ui.horizontal(|ui| {
-                    ui.label(crate::theme::chrome_text(format!("Priority {}", i + 1)));
+                    ui.label(crate::theme::chrome_text(format!("{} {}", s.sort_priority, i + 1)));
 
                     // 컬럼 선택 드롭다운. 다른 기준이 이미 선택한 컬럼은 목록에서 제외.
                     let cur_col = doc.sort_specs[i].col.min(col_count - 1);
@@ -6120,7 +6168,7 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
 
                     // 대소문자 무시(문자 기준일 때만). 체크됨 = 무시(ci=true).
                     if doc.sort_specs[i].kind == SortKind::Text {
-                        ui.checkbox(&mut doc.sort_specs[i].ci, "Ignore case");
+                        ui.checkbox(&mut doc.sort_specs[i].ci, s.sort_ignore_case);
                     }
 
                     // 순서 변경(↑ 위로, ↓ 아래로). 맨 위/맨 아래에선 해당 버튼 비활성.
@@ -6154,7 +6202,7 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
                     && next_free.is_some();
 
                 ui.add_enabled_ui(can_add, |ui| {
-                    if ui.button("+ Add criterion").clicked() {
+                    if ui.button(s.sort_add_criterion).clicked() {
                         if let Some(col) = next_free {
                             doc.sort_specs.push(SortSpec {
                                 col,
@@ -6166,18 +6214,18 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) 
                     }
                 });
                 if doc.sort_specs.len() >= sort::MAX_KEYS {
-                    ui.label(crate::theme::chrome_text(format!("(maximum {})", sort::MAX_KEYS)));
+                    ui.label(crate::theme::chrome_text(s.sort_maximum.replace("{}", &sort::MAX_KEYS.to_string())));
                 } else if doc.sort_specs.len() >= col_count {
-                    ui.label(crate::theme::chrome_text("(all columns in use)"));
+                    ui.label(crate::theme::chrome_text(s.sort_all_in_use));
                 }
             });
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Sort").clicked() {
+                if ui.button(s.sort_do).clicked() {
                     do_sort = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(s.common_cancel).clicked() {
                     doc.show_sort_dialog = false;
                 }
             });
@@ -6251,8 +6299,15 @@ fn apply_edit_sort(doc: &mut Document, specs: &[SortSpec], delim: u8, data_start
 /// 툴바의 정렬 컨트롤. 컬럼이 선택돼 있고 인덱싱이 완료(Phase::Complete)일 때만
 /// 정렬 버튼이 활성화된다. 정렬은 백그라운드 스레드에서 수행되며, 진행 중에는
 /// progress bar가 표시되고 완료되면 permutation을 doc.sort로 옮긴다.
-fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Context) {
+fn render_sort_controls(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    ctx: &egui::Context,
+    lang: crate::i18n::Lang,
+) {
     use crate::index::Phase;
+
+    let s = crate::i18n::t(lang);
 
     // 진행 중인 정렬 작업이 끝났는지 먼저 폴링해 결과를 수거.
     if let Some(job) = &mut doc.sort_job {
@@ -6272,7 +6327,7 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
     // 정렬 진행 중이면 progress bar만 표시하고 버튼은 숨긴다.
     if let Some(job) = &doc.sort_job {
         let p = job.progress();
-        ui.label(crate::theme::chrome_text("Sorting…"));
+        ui.label(crate::theme::chrome_text(s.sort_running));
         ui.add(
             egui::ProgressBar::new(p)
                 .desired_width(160.0)
@@ -6289,8 +6344,8 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
     let selected = doc.selected_col;
 
     match selected {
-        Some(col) => ui.label(crate::theme::chrome_text(format!("Sort: column {}", col + 1))),
-        None => ui.label(crate::theme::chrome_text("Sort: (click a header to select a column)")),
+        Some(col) => ui.label(crate::theme::chrome_text(s.sort_column_n.replace("{}", &(col + 1).to_string()))),
+        None => ui.label(crate::theme::chrome_text(s.sort_pick_header)),
     };
 
     let delim = match doc.sep {
@@ -6304,23 +6359,23 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
 
     let mut do_sort: Option<(SortKind, SortDir)> = None;
     ui.add_enabled_ui(can_sort, |ui| {
-        if ui.button("Text ↑").clicked() {
+        if ui.button(s.sort_text_asc).clicked() {
             do_sort = Some((SortKind::Text, SortDir::Asc));
         }
-        if ui.button("Text ↓").clicked() {
+        if ui.button(s.sort_text_desc).clicked() {
             do_sort = Some((SortKind::Text, SortDir::Desc));
         }
-        if ui.button("Number ↑").clicked() {
+        if ui.button(s.sort_number_asc).clicked() {
             do_sort = Some((SortKind::Number, SortDir::Asc));
         }
-        if ui.button("Number ↓").clicked() {
+        if ui.button(s.sort_number_desc).clicked() {
             do_sort = Some((SortKind::Number, SortDir::Desc));
         }
     });
 
     // 다중 컬럼 정렬 다이얼로그 열기(인덱싱 완료일 때만).
     ui.add_enabled_ui(complete, |ui| {
-        if ui.button("Sort by Columns…").clicked() {
+        if ui.button(s.menu_sort_columns).clicked() {
             // 다이얼로그를 열 때 기준 목록이 비어 있으면 현재 선택 컬럼(있으면)으로
             // 첫 기준을 미리 채워 사용자가 바로 편집하게 한다.
             if doc.sort_specs.is_empty() {
@@ -6338,7 +6393,7 @@ fn render_sort_controls(ui: &mut egui::Ui, doc: &mut Document, ctx: &egui::Conte
 
     // 정렬 해제 버튼은 뷰 모드에서 permutation 정렬이 적용돼 있을 때만.
     // (편집 모드 정렬은 lines에 이미 반영돼 되돌릴 permutation이 없다.)
-    if doc.sort.is_some() && ui.button("Clear Sort").clicked() {
+    if doc.sort.is_some() && ui.button(s.sort_clear).clicked() {
         doc.sort = None;
     }
 
@@ -7762,7 +7817,9 @@ fn render_text(
     row_base: usize,
     clipboard: &mut String,
     tab_pressed: bool,
+    lang: crate::i18n::Lang,
 ) {
+    let s = crate::i18n::t(lang);
     use std::cell::Cell;
 
     // 찾기가 남긴 스크롤 요청(표 모드와 같은 이유·같은 방법 — render_table 주석 참조).
@@ -7886,7 +7943,7 @@ fn render_text(
             header.col(|ui| {
                 let rect = ui.max_rect();
                 paint_header_cell(ui, rect, crate::theme::header_bg());
-                ui.add(egui::Label::new(egui::RichText::new("Line").strong()).truncate());
+                ui.add(egui::Label::new(egui::RichText::new(s.common_line).strong()).truncate());
             });
         })
         .body(|body| {
@@ -9207,6 +9264,7 @@ fn collect_hex_intents(
 ///
 /// 창 X와 Escape는 Cancel과 같다. 없으면 플래그가 켜진 채 잠금이 안 풀린다.
 fn render_confirm_parquet_sort_dialog(ctx: &egui::Context, app: &mut App) {
+    let s = crate::i18n::t(app.lang);
     let Some((col, dir)) = app.doc().and_then(|d| d.pending_parquet_sort) else {
         return;
     };
@@ -9232,10 +9290,10 @@ fn render_confirm_parquet_sort_dialog(ctx: &egui::Context, app: &mut App) {
                 bytes as f64 / 1e6
             )));
             ui.horizontal(|ui| {
-                if ui.button("Sort").clicked() {
+                if ui.button(s.sort_do).clicked() {
                     go = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(s.common_cancel).clicked() {
                     cancel = true;
                 }
             });
@@ -9265,6 +9323,7 @@ fn render_confirm_parquet_sort_dialog(ctx: &egui::Context, app: &mut App) {
 /// 창 X(`.open()`)와 Escape는 Cancel과 같다 — 형제 다이얼로그가 전부 갖고
 /// 있는 탈출구다. 이게 없으면 플래그가 켜진 채 잠금이 영영 풀리지 않는다.
 fn render_confirm_hex_load_dialog(ctx: &egui::Context, app: &mut App) {
+    let s = crate::i18n::t(app.lang);
     let len = app.doc().map_or(0, |d| d.source.len());
     let mut open = true;
     let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
@@ -9278,7 +9337,7 @@ fn render_confirm_hex_load_dialog(ctx: &egui::Context, app: &mut App) {
                 len as f64 / 1e6
             )));
             ui.horizontal(|ui| {
-                if ui.button("Load").clicked() {
+                if ui.button(s.common_load).clicked() {
                     if let Some(doc) = app.doc_mut() {
                         let bytes = doc.source.as_bytes().to_vec();
                         if let Some(h) = doc.hex.as_mut() {
@@ -9287,7 +9346,7 @@ fn render_confirm_hex_load_dialog(ctx: &egui::Context, app: &mut App) {
                         }
                     }
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(s.common_cancel).clicked() {
                     cancel = true;
                 }
             });
@@ -14994,7 +15053,7 @@ mod tests {
         }
         let _ = ctx.run(Default::default(), |ctx| {
             let doc = app.doc_mut().unwrap();
-            let act = render_find_panel(ctx, doc);
+            let act = render_find_panel(ctx, doc, crate::i18n::Lang::default());
             assert_eq!(act, None, "아무 버튼도 누르지 않았으면 인텐트도 없다");
         });
         assert!(
@@ -15015,7 +15074,7 @@ mod tests {
         // 첫 프레임: 창을 띄운다.
         let _ = ctx.run(Default::default(), |ctx| {
             let doc = app.doc_mut().unwrap();
-            let _ = render_find_panel(ctx, doc);
+            let _ = render_find_panel(ctx, doc, crate::i18n::Lang::default());
         });
         assert!(app.doc().unwrap().show_find, "사전 조건: 창이 열려 있다");
         // egui Window의 X 버튼 클릭을 직접 시뮬레이션하기보다, `open` 파라미터가
@@ -15126,7 +15185,7 @@ mod tests {
         }
         let _ = ctx.run(Default::default(), |ctx| {
             let doc = app.doc_mut().unwrap();
-            let _ = render_find_panel(ctx, doc);
+            let _ = render_find_panel(ctx, doc, crate::i18n::Lang::default());
         });
         assert_eq!(
             app.doc().unwrap().last_match,
@@ -15242,7 +15301,7 @@ mod tests {
                 });
                 status_top = status.response.rect.top();
                 let doc = app.doc_mut().unwrap();
-                let _ = render_find_panel(ctx, doc);
+                let _ = render_find_panel(ctx, doc, crate::i18n::Lang::default());
                 find_window_bottom = ctx
                     .memory(|m| m.area_rect(egui::Id::new("Find & Replace")))
                     .map(|r| r.bottom())
@@ -15876,13 +15935,13 @@ mod tests {
         // 검색어가 빈 상태로 한 프레임.
         let _ = ctx.run(Default::default(), |ctx| {
             let doc = app.doc_mut().unwrap();
-            assert_eq!(render_find_panel(ctx, doc), None);
+            assert_eq!(render_find_panel(ctx, doc, crate::i18n::Lang::default()), None);
         });
         // 검색어가 있는 상태로 한 프레임(버튼이 활성화된 경로).
         app.doc_mut().unwrap().find_query = "hit".to_owned();
         let _ = ctx.run(Default::default(), |ctx| {
             let doc = app.doc_mut().unwrap();
-            assert_eq!(render_find_panel(ctx, doc), None, "클릭하지 않았으면 인텐트도 없다");
+            assert_eq!(render_find_panel(ctx, doc, crate::i18n::Lang::default()), None, "클릭하지 않았으면 인텐트도 없다");
         });
     }
 
@@ -16848,7 +16907,7 @@ mod tests {
         let draw = |app: &mut App, clip: &mut String| {
             let _ = ctx.run(input.clone(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    render_text(ui, app.doc_mut().unwrap(), 0, clip, false);
+                    render_text(ui, app.doc_mut().unwrap(), 0, clip, false, crate::i18n::Lang::default());
                 });
             });
         };
@@ -17029,7 +17088,14 @@ mod tests {
             let mut clip = String::new();
             let out = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    render_text(ui, app.doc_mut().unwrap(), 0, &mut clip, false);
+                    render_text(
+                        ui,
+                        app.doc_mut().unwrap(),
+                        0,
+                        &mut clip,
+                        false,
+                        crate::i18n::Lang::default(),
+                    );
                 });
             });
             let want = crate::theme::tab_bg();
@@ -17376,7 +17442,7 @@ mod tests {
         let draw = |app: &mut App, clip: &mut String| {
             let _ = ctx.run(input.clone(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    render_text(ui, app.doc_mut().unwrap(), 0, clip, false);
+                    render_text(ui, app.doc_mut().unwrap(), 0, clip, false, crate::i18n::Lang::default());
                 });
             });
         };
@@ -18965,7 +19031,7 @@ mod tests {
         let mut action = None;
         let _ = ctx.run(Default::default(), |ctx| {
             let doc = app.doc_mut().unwrap();
-            action = render_find_panel(ctx, doc);
+            action = render_find_panel(ctx, doc, crate::i18n::Lang::default());
         });
         // 아무 것도 누르지 않은 프레임은 인텐트가 없다 — 스모크 확인.
         assert_eq!(action, None);
@@ -18977,7 +19043,7 @@ mod tests {
         }
         let _ = ctx.run(Default::default(), |ctx| {
             let doc = app.doc_mut().unwrap();
-            action = render_find_panel(ctx, doc);
+            action = render_find_panel(ctx, doc, crate::i18n::Lang::default());
         });
         assert_eq!(action, None, "포커스만 잡은 프레임은 아직 인텐트가 없다");
         // 이미 포커스가 있는 입력란에 Enter를 쳐서 Find Next를 낸다.
@@ -18993,7 +19059,7 @@ mod tests {
         };
         let _ = ctx.run(enter_input, |ctx| {
             let doc = app.doc_mut().unwrap();
-            action = render_find_panel(ctx, doc);
+            action = render_find_panel(ctx, doc, crate::i18n::Lang::default());
         });
         assert_eq!(action, Some(FindAction::HexNext));
     }
@@ -19172,7 +19238,7 @@ mod tests {
                     });
                 });
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    render_text(ui, app.doc_mut().unwrap(), 0, clip, tab_for_body);
+                    render_text(ui, app.doc_mut().unwrap(), 0, clip, tab_for_body, crate::i18n::Lang::default());
                 });
                 // 끝에서 걷어내는 단계는 **일부러 없다** — 프레임이 끝난 뒤
                 // 포커스가 None이라는 것은 File이 애초에 받지 못했다는 뜻이다

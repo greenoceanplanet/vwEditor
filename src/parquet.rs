@@ -333,10 +333,11 @@ pub struct ParquetDoc {
 
 /// Parquet 파일을 연다. **푸터만 읽으므로 파일 크기와 무관하게 즉시다** —
 /// CSV처럼 개행을 세러 전체를 훑지 않는다.
-pub fn open(path: &Path) -> Result<ParquetDoc, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("파일을 열 수 없습니다: {e}"))?;
+pub fn open(path: &Path, lang: crate::i18n::Lang) -> Result<ParquetDoc, String> {
+    let s = crate::i18n::t(lang);
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", s.err_open_file))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| format!("Parquet으로 읽을 수 없습니다: {e}"))?;
+        .map_err(|e| format!("{}: {e}", s.err_parquet_read))?;
 
     let meta = builder.metadata();
     let total_rows = meta.file_metadata().num_rows().max(0) as u64;
@@ -552,9 +553,9 @@ impl ParquetDoc {
         use arrow_cast::display::{ArrayFormatter, FormatOptions};
         use parquet::arrow::ProjectionMask;
 
-        let file = std::fs::File::open(&self.path).map_err(|e| format!("파일 읽기 실패: {e}"))?;
+        let file = std::fs::File::open(&self.path).map_err(|e| format!("Failed to read file: {e}"))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| format!("Parquet 읽기 실패: {e}"))?;
+            .map_err(|e| format!("Failed to read Parquet: {e}"))?;
         let mask = match cols {
             Some(c) => ProjectionMask::roots(builder.parquet_schema(), c.iter().copied()),
             None => ProjectionMask::all(),
@@ -564,7 +565,7 @@ impl ParquetDoc {
             .with_projection(mask)
             .with_batch_size(BATCH_ROWS)
             .build()
-            .map_err(|e| format!("row group {g} 디코드 실패: {e}"))?;
+            .map_err(|e| format!("Failed to decode row group {g}: {e}"))?;
 
         // **프로젝션을 쓰면 배치의 컬럼 순서가 원본 스키마와 달라진다.**
         // geometry 판정은 반드시 원본 인덱스로 해야 한다.
@@ -576,7 +577,7 @@ impl ParquetDoc {
         let mut out = Vec::new();
         let opts = FormatOptions::default();
         for batch in reader {
-            let b = batch.map_err(|e| format!("row group {g} 배치 실패: {e}"))?;
+            let b = batch.map_err(|e| format!("Failed to batch row group {g}: {e}"))?;
             // 포매터는 컬럼마다 한 번만 만든다(행마다 만들면 비싸다).
             let fmts: Vec<Option<ArrayFormatter>> = (0..b.num_columns())
                 .map(|c| ArrayFormatter::try_new(b.column(c).as_ref(), &opts).ok())
@@ -909,7 +910,7 @@ mod tests {
     fn open_reads_row_count_and_columns_from_footer() {
         let p = temp_path("open");
         write_simple(&p, vec![1, 2, 3], vec![Some("가"), None, Some("다")]);
-        let d = super::open(&p).unwrap();
+        let d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         assert_eq!(d.total_rows(), 3);
         assert_eq!(d.column_names(), &["id".to_string(), "name".to_string()]);
         let _ = std::fs::remove_file(&p);
@@ -919,7 +920,7 @@ mod tests {
     fn open_rejects_a_non_parquet_file() {
         let p = temp_path("bad");
         std::fs::write(&p, b"this is not parquet at all").unwrap();
-        assert!(super::open(&p).is_err());
+        assert!(super::open(&p, crate::i18n::Lang::default()).is_err());
         let _ = std::fs::remove_file(&p);
     }
 
@@ -927,7 +928,7 @@ mod tests {
     fn row_line_zero_is_the_header_row() {
         let p = temp_path("hdr");
         write_simple(&p, vec![7], vec![Some("x")]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         assert_eq!(d.row_line(0, b',').as_deref(), Some("id,name"));
         let _ = std::fs::remove_file(&p);
     }
@@ -937,7 +938,7 @@ mod tests {
         // 인덱스 규약: 논리 행 k는 파일 행 k-1이다.
         let p = temp_path("rows");
         write_simple(&p, vec![10, 20], vec![Some("가"), Some("나")]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         assert_eq!(d.row_line(1, b',').as_deref(), Some("10,가"));
         assert_eq!(d.row_line(2, b',').as_deref(), Some("20,나"));
         assert_eq!(d.row_line(3, b','), None, "범위 밖");
@@ -948,7 +949,7 @@ mod tests {
     fn null_cells_render_as_empty_string() {
         let p = temp_path("null");
         write_simple(&p, vec![1], vec![None]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         // ArrayFormatter는 null을 <null>로 내므로 직접 빈 문자열로 바꾼다.
         assert_eq!(d.row_line(1, b',').as_deref(), Some("1,"));
         let _ = std::fs::remove_file(&p);
@@ -960,7 +961,7 @@ mod tests {
         // "NULL"과 구분되지 않고 CSV로 내보낼 때도 관행에 어긋난다.
         let p = temp_path("nullmark");
         write_simple(&p, vec![1], vec![None]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         let line = d.row_line(1, b',').unwrap();
         assert!(!line.contains("null"), "null 마커가 새어 나왔다: {line}");
         assert_eq!(line, "1,");
@@ -971,7 +972,7 @@ mod tests {
     fn cells_needing_quotes_round_trip_from_a_real_file() {
         let p = temp_path("quote");
         write_simple(&p, vec![1], vec![Some("a,b\"c")]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         let line = d.row_line(1, b',').unwrap();
         let back = crate::parse::split_fields(&line, b',');
         assert_eq!(back, vec!["1".to_string(), "a,b\"c".to_string()]);
@@ -982,7 +983,7 @@ mod tests {
     fn cells_containing_newlines_are_flattened_to_one_line() {
         let p = temp_path("nl");
         write_simple(&p, vec![1], vec![Some("첫줄\n둘째줄")]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         let line = d.row_line(1, b',').unwrap();
         assert!(!line.contains('\n'), "개행이 남으면 행 정렬이 깨진다: {line}");
         assert_eq!(line, "1,첫줄 둘째줄");
@@ -995,7 +996,7 @@ mod tests {
         let pt = wkb_point(127.024, 37.512);
         let j = r#"{"columns":{"geometry":{"encoding":"WKB"}}}"#;
         write_with_geo(&p, vec![pt.as_slice()], Some(j));
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         let line = d.row_line(1, b',').unwrap();
         // POINT 요약에는 쉼표가 없어 인용되지 않는다. 중요한 것은 인용 여부가
         // 아니라 **왕복**이다 — 표가 이 줄을 되잘라 원래 셀을 얻어야 한다.
@@ -1021,7 +1022,7 @@ mod tests {
         }
         let j = r#"{"columns":{"geometry":{"encoding":"WKB"}}}"#;
         write_with_geo(&p, vec![poly.as_slice()], Some(j));
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         let line = d.row_line(1, b',').unwrap();
         assert!(line.starts_with("\"POLYGON(1,204 pts)\""), "인용 필요: {line}");
         assert_eq!(
@@ -1037,7 +1038,7 @@ mod tests {
         let p = temp_path("nogeo");
         let pt = wkb_point(1.0, 2.0);
         write_with_geo(&p, vec![pt.as_slice()], None);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         let line = d.row_line(1, b',').unwrap();
         assert!(line.starts_with("<binary 21 B>"), "실제: {line}");
         let _ = std::fs::remove_file(&p);
@@ -1047,7 +1048,7 @@ mod tests {
     fn empty_parquet_has_header_but_no_data_rows() {
         let p = temp_path("empty");
         write_simple(&p, vec![], vec![]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         assert_eq!(d.total_rows(), 0);
         assert_eq!(d.row_line(0, b',').as_deref(), Some("id,name"), "헤더는 있다");
         assert_eq!(d.row_line(1, b','), None);
@@ -1058,7 +1059,7 @@ mod tests {
     fn column_values_returns_every_row_for_sorting() {
         let p = temp_path("colvals");
         write_simple(&p, vec![3, 1, 2], vec![Some("c"), Some("a"), Some("b")]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         assert_eq!(d.column_values(0).unwrap(), vec!["3", "1", "2"]);
         assert_eq!(d.column_values(1).unwrap(), vec!["c", "a", "b"]);
         let _ = std::fs::remove_file(&p);
@@ -1069,7 +1070,7 @@ mod tests {
         // Parquet은 타입이 확정적이라 "숫자로 보이는지" 추론이 필요 없다.
         let p = temp_path("numeric");
         write_simple(&p, vec![1], vec![Some("가")]);
-        let d = super::open(&p).unwrap();
+        let d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         assert!(d.column_is_numeric(0), "id는 int64");
         assert!(!d.column_is_numeric(1), "name은 utf8");
         let _ = std::fs::remove_file(&p);
@@ -1162,7 +1163,7 @@ mod tests {
         // 디코드된 캐시가 그대로 쓰여 빈 셀이 나온다.
         let p = temp_path("proj");
         write_simple(&p, vec![7], vec![Some("가")]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
 
         d.set_visible_columns(Some(vec![0]));
         assert_eq!(d.row_line(1, b',').as_deref(), Some("7"), "첫 컬럼만");
@@ -1187,7 +1188,7 @@ mod tests {
     fn stale_cache_is_rejected_by_the_column_key() {
         let p = temp_path("stalekey");
         write_simple(&p, vec![7], vec![Some("가")]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
 
         // 전체 컬럼으로 한 번 캐시를 채운다.
         assert_eq!(d.row_line(1, b',').as_deref(), Some("7,가"));
@@ -1206,7 +1207,7 @@ mod tests {
     fn header_row_follows_visible_columns() {
         let p = temp_path("projhdr");
         write_simple(&p, vec![1], vec![Some("x")]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         d.set_visible_columns(Some(vec![1]));
         assert_eq!(d.row_line(0, b',').as_deref(), Some("name"));
         let _ = std::fs::remove_file(&p);
@@ -1217,7 +1218,7 @@ mod tests {
         // 정렬은 보이는 컬럼과 무관하게 지정 컬럼 전체를 읽어야 한다.
         let p = temp_path("projsort");
         write_simple(&p, vec![2, 1], vec![Some("b"), Some("a")]);
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         d.set_visible_columns(Some(vec![0]));
         assert_eq!(
             d.column_values(1).unwrap(),
@@ -1235,7 +1236,7 @@ mod tests {
         let pt = wkb_point(1.0, 2.0);
         let j = r#"{"columns":{"geometry":{"encoding":"WKB"}}}"#;
         write_with_geo(&p, vec![pt.as_slice()], Some(j));
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         // geometry(0)만 보이게 하면 배치 인덱스도 0이라 우연히 맞는다.
         // name(1)만 보이게 하면 배치 인덱스 0이 name이므로, 원본 인덱스로
         // 판정하지 않으면 name을 geometry로 오인한다.
@@ -1250,7 +1251,7 @@ mod tests {
         let pt = wkb_point(1.0, 2.0);
         let j = r#"{"columns":{"geometry":{"encoding":"WKB"}}}"#;
         write_with_geo(&p, vec![pt.as_slice()], Some(j));
-        let mut d = super::open(&p).unwrap();
+        let mut d = super::open(&p, crate::i18n::Lang::default()).unwrap();
         d.set_visible_columns(Some(vec![0]));
         assert_eq!(d.row_line(1, b',').as_deref(), Some("POINT(1 2)"));
         let _ = std::fs::remove_file(&p);

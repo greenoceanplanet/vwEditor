@@ -272,10 +272,15 @@ pub struct FontReport {
 /// 문구를 여기 두는 이유: 이 상황은 Windows 개발 환경에서 재현되지 않아
 /// (맑은 고딕이 항상 있다) 테스트로만 검증된다. 테스트와 실제 문구가 같은
 /// 상수를 봐야 어긋나지 않는다.
-pub const KOREAN_FONT_MISSING_MSG: &str = "한글 폰트를 찾지 못해 한글이 □로 보입니다. \
-     한글 폰트를 설치하면 해결됩니다 — Debian/Ubuntu: `sudo apt install fonts-nanum`, \
+///
+/// **이 문구만은 `i18n`을 타지 않고 영어로 고정한다.** 한글을 그릴 수 없다는
+/// 사실을 알리는 안내가 한글이면 □로만 보여 아무것도 전달하지 못한다.
+/// 언어 설정이 한국어여도 마찬가지다 — 설정이 아니라 폰트가 없는 것이다.
+pub const KOREAN_FONT_MISSING_MSG: &str =
+    "No Korean font was found, so Korean text appears as \u{25a1}. \
+     Installing one fixes it — Debian/Ubuntu: `sudo apt install fonts-nanum`, \
      Fedora: `sudo dnf install nhn-nanum-fonts`, Arch: `sudo pacman -S noto-fonts-cjk`. \
-     설치한 폰트 경로가 목록에 없다면 src/theme.rs의 KR_CANDIDATES에 추가해 주세요.";
+     If a font is installed but still not found, add its path to KR_CANDIDATES in src/theme.rs.";
 
 /// 데이터 영역은 고정폭(Cascadia Mono), UI는 Segoe UI, 한글은 맑은 고딕 폴백.
 ///
@@ -491,11 +496,27 @@ mod tests {
     #[test]
     fn korean_font_message_tells_how_to_fix_it() {
         let m = KOREAN_FONT_MISSING_MSG;
-        assert!(m.contains("한글"), "증상을 한글로 설명한다");
-        assert!(m.contains("apt") && m.contains("dnf") && m.contains("pacman"),
-            "주요 배포판 설치 명령을 안내한다: {m}");
-        assert!(m.contains("KR_CANDIDATES"),
-            "목록에 없는 폰트를 쓰는 사용자를 위해 고칠 지점을 알려준다");
+        assert!(m.contains("Korean font"), "증상을 설명한다: {m}");
+        assert!(
+            m.contains("apt") && m.contains("dnf") && m.contains("pacman"),
+            "주요 배포판 설치 명령을 안내한다: {m}"
+        );
+        assert!(
+            m.contains("KR_CANDIDATES"),
+            "목록에 없는 폰트를 쓰는 사용자를 위해 고칠 지점을 알려준다"
+        );
+    }
+
+    /// 이 안내만은 반드시 **영어**여야 한다 — 한글을 그릴 수 없다는 사실을
+    /// 알리는 문구가 한글이면 □로만 보인다. i18n을 타지 않는 이유이기도 하다.
+    #[test]
+    fn korean_font_message_is_ascii_only() {
+        let m = KOREAN_FONT_MISSING_MSG;
+        let hangul: Vec<char> = m.chars().filter(|c| ('가'..='힣').contains(c)).collect();
+        assert!(
+            hangul.is_empty(),
+            "한글 폰트가 없을 때 보일 문구에 한글이 있다: {hangul:?}"
+        );
     }
 
     /// 이 환경(Windows)에서는 한글 폰트가 반드시 잡힌다. 이 테스트가 깨지면
