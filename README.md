@@ -25,6 +25,7 @@ parquet 조회도 가능합니다.
 - **Parquet / GeoParquet** — 읽기 전용. geometry 컬럼은 `POINT(127.02 37.51)`,
   `POLYGON(1,204 pts)` 형태로 요약해 보여줍니다. CSV/TSV로 내보내기 가능합니다.
 - **파싱 오류 행 검출** — 따옴표가 안 닫힌 행 등을 찾아 줍니다.
+- **한국어·영어 UI** — 시작할 때 OS 로케일을 따르고, 메뉴 > 언어에서 바꿀 수 있습니다.
 - **멀티탭**, **드래그앤드롭**, **Ctrl+휠 확대**(0.5~4.0배).
 
 ## 빌드
@@ -69,9 +70,11 @@ sudo dnf install gtk3-devel libxkbcommon-devel
 [src/theme.rs](src/theme.rs)의 `MONO_CANDIDATES` / `UI_CANDIDATES` /
 `KR_CANDIDATES`에 플랫폼별 경로 목록이 있습니다.
 
-UI가 한국어라 **한글 폰트가 없으면 글자가 □로 보입니다.** egui 내장 폰트에는
-CJK 글리프가 없기 때문입니다. 이 경우 앱이 시작할 때 설치 방법을 안내하도록
-했습니다.
+**한글 폰트가 없으면 한글이 □로 보입니다.** egui 내장 폰트에는 CJK 글리프가
+없기 때문입니다. UI를 한국어로 쓸 때는 물론이고, **UI가 영어여도 파일 안의
+한글 데이터가 □가 됩니다** — 이쪽이 실제로는 더 자주 부딪히는 경우입니다.
+이 경우 앱이 시작할 때 설치 방법을 안내합니다(그 안내만은 영어입니다 —
+한글을 못 그린다는 안내가 한글이면 읽을 수 없으니까요).
 
 ```bash
 # Debian / Ubuntu
@@ -148,6 +151,7 @@ line positions in the background. The scrollbar grows as indexing progresses.
 - **Parquet / GeoParquet** — read-only. Geometry columns are summarized as
   `POINT(127.02 37.51)` or `POLYGON(1,204 pts)`. Exportable to CSV/TSV.
 - **Malformed row detection** — finds rows with unclosed quotes and similar problems.
+- **English and Korean UI** — follows your OS locale at startup; switchable under **Language** in the menu bar.
 - **Multiple tabs**, **drag and drop**, **Ctrl+wheel zoom** (0.5×–4.0×).
 
 ## Build
@@ -193,9 +197,12 @@ repository small. Instead the app looks for system fonts — see
 `MONO_CANDIDATES` / `UI_CANDIDATES` / `KR_CANDIDATES` in
 [src/theme.rs](src/theme.rs) for the per-platform path lists.
 
-The UI is in Korean, so **without a Korean font the text renders as □.** egui's
-built-in fonts contain no CJK glyphs. When this happens the app shows
-installation instructions at startup.
+**Without a Korean font, Korean text renders as □.** egui's built-in fonts
+contain no CJK glyphs. This affects the Korean UI, but also — more commonly —
+**Korean data inside your files, even when the UI is in English.** When this
+happens the app shows installation instructions at startup (that one message is
+always in English, since a notice about missing Korean glyphs would be unreadable
+in Korean).
 
 ```bash
 # Debian / Ubuntu
