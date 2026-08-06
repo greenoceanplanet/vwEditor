@@ -8,8 +8,27 @@ parquet 조회도 가능합니다.
 10GB 파일을 열어도 첫 화면이 곧바로 뜨도록 했습니다. 파일 전체를 읽지 않고 앞부분만 훑어 표시한 뒤, 나머지 줄 위치는 백그라운드에서 인덱싱합니다.
 스크롤은 읽은 데까지 따라 늘어납니다.
 
+> ### ⚠️ 백신 오탐 안내
+>
+> Windows Defender가 이 프로그램을 **`Trojan:Win32/Wacatac.B!ml`** 로
+> 잡을 수 있습니다. **오탐이며 Microsoft에 신고했습니다.**
+>
+> 이름 끝의 `!ml`은 "머신러닝 추측"이라는 뜻입니다 — 알려진 악성코드와
+> 일치해서가 아니라, 모델이 수상하다고 판단했다는 표시입니다. 서명 없는
+> 정적 링크 Rust 바이너리(+LTO, mimalloc)가 패킹된 실행 파일과 겉모양이
+> 겹쳐서 생기는 흔한 오탐입니다.
+>
+> 이 프로그램은 **네트워크 기능이 아예 없습니다** — HTTP 클라이언트도,
+> 소켓도, 네트워크 크레이트도 의존성에 없습니다. 레지스트리를 건드리지
+> 않고, 다른 프로세스를 띄우지 않으며, 설치나 자동 실행 등록도 하지
+> 않습니다. 사용자가 직접 열거나 저장하는 파일만 읽고 씁니다.
+>
+> 직접 확인하시려면: 소스가 전부 공개되어 있으니 `cargo build --release`로
+> 직접 빌드하시거나, [VirusTotal](https://www.virustotal.com)에 올려
+> 다른 백신들의 판정을 비교해 보세요.
+
 > 개인 도구로 만들어 쓰는 중입니다. Windows에서 실사용하며 다듬었고,
-> 825개 테스트가 붙어 있습니다. macOS·Linux는 빌드는 되지만
+> 831개 테스트가 붙어 있습니다. macOS·Linux는 빌드는 되지만
 > **실기 검증을 못 했습니다** — 아래 [플랫폼 지원](#플랫폼-지원)을 참고하세요.
 
 ## 기능
@@ -108,7 +127,7 @@ sudo pacman -S noto-fonts-cjk
 ## 개발
 
 ```powershell
-cargo test              # 825개
+cargo test              # 831개
 cargo clippy --all-targets
 cargo build --release
 ```
@@ -133,8 +152,27 @@ A 10GB file shows its first screen immediately. Instead of reading the whole
 file, it scans just the beginning and displays that, then indexes the remaining
 line positions in the background. The scrollbar grows as indexing progresses.
 
+> ### ⚠️ Antivirus false positive
+>
+> Windows Defender may flag this program as **`Trojan:Win32/Wacatac.B!ml`**.
+> **This is a false positive and has been reported to Microsoft.**
+>
+> The `!ml` suffix means the verdict comes from a machine-learning guess, not
+> from a match against known malware. Unsigned, statically linked Rust binaries
+> built with LTO and a replaced global allocator (mimalloc) resemble packed
+> executables to the heuristic model — a common false positive.
+>
+> This program has **no networking whatsoever** — no HTTP client, no sockets,
+> and no network crate anywhere in its dependency tree. It does not touch the
+> registry, spawn processes, or install anything. It only reads and writes the
+> files you explicitly open or save.
+>
+> Verify it yourself: the full source is public, so you can build it with
+> `cargo build --release`, or upload the binary to
+> [VirusTotal](https://www.virustotal.com) and compare verdicts across engines.
+
 > This is a personal tool I built for my own use. It has been refined through
-> daily use on Windows and carries 825 tests. macOS and Linux builds compile
+> daily use on Windows and carries 831 tests. macOS and Linux builds compile
 > but **have not been verified on real hardware** — see
 > [Platform Support](#platform-support) below.
 
@@ -242,7 +280,7 @@ been able to verify them in those environments.
 ## Development
 
 ```powershell
-cargo test              # 825 tests
+cargo test              # 831 tests
 cargo clippy --all-targets
 cargo build --release
 ```
