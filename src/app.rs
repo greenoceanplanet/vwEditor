@@ -13235,12 +13235,12 @@ mod tests {
     // ---- 실사용 파일 성능 측정(수동) ----
 
     /// **수동 실행 전용.** 대용량 실파일로 `scan_all_matches`의 실제 시간을 잰다.
-    /// 파일이 있는 머신에서만 의미가 있으므로 `#[ignore]`이고, 없으면 조용히
-    /// 건너뛴다. 대상 파일은 `TV_PERF_FILE` 환경변수로 바꿀 수 있다.
+    /// 손에 큰 파일이 있는 사람만 의미가 있으므로 `#[ignore]`이고, 대상 파일을
+    /// 지정하지 않으면 조용히 건너뛴다.
     ///
     /// 실행(앱 exe를 건드리지 않도록 별도 target 디렉터리 권장):
-    /// `$env:CARGO_TARGET_DIR="...\perf"; cargo test --release
-    ///  perf_real_file_hangul_extract -- --ignored --nocapture`
+    /// `$env:TV_PERF_FILE="...\big.tsv"; $env:CARGO_TARGET_DIR="...\perf";
+    ///  cargo test --release perf_real_file_hangul_extract -- --ignored --nocapture`
     ///
     /// K-1 측정 기준값(899MB / 1540만 행 TSV, needle `인도네시아`, Whole cell,
     /// ignore_case, 12,047행): `is_ascii()` 판정일 때 **229.3초** →
@@ -13248,10 +13248,14 @@ mod tests {
     #[test]
     #[ignore]
     fn perf_real_file_hangul_extract() {
-        let default = r"(대용량 실파일)";
-        let path_buf = std::path::PathBuf::from(
-            std::env::var("TV_PERF_FILE").unwrap_or_else(|_| default.to_owned()),
-        );
+        // 대상 파일은 `TV_PERF_FILE`로 지정한다. 기본 경로를 두지 않는 이유:
+        // 특정 머신의 사적인 경로가 저장소에 남고, 그 파일이 없는 사람에게는
+        // 어차피 의미가 없다. 지정하지 않으면 건너뛴다.
+        let Ok(spec) = std::env::var("TV_PERF_FILE") else {
+            eprintln!("TV_PERF_FILE 미지정 — 건너뜀");
+            return;
+        };
+        let path_buf = std::path::PathBuf::from(spec);
         let path = path_buf.as_path();
         if !path.exists() {
             eprintln!("파일 없음 — 건너뜀: {}", path.display());
