@@ -1,3 +1,4 @@
+use crate::archive;
 use crate::index::LineIndex;
 use crate::indexer;
 use crate::parse::{self, Encoding, SeparatorMode};
@@ -631,6 +632,13 @@ impl App {
             self.open_path_parquet(path);
             return;
         }
+        // zip도 매직(`PK\x03\x04`/`PK\x05\x06`)으로 판단한다 — `.csv.zip`이 아닌
+        // 다른 확장자로 저장된 zip도 열리고, 반대로 확장자만 `.zip`인 텍스트는
+        // 아래 텍스트 경로로 간다.
+        if archive::is_zip(&head) {
+            self.open_path_zip(path, ctx);
+            return;
+        }
         match parse::detect_text(&head) {
             parse::TextDetection::Binary => {
                 self.pending_binary_open = Some(PendingBinaryOpen {
@@ -655,7 +663,91 @@ impl App {
                 return;
             }
         };
+        self.finish_open_text(
+            src,
+            enc,
+            path.to_path_buf(),
+            path.display().to_string(),
+            path.to_path_buf(),
+            false,
+            ctx,
+        );
+    }
 
+    /// zip 파일을 연다. 안에서 표 형식 파일(csv/tsv/psv/txt) 하나를 찾아 통째로
+    /// 압축을 풀고, 그 바이트를 일반 텍스트 문서처럼 연다. 큰 파일도 전체를
+    /// 메모리에 올린 뒤 mmap 문서와 같은 인덱서를 타므로 결이 다르지 않다 —
+    /// 다만 압축 안 데이터는 mmap이 불가능하므로 이 경로만 램에 다 올린다.
+    /// 후보가 0개거나 2개 이상이면(`extract_single_table` 참조) `self.error`를
+    /// 채우고 탭은 추가하지 않는다 — `open_path_as_text`와 같은 규율.
+    pub fn open_path_zip(&mut self, path: &Path, ctx: &egui::Context) {
+        self.error = None;
+        let entry = match archive::extract_single_table(path) {
+            Ok(e) => e,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        let head = {
+            let n = entry.bytes.len().min(PRIME_BYTES);
+            &entry.bytes[..n]
+        };
+        // 표 확장자(csv/tsv/psv/txt)인데 내용이 바이너리로 보이는 경우는
+        // 드물다고 보고 UTF-8로 강제한다 — zip 안 파일은 `pending_binary_open`의
+        // "이 인코딩으로 다시 열기" 흐름을 태울 대상 경로가 없다(디스크 파일이
+        // 아니라 압축 해제된 바이트라서).
+        let enc = match parse::detect_text(head) {
+            parse::TextDetection::Binary => Encoding::Utf8,
+            parse::TextDetection::Text(enc) => enc,
+        };
+        let path_label = format!("{} → {}", path.display(), entry.name);
+        let entry_name = std::path::PathBuf::from(&entry.name);
+        self.open_zip_entry_as_text(entry.bytes, enc, &entry_name, path_label, ctx);
+    }
+
+    /// zip 안에서 꺼낸 바이트를 텍스트 문서로 연다(읽기 전용 원본 없음).
+    /// `open_path_as_text`와 같은 뒷단(`finish_open_text`)을 타므로 인덱싱·
+    /// 자동 편집 모드 진입이 동일하게 적용된다. 디스크에 대응하는 파일이
+    /// 없으므로 `path`는 빈 경로 — 저장하면 "다른 이름으로 저장"으로
+    /// 폴백한다(`build_extracted_doc` 주석과 같은 규율). 구분자 감지는
+    /// 저장 경로가 아니라 zip 안 항목 이름(`entry_name`)의 확장자를 본다 —
+    /// 이래야 `data.csv`가 zip 밖에서 연 것과 똑같이 콤마로 감지된다.
+    pub fn open_zip_entry_as_text(
+        &mut self,
+        bytes: Vec<u8>,
+        enc: Encoding,
+        entry_name: &Path,
+        path_label: String,
+        ctx: &egui::Context,
+    ) {
+        self.error = None;
+        let src = Arc::new(Source::from_bytes(bytes));
+        self.finish_open_text(
+            src,
+            enc,
+            std::path::PathBuf::new(),
+            path_label,
+            entry_name.to_path_buf(),
+            true,
+            ctx,
+        );
+    }
+
+    /// `open_path_as_text`/`open_zip_entry_as_text` 공통 뒷단: 구분자·헤더
+    /// 감지, 인덱서 기동, `Document` 생성·추가, 작은 파일 자동 편집 모드 진입.
+    /// `sep_hint_path`는 구분자 확장자 감지에만 쓰인다 — 저장 시 갈 실제
+    /// 경로(`path`)와 다를 수 있다(zip 항목처럼).
+    fn finish_open_text(
+        &mut self,
+        src: Arc<Source>,
+        enc: Encoding,
+        path: std::path::PathBuf,
+        path_label: String,
+        sep_hint_path: std::path::PathBuf,
+        is_extracted: bool,
+        ctx: &egui::Context,
+    ) {
         // `src`는 아래에서 `Document`로 옮겨 가므로 크기를 미리 잡아 둔다.
         let size = src.len();
 
@@ -667,7 +759,7 @@ impl App {
         // 앞부분을 줄 단위로 나눠 구분자/헤더 감지에 사용
         let head_text = parse::decode_line(head, enc);
         let head_lines: Vec<&str> = head_text.lines().take(50).collect();
-        let sep = parse::detect_separator(path, &head_lines);
+        let sep = parse::detect_separator(&sep_hint_path, &head_lines);
         // 헤더 감지는 표 모드일 때만 의미가 있다. 텍스트 모드면 헤더 없음.
         let has_header = match sep {
             SeparatorMode::Char(d) => {
@@ -698,9 +790,9 @@ impl App {
             sep,
             has_header,
             indexer: Some(handle),
-            path: path.to_path_buf(),
-            path_label: path.display().to_string(),
-            is_extracted: false,
+            path,
+            path_label,
+            is_extracted,
             custom_sep_input,
             selected_col: None,
             sort: None,
@@ -1598,6 +1690,7 @@ impl eframe::App for App {
                             .add_filter("CSV", &["csv"])
                             .add_filter("TSV", &["tsv", "tab"])
                             .add_filter("Text", &["txt"])
+                            .add_filter("Zip", &["zip"])
                             .add_filter("All files", &["*"]);
                         if let Some(path) = dlg.pick_file() {
                             // 새 탭으로 열리므로 기존 탭을 대체하지 않는다 —
@@ -2004,7 +2097,7 @@ impl eframe::App for App {
                         Phase::Paused => {
                             ui.label(crate::theme::chrome_text(format!(
                                 "Stopped — showing first {} rows ({done_gb:.2} / {total_gb:.2} GB)",
-                                doc.index.line_count()
+                                crate::parquet::group_digits(doc.index.line_count() as u64)
                             )));
                             if ui.button(s.common_resume).clicked() {
                                 // 재개 = 처음부터 다시 병렬 스캔. spawn_indexer가
@@ -2028,7 +2121,7 @@ impl eframe::App for App {
                         Phase::Complete => {
                             ui.label(crate::theme::chrome_text(format!(
                                 "Ready — {} rows",
-                                doc.index.line_count()
+                                crate::parquet::group_digits(doc.index.line_count() as u64)
                             )));
                             // 정렬이 적용돼 있으면 어떤 기준인지 표시.
                             if let Some(s) = &doc.sort {
@@ -2062,7 +2155,7 @@ impl eframe::App for App {
                         ui.separator();
                         ui.label(crate::theme::chrome_text(format!(
                             "Editing — {} rows",
-                            e.lines.len()
+                            crate::parquet::group_digits(e.lines.len() as u64)
                         )));
                         if e.dirty {
                             ui.label(
@@ -2083,8 +2176,8 @@ impl eframe::App for App {
                         ui.label(
                             crate::theme::chrome_text(format!(
                                 "Filtered — {} of {} rows",
-                                filter.matched.len(),
-                                total_rows
+                                crate::parquet::group_digits(filter.matched.len() as u64),
+                                crate::parquet::group_digits(total_rows as u64)
                             ))
                             .color(egui::Color32::from_rgb(20, 110, 190)),
                         );
@@ -10520,6 +10613,49 @@ mod tests {
         assert!(doc.indexer.is_none(), "헥스 문서는 줄 인덱서를 돌리지 않는다");
         assert!(matches!(doc.sep, SeparatorMode::None));
         assert_eq!(doc.source.len(), 6);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ---- Zip 배선 ----
+
+    #[test]
+    fn zip_with_a_single_csv_opens_as_a_text_document() {
+        let p = crate::archive::testutil::temp_path("openpath");
+        crate::archive::testutil::write_zip(&p, &[("data.csv", b"a,b\n1,2\n3,4\n")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().expect("탭이 열려야 한다");
+        assert!(app.error.is_none(), "에러 없이 열려야 한다: {:?}", app.error);
+        assert_eq!(doc.sep, SeparatorMode::Char(b','), "zip 안 항목의 확장자로 구분자를 감지");
+        assert!(doc.has_header, "첫 논리 행이 컬럼 이름이다");
+        assert!(doc.path.as_os_str().is_empty(), "디스크에 대응하는 실제 파일이 없다");
+        assert!(doc.path_label.contains("data.csv"), "탭 라벨에 zip 안 파일 이름이 보여야 한다");
+        assert!(doc.is_extracted, "zip에서 꺼낸 문서는 추출본으로 표시한다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn zip_with_no_csv_reports_an_error_without_opening_a_tab() {
+        let p = crate::archive::testutil::temp_path("noent");
+        crate::archive::testutil::write_zip(&p, &[("readme.md", b"hello")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert!(app.error.is_some(), "표 형식 파일이 없으면 에러");
+        assert!(app.doc().is_none(), "탭이 열리면 안 된다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn zip_with_multiple_csvs_reports_an_error_without_opening_a_tab() {
+        let p = crate::archive::testutil::temp_path("multi");
+        crate::archive::testutil::write_zip(&p, &[("a.csv", b"1"), ("b.csv", b"2")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert!(app.error.is_some(), "여러 후보면 에러");
+        assert!(app.doc().is_none(), "탭이 열리면 안 된다");
         std::fs::remove_file(&p).ok();
     }
 
