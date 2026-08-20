@@ -28,17 +28,28 @@ $flags = @(
     "--remap-path-prefix=$rustupHome=/rustc"
     "--remap-path-prefix=$projectDir=/project"
     "--remap-path-prefix=$env:USERPROFILE=/home"
-) -join ' '
+)
 
 Write-Host "remapping build paths, then building release..." -ForegroundColor Cyan
-$env:RUSTFLAGS = $flags
+# `RUSTFLAGS`(공백 구분)가 아니라 `CARGO_ENCODED_RUSTFLAGS`(0x1F 구분)를 쓴다.
+# 사용자 홈 경로에 공백이 들어 있으면(`C:\Users\JS Lee`처럼) RUSTFLAGS는 그
+# 공백에서 플래그를 둘로 잘못 쪼개 `--remap-path-prefix must contain '='`
+# 에러가 난다. CARGO_ENCODED_RUSTFLAGS는 각 인자를 그대로 보존한다.
+#
+# 구분자는 `[char]0x1F`로 만든다 — Windows PowerShell 5.1은 ``u{1f}``
+# 유니코드 이스케이프(PowerShell 6+ 전용)를 모른다. 그걸 쓰면 문자 그대로
+# "u{1f}" 텍스트가 들어가 네 플래그가 하나로 뭉개지고, cargo가 그 뭉개진
+# 문자열을 통째로 rustc에 넘겨 remap이 조용히 실패한다(에러 없이 그냥 안
+# 먹는다) — 실제로 이 버그 때문에 첫 배포 빌드에 경로가 그대로 남았었다.
+$unitSep = [char]0x1F
+$env:CARGO_ENCODED_RUSTFLAGS = $flags -join $unitSep
 # cargo 는 경고를 stderr 로 낸다. ErrorActionPreference='Stop' 아래에서는 그것만으로
 # 스크립트가 죽으므로, 이 구간에서만 끄고 종료 코드로 성공을 판단한다.
 $ErrorActionPreference = 'Continue'
 cargo build --release
 $code = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
-Remove-Item Env:\RUSTFLAGS
+Remove-Item Env:\CARGO_ENCODED_RUSTFLAGS
 if ($code -ne 0) { throw "cargo build 실패 (exit $code)" }
 
 $exe = Join-Path $projectDir 'target\release\vweditor.exe'
